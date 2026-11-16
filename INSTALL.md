@@ -90,7 +90,7 @@ export LIBRARY_PATH="$INTEL_OPENVINO_DIR/runtime/3rdparty/tbb/lib:$INTEL_OPENVIN
 
 ### 2. OpenVINO GenAI SDK
 
-Download the **OpenVINO GenAI 2026.2+** archive for your platform from Intel:
+Download the **OpenVINO GenAI 2026.4.1.0** archive (the `OV_VERSION` release pin above) for your platform from Intel:
 
 - Archives: <https://storage.openvinotoolkit.org/repositories/openvino_genai/packages/>
 - Or the Intel download center: <https://www.intel.com/content/www/us/en/developer/tools/openvino-toolkit/download.html>

@@ -88,12 +88,21 @@ pub static INFLIGHT_TASKS: LazyLock<IntGauge> = LazyLock::new(|| {
 ///   (both 503). Add workers.
 /// - `empty_prompt` (400), `multi_prompt` (unsupported batch form, 400) —
 ///   malformed request.
+/// - `unsupported_field` (400) — a well-formed `/v1/responses` field the
+///   server does not serve (tools, stored state, file or audio input); the
+///   error's `param` names it.
+/// - `malformed_body` (400, or 413 over the body limit) — the body did not
+///   parse as the request: bad JSON, wrong field types, or an unsupported
+///   content part.
+/// - `invalid_media` (400) — an image the server will not take: images sent
+///   to a text-only model, too many, undecodable, outside the size limits,
+///   or dropped by the prompt format.
 /// - `prompt_too_large` (413) — over the API's `max_prompt_bytes` body
 ///   limit. Raise that limit.
-/// - `prompt_over_window` (413) — tokenizes past what the engine can window
-///   for one request, e.g. a packed slot's KV region. Resize the slots or
-///   widen the context. Split from `prompt_too_large` deliberately: same
-///   status, different knob, different owner.
+/// - `prompt_over_window` (400, `context_length_exceeded`) — tokenizes past
+///   what the engine can window for one request, e.g. a packed slot's KV
+///   region. Resize the slots or widen the context. Split from
+///   `prompt_too_large` deliberately: different knob, different owner.
 /// - `engine_unavailable` (503) — the engine is not loaded, or a pipeline
 ///   peer is unreachable. Bring the stage or its peer up.
 /// - `engine_error` (500) — the engine itself failed the submit (backend,

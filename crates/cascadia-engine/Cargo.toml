@@ -9,6 +9,7 @@ repository.workspace = true
 description = "Engine + Builder traits — the plugin interface every inference engine implements."
 
 [dependencies]
+serde_json = { workspace = true }
 cascadia-types = { workspace = true }
 cascadia-kv-wire = { path = "../cascadia-kv-wire", optional = true }
 async-trait = { workspace = true }

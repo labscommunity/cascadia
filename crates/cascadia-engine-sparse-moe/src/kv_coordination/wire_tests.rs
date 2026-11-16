@@ -62,6 +62,7 @@ fn fp() -> ModelFingerprint {
         qk_head_dim: 2,
         v_head_dim: 1,
         vocab_size: 256,
+        config_digest: 0,
         layer_start: 0,
         layer_end: 2,
         is_first: true,
@@ -476,6 +477,6 @@ async fn the_legacy_rank_less_get_carries_no_rank_to_bind() {
     assert!(matches!(reply, KvMessage::Found(_)));
 }
 
-// The H.1a capture-stash pins (tagged capture confined to its tenant; untagged capture serves any
-// partner) moved to `super::holder_conformance`, which states them once and instantiates them for
+// The H.1a capture-stash pins (every capture served only to the tenant it was stashed under,
+// untagged only to "") moved to `super::holder_conformance`, which states them once and instantiates them for
 // BOTH MoE holders over this same wire harness.

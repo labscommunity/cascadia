@@ -23,7 +23,7 @@ use cascadia_engine_sparse_moe::{SparseMoEBuilder, SparseMoEBuilderConfig};
 use cascadia_runner::Runner;
 use cascadia_transport::TransportAddr;
 use cascadia_types::{GenerationTask, PeerEndpoint, PeerLayout, ShardSpec};
-use clap::{CommandFactory, Parser, Subcommand, ValueEnum};
+use clap::{Args, CommandFactory, Parser, Subcommand, ValueEnum};
 use clap_complete::Shell;
 use futures::StreamExt;
 use tracing::{info, warn};
@@ -183,6 +183,11 @@ pub enum Command {
     /// to the text-surgery path (`tools/gemma4_surgery/export_gemma4_text.py`),
     /// while safetensors gemma-4 still uses the torch `export_gemma4.py`.
     Shard(ShardArgs),
+    /// Export a HuggingFace model as one whole-model OpenVINO IR directory
+    /// (optimum-intel: `image-text-to-text` for a vision-language model,
+    /// `text-generation-with-past` for text), for ov-genai or OVMS on one
+    /// box. See `cascadia export --help`.
+    Export(ExportArgs),
     /// Profile available OV devices on this host against a single
     /// model. Writes `device_profile.json`. See `cascadia
     /// profile-devices --help`. Step 1 of issue #41 (three-tier
@@ -234,6 +239,157 @@ pub enum EngineKind {
     /// weight streaming (disk-tier O1), orthogonal to the host interposer.
     #[value(name = "sycl-llama")]
     SyclLlama,
+}
+
+/// Image and video input limits for the API (VLM models only). Unset flags
+/// keep the API's defaults.
+#[derive(Args, Debug, Clone, Default, PartialEq)]
+pub struct ApiMediaArgs {
+    /// ffmpeg binary that decodes `video_url` parts into frames (`ffprobe`
+    /// is taken from the same directory, else from PATH). Default: `ffmpeg`
+    /// on PATH. Without one, video files get a 400 and `/v1/models` does not
+    /// list `video`; frame lists (`video_url.url` an array of images) need
+    /// no ffmpeg. A decode-only LGPL build is enough.
+    #[arg(long, value_name = "PATH")]
+    pub api_ffmpeg: Option<PathBuf>,
+
+    /// Images one request may carry (default 8). A video's frames do not
+    /// count against it.
+    #[arg(long, value_name = "N")]
+    pub api_max_images: Option<usize>,
+
+    /// Videos (files and frame lists) one request may carry (default 1); 0
+    /// turns video off and keeps the video allowance out of the body limit.
+    #[arg(long, value_name = "N")]
+    pub api_max_videos: Option<usize>,
+
+    /// Frames sampled from one video at most (default 16), and the most a
+    /// frame list may carry (past it a 400). Each costs one image's tokens.
+    #[arg(long, value_name = "N")]
+    pub api_max_video_frames: Option<usize>,
+
+    /// Frames sampled per second of video before the frame cap spreads them
+    /// out (default 1.0); also the rate of a frame list sent without `fps`.
+    #[arg(long, value_name = "FPS")]
+    pub api_video_fps: Option<f64>,
+
+    /// Longest video accepted, in seconds (default 600).
+    #[arg(long, value_name = "SECS")]
+    pub api_max_video_seconds: Option<f64>,
+
+    /// Pixel budget of one video frame (default 200704, 448x448); frames are
+    /// scaled to fit, keeping the aspect ratio.
+    #[arg(long, value_name = "PIXELS")]
+    pub api_max_video_frame_pixels: Option<u64>,
+
+    /// Largest source frame a video may have, in pixels (default 8294400,
+    /// 3840x2160); larger videos are refused before decoding. Each video is
+    /// also held to 600 s of 1080p30 worth of source pixels.
+    #[arg(long, value_name = "PIXELS")]
+    pub api_max_video_source_pixels: Option<u64>,
+
+    /// Encoded video bytes one request may carry, in MiB (default 32, at
+    /// most 1024), on top of the image and text allowances.
+    #[arg(long, value_name = "MIB")]
+    pub api_max_video_mb: Option<f64>,
+
+    /// Seconds one video's probe and decode may take before ffmpeg is
+    /// killed and the request refused (default 30, at most 3600).
+    #[arg(long, value_name = "SECS")]
+    pub api_video_decode_timeout: Option<f64>,
+}
+
+/// The longest `--api-video-decode-timeout` taken.
+const MAX_VIDEO_DECODE_TIMEOUT_SECS: f64 = 3600.0;
+
+impl ApiMediaArgs {
+    /// Whether any video flag was given (they do nothing without images).
+    fn any_video_flag(&self) -> bool {
+        let Self {
+            api_ffmpeg,
+            api_max_images: _,
+            api_max_videos,
+            api_max_video_frames,
+            api_video_fps,
+            api_max_video_seconds,
+            api_max_video_frame_pixels,
+            api_max_video_source_pixels,
+            api_max_video_mb,
+            api_video_decode_timeout,
+        } = self;
+        api_ffmpeg.is_some()
+            || api_max_videos.is_some()
+            || api_max_video_frames.is_some()
+            || api_video_fps.is_some()
+            || api_max_video_seconds.is_some()
+            || api_max_video_frame_pixels.is_some()
+            || api_max_video_source_pixels.is_some()
+            || api_max_video_mb.is_some()
+            || api_video_decode_timeout.is_some()
+    }
+
+    /// Write the given limits over `media`'s defaults, refusing values that
+    /// cannot work.
+    fn apply(&self, media: &mut cascadia_api::MediaConfig) -> Result<()> {
+        let positive = |name: &str, v: f64| {
+            if v.is_finite() && v > 0.0 {
+                Ok(v)
+            } else {
+                Err(anyhow!("--{name} must be a positive number, not {v}"))
+            }
+        };
+        if let Some(n) = self.api_max_images {
+            media.max_images = n;
+        }
+        if let Some(n) = self.api_max_videos {
+            media.max_videos = n;
+        }
+        if let Some(n) = self.api_max_video_frames {
+            if n == 0 {
+                return Err(anyhow!("--api-max-video-frames must be at least 1"));
+            }
+            media.max_video_frames = n;
+        }
+        if let Some(v) = self.api_video_fps {
+            media.video_fps = positive("api-video-fps", v)?;
+        }
+        if let Some(v) = self.api_max_video_seconds {
+            media.max_video_seconds = positive("api-max-video-seconds", v)?;
+        }
+        if let Some(n) = self.api_max_video_frame_pixels {
+            if n < 4 {
+                return Err(anyhow!("--api-max-video-frame-pixels must be at least 4"));
+            }
+            media.max_video_frame_pixels = n;
+        }
+        if let Some(n) = self.api_max_video_source_pixels {
+            if n < 4 {
+                return Err(anyhow!("--api-max-video-source-pixels must be at least 4"));
+            }
+            media.max_video_source_pixels = n;
+        }
+        if let Some(v) = self.api_max_video_mb {
+            let v = positive("api-max-video-mb", v)?;
+            if v > 1024.0 {
+                return Err(anyhow!("--api-max-video-mb must be at most 1024, not {v}"));
+            }
+            media.max_request_video_bytes = (v * 1048576.0) as usize;
+        }
+        if let Some(v) = self.api_video_decode_timeout {
+            // Past an hour the deadline is no bound at all, and a huge value
+            // would panic in `Duration` or overflow `Instant::now() + timeout`
+            // on the first video.
+            let v = positive("api-video-decode-timeout", v)?;
+            if v > MAX_VIDEO_DECODE_TIMEOUT_SECS {
+                return Err(anyhow!(
+                    "--api-video-decode-timeout must be at most {MAX_VIDEO_DECODE_TIMEOUT_SECS} \
+                     seconds, not {v}"
+                ));
+            }
+            media.video_decode_timeout = std::time::Duration::from_secs_f64(v);
+        }
+        Ok(())
+    }
 }
 
 #[derive(Parser, Debug, Clone)]
@@ -405,11 +561,28 @@ pub struct WorkerArgs {
 
     /// Largest `/v1/chat/completions` request body (MiB); the rendered prompt
     /// is capped at the same size. 1 MiB ≈ 250 K tokens of English, the
-    /// window of the largest served models. Only `qwen35` also bounds the
-    /// prompt in TOKENS (against `max_position_embeddings`); on other engines
-    /// this byte cap is the whole guard, so lower it on an exposed endpoint.
+    /// window of the largest served models. `qwen35`, `gemma4`, `ov-genai`,
+    /// `ov-runtime` and `ov-dist-spec` also bound the prompt in TOKENS (against
+    /// the model window, or a static tree's KV window); on other engines this
+    /// byte cap is the whole guard, so lower it on an exposed endpoint.
     #[arg(long, default_value_t = 1.0)]
     pub api_max_body_mb: f64,
+
+    /// Fetch `https://` image URLs in chat requests (VLM models only).
+    /// Off by default: `data:` URLs always work, and enabling this makes the
+    /// server issue outbound requests for callers. Fetches go to public
+    /// addresses on port 443 only, pinned to the checked address, with at
+    /// most 3 redirects and the request's image byte budget.
+    #[arg(long)]
+    pub api_allow_image_urls: bool,
+
+    #[command(flatten)]
+    pub api_media: ApiMediaArgs,
+
+    /// Device for the `qwen35` vision encoder on rank 0 (e.g. `GPU` for the
+    /// iGPU while the stages run on `CPU`). Defaults to `--device`.
+    #[arg(long)]
+    pub vision_device: Option<String>,
 
     /// OV performance hint (PERFORMANCE_HINT). LATENCY suits single-user
     /// decode; THROUGHPUT enables NUM_STREAMS auto-tuning. See OpenVINO
@@ -810,9 +983,27 @@ pub struct RunArgs {
     #[arg(long, default_value_t = 1.0)]
     pub api_max_body_mb: f64,
 
+    /// Fetch `https://` image URLs (VLM models; public addresses only). See
+    /// `cascadia worker --help`.
+    #[arg(long)]
+    pub api_allow_image_urls: bool,
+
+    #[command(flatten)]
+    pub api_media: ApiMediaArgs,
+
+    /// Device for the `qwen35` vision encoder (e.g. `GPU`). See
+    /// `cascadia worker --help`.
+    #[arg(long)]
+    pub vision_device: Option<String>,
+
     /// Expert placement JSON (requires --ep-workers). See worker --help.
     #[arg(long)]
     pub ep_placement: Option<PathBuf>,
+
+    /// OpenVINO compiled-blob cache dir (plugin CACHE_DIR). Unset uses the
+    /// platform cache; `""` disables. See `cascadia worker --help`.
+    #[arg(long)]
+    pub ov_cache_dir: Option<String>,
 
     /// Elastic memory posture — serve large allocations from file-backed
     /// mappings so RAM stays kernel-reclaimable (ramlab exp 198). See
@@ -909,8 +1100,12 @@ impl WorkerArgs {
         api: String,
         prefix_cache_gb: Option<f64>,
         api_max_body_mb: f64,
+        api_allow_image_urls: bool,
+        api_media: ApiMediaArgs,
+        vision_device: Option<String>,
         ep_workers: Vec<String>,
         ep_placement: Option<PathBuf>,
+        ov_cache_dir: Option<String>,
     ) -> Self {
         WorkerArgs {
             rank: 0,
@@ -926,11 +1121,14 @@ impl WorkerArgs {
             engine,
             prefix_cache_gb,
             api_max_body_mb,
+            api_allow_image_urls,
+            api_media,
+            vision_device,
             ep_workers,
             ep_worker_index: None,
             ep_worker_count: None,
             ep_placement,
-            ov_cache_dir: None,
+            ov_cache_dir,
             ov_kv_precision: None,
             ov_dyn_quant_group: None,
             ov_performance_mode: None,
@@ -1065,6 +1263,48 @@ pub struct ShardArgs {
     /// faster start.
     #[arg(long)]
     pub skip_check: bool,
+
+    /// HuggingFace revision of `--model` (branch, tag or commit). Defaults to
+    /// the hub's current commit; either way the commit is recorded in
+    /// `cascadia-export.json`.
+    #[arg(long)]
+    pub revision: Option<String>,
+
+    /// For a vision-language model, shard the text tower alone: the tree then
+    /// serves text only. Without it such a model gets a vision tree (an
+    /// OpenVINO VLM export is cut with `tools/vlm_surgery/cut_vlm_lm.py`, a raw
+    /// checkpoint is exported with optimum-intel first), or is refused when no
+    /// vision tree can be made.
+    #[arg(long)]
+    pub text_only: bool,
+}
+
+/// `cascadia export`: one whole-model OpenVINO IR directory from a HuggingFace
+/// model. Flattenable like [`ShardArgs`].
+#[derive(Parser, Debug, Clone)]
+pub struct ExportArgs {
+    /// HuggingFace repo id or a local checkpoint directory. A source that is
+    /// already an OpenVINO export is left as it is (nothing is written).
+    #[arg(long)]
+    pub model: String,
+
+    /// Output directory for the OpenVINO IR (will be created). Also gets
+    /// `cascadia-export.json`.
+    #[arg(long, short = 'o')]
+    pub output_dir: String,
+
+    /// optimum-cli `--weight-format` (default int4).
+    #[arg(long)]
+    pub weight_format: Option<String>,
+
+    /// HuggingFace revision of `--model`. Defaults to the hub's current commit.
+    #[arg(long)]
+    pub revision: Option<String>,
+
+    /// Override the python interpreter used to run the bundled exporter.
+    /// Defaults to `python3` then `python` on PATH.
+    #[arg(long)]
+    pub python: Option<String>,
 }
 
 #[derive(ValueEnum, Clone, Copy, Debug)]
@@ -1220,6 +1460,7 @@ pub async fn run(cli: Cli) -> Result<()> {
         Command::Worker(args) => cmd_worker(args).await,
         Command::Discover(args) => cmd_discover(args).await,
         Command::Shard(args) => cmd_shard(args).await,
+        Command::Export(args) => cmd_export(args),
         Command::ProfileDevices(args) => cmd_profile_devices(args),
         Command::ProfileStages(args) => cmd_profile_per_stage(args),
         Command::Place(args) => cmd_place(args),
@@ -1237,8 +1478,12 @@ async fn cmd_run(args: RunArgs) -> Result<()> {
         args.api,
         args.prefix_cache_gb,
         args.api_max_body_mb,
+        args.api_allow_image_urls,
+        args.api_media,
+        args.vision_device,
         args.ep_workers,
         args.ep_placement,
+        args.ov_cache_dir,
     );
     // Carry the elastic posture onto the worker so the OV memory-knob seeding
     // (ov_perf_properties) fires; the interposer itself was already activated
@@ -1534,6 +1779,19 @@ fn parse_ov_config(entries: &[String]) -> Vec<(String, String)> {
         .collect()
 }
 
+/// The engine as the API's media setup sees it ([`cascadia_api::media_setup`]).
+fn media_engine(engine: EngineKind) -> cascadia_api::MediaEngine {
+    use cascadia_api::MediaEngine as M;
+    match engine {
+        EngineKind::OvGenai => M::OvGenai,
+        EngineKind::OvRuntime => M::OvRuntime,
+        EngineKind::Gemma4 => M::Gemma4,
+        EngineKind::Qwen36Moe => M::Qwen35,
+        EngineKind::OvDistSpec => M::OvDistSpec,
+        _ => M::Other,
+    }
+}
+
 /// Load a whole-model chat template for ov-genai, tolerating both layouts:
 /// `tokenizer/tokenizer_config.json` (HF subdir) and a root-level
 /// `tokenizer_config.json` / `chat_template.jinja` (OV int4 exports).
@@ -1547,10 +1805,6 @@ fn ovgenai_chat_template(model: &str) -> cascadia_api::ChatTemplateConfig {
     }
 }
 
-/// Warn when a performance flag the user explicitly set will be silently
-/// ignored for the chosen engine/device, so an ineffective flag is visible at
-/// runtime instead of vanishing (mirrors the `--ffn-sparsity-capture-dir`
-/// warning in `build_builder`'s sparse-moe arm).
 /// `--cb` targeting the CPU plugin specifically.
 ///
 /// Deliberately an exact match rather than a prefix: `AUTO`/`HETERO` strings
@@ -1560,6 +1814,10 @@ fn cb_on_plain_cpu(args: &WorkerArgs) -> bool {
     args.cb && args.device.trim().eq_ignore_ascii_case("CPU")
 }
 
+/// Warn when a performance flag the user explicitly set will be silently
+/// ignored for the chosen engine/device, so an ineffective flag is visible at
+/// runtime instead of vanishing (mirrors the `--ffn-sparsity-capture-dir`
+/// warning in `build_builder`'s sparse-moe arm).
 fn warn_ignored_ov_perf_flags(args: &WorkerArgs) {
     // NPU LLM knobs apply only to ov-genai on an NPU device (see
     // `ov_perf_properties`). If the user set one but that gate won't fire, the
@@ -1960,6 +2218,9 @@ fn build_builder(args: &WorkerArgs, prefix_cache_bytes: usize) -> Result<Box<dyn
                 b = b.with_dyn_quant_group(group);
             }
             b = b.with_ov_properties(ov_perf_properties(args));
+            if let Some(dev) = &args.vision_device {
+                b = b.with_vision_device(dev);
+            }
             info!(
                 prefix_cache_gib = prefix_cache_bytes >> 30,
                 "qwen35 prefix-cache budget"
@@ -2575,6 +2836,53 @@ async fn cmd_worker(args: WorkerArgs) -> Result<()> {
         // forwards the structured turns + tools); the API-side render is
         // only a placeholder so tool requests are not refused here
         cfg.engine_applies_template = matches!(args.engine, EngineKind::SyclLlama);
+        // Image input: ov-genai on a VLM-layout export (vision encoder IRs
+        // present). Every other engine answers `image_url` parts with a 400.
+        // The body limit grows by the image allowance; the prompt cap does not.
+        // `qwen35` trees carrying the vision IRs encode images on rank 0 (the
+        // rank that serves this API) and take Qwen's native tag.
+        // `ov-runtime` serves images on a Gemma 4 vision tree (a `vision` block
+        // in pipeline_config.json; rank 0 encodes them) with Gemma's own tag.
+        // `ov-dist-spec` serves them on a causal 1-D-position target tree
+        // (Pixtral / Mistral 3, Phi-3.5-vision, InternVL2, LLaVA-NeXT; cut
+        // with cut_vlm_lm.py --all-logits): rank 0 encodes, the draft stays text.
+        let setup =
+            cascadia_api::media_setup(media_engine(args.engine), std::path::Path::new(&args.model));
+        for note in &setup.notes {
+            warn!("{note}");
+        }
+        cfg.no_media_reason = setup.no_media_reason;
+        if let Some(mut media) = setup.config {
+            media.allow_remote_urls = args.api_allow_image_urls;
+            args.api_media.apply(&mut media)?;
+            // Video is served as frames through the image path, or whole
+            // where the engine takes it natively (`MediaConfig::native_video`),
+            // decoded by ffmpeg: on when one is found. A path the operator named must
+            // work; a missing default is one line, not a failure.
+            match cascadia_api::attach_ffmpeg(&mut media, args.api_media.api_ffmpeg.as_deref()) {
+                Ok(None) => {}
+                Ok(Some(note)) => info!("{note} (pass --api-ffmpeg to enable it)"),
+                Err(why) => return Err(anyhow!("--api-ffmpeg: {why}")),
+            }
+            info!(
+                max_images = media.max_images,
+                max_image_pixels = media.max_image_pixels,
+                remote_urls = media.allow_remote_urls,
+                video_files = media.accepts_video(),
+                max_videos = media.max_videos,
+                max_video_frames = media.max_video_frames,
+                native_video = media.native_video,
+                "VLM export: accepting image_url content parts"
+            );
+            cfg.media = Some(media);
+        } else {
+            if args.api_allow_image_urls {
+                warn!("--api-allow-image-urls has no effect: this model takes no image input");
+            }
+            if args.api_media.any_video_flag() || args.api_media.api_max_images.is_some() {
+                warn!("the --api-max-* and video flags have no effect: this model takes no image input");
+            }
+        }
         // `CASCADIA_API_MAX_CONCURRENT`: in-flight request cap (backpressure is
         // 503 beyond it). A multi-stream engine serves `CASCADIA_STREAMS` at
         // once, so a client that sends that many requests at once needs the
@@ -2717,6 +3025,8 @@ async fn cmd_worker(args: WorkerArgs) -> Result<()> {
             trust_remote_code: false,
             tenant: String::new(), // H.1b: single-tenant CLI path — LOCAL_NS
             resume_token_ids: None,
+            media: Vec::new(),
+            prompt_rendered: false,
         };
         // `generate_async`, not `generate`: this loop runs on the tokio
         // runtime, and the sync path would block a worker on the engine
@@ -2759,10 +3069,7 @@ const EXPORT_REQUIREMENTS: &str = include_str!(concat!(
 /// Every entry is double-quoted: `>=`/`<`/`[extras]` need quoting, and double
 /// quotes are the only form that survives sh, zsh, PowerShell and cmd.exe alike.
 pub(crate) fn export_pip_install_line(python: &str) -> String {
-    let pkgs: Vec<String> = EXPORT_REQUIREMENTS
-        .lines()
-        .map(|l| l.split('#').next().unwrap_or("").trim()) // drop comments
-        .filter(|l| !l.is_empty())
+    let pkgs: Vec<String> = export_requirement_lines()
         .map(|p| format!("\"{p}\""))
         .collect();
     // Quote the interpreter only when it needs it. No PowerShell `&` call
@@ -2775,6 +3082,36 @@ pub(crate) fn export_pip_install_line(python: &str) -> String {
         python.to_string()
     };
     format!("{py} -m pip install {}", pkgs.join(" "))
+}
+
+/// The requirement lines of EXPORT_REQUIREMENTS, comments and blanks dropped.
+/// The pip line and [`export_requirements`] both read through here, so they
+/// cannot drift from each other or from this binary's exporter.
+fn export_requirement_lines() -> impl Iterator<Item = &'static str> {
+    EXPORT_REQUIREMENTS
+        .lines()
+        .map(|l| l.split('#').next().unwrap_or("").trim())
+        .filter(|l| !l.is_empty())
+}
+
+/// The exporter's pinned deps as `(name, PEP 440 specifier)` pairs, e.g.
+/// `("transformers", ">=5.5,<5.6")`, parsed from the requirements.txt compiled
+/// into this binary. For callers that check installed versions before running
+/// the exporter, so they never keep a copy of the pins.
+pub fn export_requirements() -> &'static [(&'static str, &'static str)] {
+    static REQS: std::sync::OnceLock<Vec<(&'static str, &'static str)>> =
+        std::sync::OnceLock::new();
+    REQS.get_or_init(|| {
+        export_requirement_lines()
+            .map(|l| {
+                let at = l.find(['<', '>', '=', '!', '~']).unwrap_or(l.len());
+                let (name, spec) = l.split_at(at);
+                // `pkg[extra]>=1` names the package `pkg`.
+                let name = name.split('[').next().unwrap_or(name).trim();
+                (name, spec.trim())
+            })
+            .collect()
+    })
 }
 
 /// Sibling modules the exporter imports at runtime: the dedicated Gemma-4
@@ -2803,6 +3140,44 @@ const GEMMA4_TEXT_SCRIPT: &str = include_str!(concat!(
     env!("CARGO_MANIFEST_DIR"),
     "/../../tools/gemma4_surgery/export_gemma4_text.py"
 ));
+/// The VLM tree cutter and its Phi-3 long-RoPE helper, dispatched by
+/// export_shards.py (through cascadia_export.py) for a vision-language model
+/// whose language model it can cut.
+const CUT_VLM_SCRIPT: &str = include_str!(concat!(
+    env!("CARGO_MANIFEST_DIR"),
+    "/../../tools/vlm_surgery/cut_vlm_lm.py"
+));
+const LONGROPE_SCRIPT: &str = include_str!(concat!(
+    env!("CARGO_MANIFEST_DIR"),
+    "/../../tools/vlm_surgery/longrope.py"
+));
+/// `cascadia export` itself, plus the VLM routing and the
+/// cascadia-export.json sidecar `cascadia shard` shares with it.
+const CASCADIA_EXPORT_SCRIPT: &str = include_str!(concat!(
+    env!("CARGO_MANIFEST_DIR"),
+    "/../../tools/cascadia_export.py"
+));
+
+/// Write the embedded exporter and every module it imports into one flat
+/// dir (the scripts import their siblings from beside themselves), plus
+/// requirements.txt so a refusal can print the install line.
+fn write_embedded_exporter(dir: &std::path::Path) -> Result<()> {
+    for (name, body) in [
+        ("export_shards.py", EXPORT_SCRIPT),
+        ("export_gemma4.py", GEMMA4_SCRIPT),
+        ("model_aliases.py", ALIASES_SCRIPT),
+        ("export_qwen36_moe.py", QWEN36_SCRIPT),
+        ("export_gemma4_text.py", GEMMA4_TEXT_SCRIPT),
+        ("cut_vlm_lm.py", CUT_VLM_SCRIPT),
+        ("longrope.py", LONGROPE_SCRIPT),
+        ("cascadia_export.py", CASCADIA_EXPORT_SCRIPT),
+        ("requirements.txt", EXPORT_REQUIREMENTS),
+    ] {
+        std::fs::write(dir.join(name), body)
+            .with_context(|| format!("writing embedded {name} to temp dir"))?;
+    }
+    Ok(())
+}
 
 /// Assemble the flag list passed to the embedded Python exporter (the args
 /// after `python -u <script>`). Pure + side-effect-free so it's unit-testable
@@ -2870,7 +3245,34 @@ fn shard_exporter_flags(args: &ShardArgs) -> Result<Vec<String>> {
         flags.push("--stage".into());
         flags.push(s.to_string());
     }
+    if let Some(r) = &args.revision {
+        flags.push("--revision".into());
+        flags.push(r.clone());
+    }
+    if args.text_only {
+        flags.push("--text-only".into());
+    }
     Ok(flags)
+}
+
+/// The flags passed to the embedded `cascadia_export.py` (after `python -u
+/// <script>`). Pure, so it is unit-testable without spawning Python.
+fn export_flags(args: &ExportArgs) -> Vec<String> {
+    let mut flags = vec![
+        "--model".into(),
+        args.model.clone(),
+        "--output-dir".into(),
+        args.output_dir.clone(),
+    ];
+    if let Some(w) = &args.weight_format {
+        flags.push("--weight-format".into());
+        flags.push(w.clone());
+    }
+    if let Some(r) = &args.revision {
+        flags.push("--revision".into());
+        flags.push(r.clone());
+    }
+    flags
 }
 
 /// The imports the bundled exporter needs. Shared with `cascadia doctor` so the
@@ -2945,7 +3347,7 @@ pub(crate) fn resolve_python(explicit: Option<&str>, check_deps: bool) -> Result
             "cannot run the interpreter passed to --python: {p:?}"
         )),
         (None, None) => Err(anyhow!(
-            "no Python interpreter found on PATH. Install Python 3.10+ or pass --python <path>."
+            "no Python interpreter found on PATH. Install Python 3.10-3.13 or pass --python <path>."
         )),
     }
 }
@@ -2968,6 +3370,79 @@ fn shard_tree_engine(dir: &std::path::Path) -> &'static str {
         return "qwen35";
     }
     "ov-runtime"
+}
+
+/// The interpreter runs but can't import `imports`: re-run the import so the
+/// user sees the real ModuleNotFoundError, with the install line.
+fn export_deps_error(python: &str, imports: &str) -> anyhow::Error {
+    use std::process::{Command, Stdio};
+    let stderr = Command::new(python)
+        .args(["-c", imports])
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .output()
+        .map(|o| String::from_utf8_lossy(&o.stderr).into_owned())
+        .unwrap_or_default();
+    anyhow!(
+        "python environment check failed for interpreter {python:?}:\n{}\n\
+         Install: {}\n\
+         (or point at another interpreter with --python <path>)",
+        stderr.trim(),
+        export_pip_install_line(python)
+    )
+}
+
+/// What `cascadia export` imports on top of the shard exporter's deps.
+const OPTIMUM_IMPORTS: &str = "import optimum.intel, nncf";
+
+fn cmd_export(args: ExportArgs) -> Result<()> {
+    use std::process::{Command, Stdio};
+
+    // The whole environment is checked before any download or export.
+    let env = resolve_python(args.python.as_deref(), true)?;
+    let python = env.path.clone();
+    eprintln!("Checking Python environment for required packages...");
+    let Some(versions) = env.deps else {
+        return Err(export_deps_error(&python, EXPORT_IMPORTS));
+    };
+    for line in versions.lines() {
+        eprintln!("  {line}");
+    }
+    let optimum_ok = Command::new(&python)
+        .args(["-c", OPTIMUM_IMPORTS])
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .is_ok_and(|s| s.success());
+    if !optimum_ok {
+        return Err(export_deps_error(&python, OPTIMUM_IMPORTS));
+    }
+
+    let tmpdir = tempfile::Builder::new()
+        .prefix("cascadia-export-")
+        .tempdir()
+        .context("creating temp dir for embedded exporter")?;
+    write_embedded_exporter(tmpdir.path())?;
+    let flags = export_flags(&args);
+    eprintln!(
+        "Running exporter: {} -u <embedded cascadia_export.py> {}",
+        python,
+        flags.join(" ")
+    );
+    let status = Command::new(&python)
+        .arg("-u")
+        .arg(tmpdir.path().join("cascadia_export.py"))
+        .args(&flags)
+        .stdin(Stdio::null())
+        .status()
+        .context("spawning python exporter")?;
+    if !status.success() {
+        return Err(anyhow!(
+            "exporter exited with {} — see output above",
+            status
+        ));
+    }
+    Ok(())
 }
 
 async fn cmd_shard(args: ShardArgs) -> Result<()> {
@@ -3015,25 +3490,7 @@ async fn cmd_shard(args: ShardArgs) -> Result<()> {
                     }
                 }
             }
-            // The chosen interpreter runs but can't import the deps: re-run the
-            // import so the user sees the real ModuleNotFoundError.
-            None => {
-                let out = Command::new(&python)
-                    .args(["-c", EXPORT_IMPORTS])
-                    .stdout(Stdio::piped())
-                    .stderr(Stdio::piped())
-                    .output();
-                let stderr = out
-                    .map(|o| String::from_utf8_lossy(&o.stderr).into_owned())
-                    .unwrap_or_default();
-                return Err(anyhow!(
-                    "python environment check failed for interpreter {python:?}:\n{}\n\
-                     Install: {}\n\
-                     (or point at another interpreter with --python <path>)",
-                    stderr.trim(),
-                    export_pip_install_line(&python)
-                ));
-            }
+            None => return Err(export_deps_error(&python, EXPORT_IMPORTS)),
         }
     }
 
@@ -3046,16 +3503,7 @@ async fn cmd_shard(args: ShardArgs) -> Result<()> {
         .tempdir()
         .context("creating temp dir for embedded exporter")?;
     let script_path = _tmpdir.path().join("export_shards.py");
-    for (name, body) in [
-        ("export_shards.py", EXPORT_SCRIPT),
-        ("export_gemma4.py", GEMMA4_SCRIPT),
-        ("model_aliases.py", ALIASES_SCRIPT),
-        ("export_qwen36_moe.py", QWEN36_SCRIPT),
-        ("export_gemma4_text.py", GEMMA4_TEXT_SCRIPT),
-    ] {
-        std::fs::write(_tmpdir.path().join(name), body)
-            .with_context(|| format!("writing embedded {name} to temp dir"))?;
-    }
+    write_embedded_exporter(_tmpdir.path())?;
 
     // Build python argv: `python -u <script> <flags…>` (flags already
     // validated + assembled by `shard_exporter_flags`).
@@ -3138,7 +3586,11 @@ mod python_tests {
             ":8000".into(),
             None,
             1.0,
+            false,
+            ApiMediaArgs::default(),
+            None,
             Vec::new(),
+            None,
             None,
         );
         a.engine = engine;
@@ -3361,11 +3813,29 @@ mod python_tests {
     }
 
     #[test]
+    fn export_requirements_are_the_pip_line_pins_split_into_name_and_spec() {
+        let reqs = export_requirements();
+        assert!(reqs.contains(&("transformers", ">=5.5,<5.6")), "{reqs:?}");
+        assert!(reqs.contains(&("huggingface_hub", ">=0.30")), "{reqs:?}");
+        // Same entries as the pip line, in the same order: one source.
+        let line = export_pip_install_line("python");
+        let quoted: Vec<String> = reqs.iter().map(|(n, s)| format!("\"{n}{s}\"")).collect();
+        assert_eq!(line, format!("python -m pip install {}", quoted.join(" ")));
+        for (name, spec) in reqs {
+            assert!(
+                !name.is_empty() && !name.contains(['<', '>', '=', ' ']),
+                "{name}"
+            );
+            assert!(!spec.is_empty(), "{name} has no specifier");
+        }
+    }
+
+    #[test]
     fn pip_line_quotes_every_specifier_and_targets_the_interpreter() {
         let line = export_pip_install_line("python3");
         assert!(line.starts_with("python3 -m pip install "), "{line}");
         // Double quotes: the only form valid in sh, zsh, PowerShell and cmd.exe.
-        assert!(line.contains("\"transformers>=5.2,<5.5\""), "{line}");
+        assert!(line.contains("\"transformers>=5.5,<5.6\""), "{line}");
         assert!(line.contains("\"safetensors>=0.4\""), "{line}");
         // Comments and blank lines from requirements.txt never leak through.
         assert!(!line.contains('#'), "{line}");
@@ -3583,7 +4053,11 @@ mod ov_property_tests {
             "127.0.0.1:8080".into(),
             None,
             1.0,
+            false,
+            ApiMediaArgs::default(),
+            None,
             Vec::new(),
+            None,
             None,
         )
     }
@@ -3787,6 +4261,7 @@ mod cli_version_tests {
 
 #[cfg(test)]
 mod tests {
+    /// ov-genai's reserved tags follow the export's `config.json` model type.
     use super::*;
 
     #[test]
@@ -4034,6 +4509,97 @@ mod tests {
         assert!(has_pair(&flags, "--stage", "1"));
     }
 
+    /// `--revision` and `--text-only` reach the exporter only when set, so a
+    /// shard without them passes exactly today's flags.
+    #[test]
+    fn shard_flags_forward_revision_and_text_only() {
+        let base = [
+            "cascadia",
+            "shard",
+            "--model",
+            "m",
+            "-o",
+            "o",
+            "--num-stages",
+            "2",
+        ];
+        let plain = shard_exporter_flags(&parse_shard(&base)).expect("plain flags");
+        assert!(!plain
+            .iter()
+            .any(|f| f == "--revision" || f == "--text-only"));
+        let mut argv = base.to_vec();
+        argv.extend(["--revision", "abc123", "--text-only"]);
+        let flags = shard_exporter_flags(&parse_shard(&argv)).expect("flags");
+        assert!(has_pair(&flags, "--revision", "abc123"));
+        assert_eq!(flags.last().map(String::as_str), Some("--text-only"));
+    }
+
+    /// `cascadia export` parses into `ExportArgs` and forwards only what was set.
+    #[test]
+    fn export_args_parse_and_forward() {
+        let cli = Cli::try_parse_from([
+            "cascadia",
+            "export",
+            "--model",
+            "Qwen/Qwen2-VL-2B-Instruct",
+            "--output-dir",
+            "out",
+        ])
+        .expect("parse export");
+        let Command::Export(args) = cli.cmd else {
+            panic!("expected export subcommand");
+        };
+        assert_eq!(
+            export_flags(&args),
+            [
+                "--model",
+                "Qwen/Qwen2-VL-2B-Instruct",
+                "--output-dir",
+                "out"
+            ]
+        );
+        let cli = Cli::try_parse_from([
+            "cascadia",
+            "export",
+            "--model",
+            "m",
+            "-o",
+            "out",
+            "--weight-format",
+            "int8",
+            "--revision",
+            "r1",
+            "--python",
+            "/usr/bin/python3",
+        ])
+        .expect("parse export");
+        let Command::Export(args) = cli.cmd else {
+            panic!("expected export subcommand");
+        };
+        assert_eq!(args.python.as_deref(), Some("/usr/bin/python3"));
+        let flags = export_flags(&args);
+        assert!(has_pair(&flags, "--weight-format", "int8"));
+        assert!(has_pair(&flags, "--revision", "r1"));
+        assert!(!flags.iter().any(|f| f == "--python"));
+    }
+
+    /// Every module the exporter imports lands beside it in the flat temp dir.
+    #[test]
+    fn embedded_exporter_is_written_flat() {
+        let dir = tempfile::tempdir().unwrap();
+        write_embedded_exporter(dir.path()).unwrap();
+        for name in [
+            "export_shards.py",
+            "export_gemma4_text.py",
+            "cut_vlm_lm.py",
+            "longrope.py",
+            "cascadia_export.py",
+            "requirements.txt",
+        ] {
+            assert!(dir.path().join(name).is_file(), "{name} missing");
+        }
+    }
+
     /// `--target npu` parses into the NPU variant.
     #[test]
     fn shard_target_npu_parses() {
@@ -4104,13 +4670,154 @@ mod tests {
             args.api,
             args.prefix_cache_gb,
             args.api_max_body_mb,
+            args.api_allow_image_urls,
+            args.api_media,
+            args.vision_device,
             Vec::new(),
             args.ep_placement,
+            args.ov_cache_dir,
         );
         assert_eq!(worker.prefix_cache_gb, Some(0.0));
         assert_eq!(worker.api_max_body_mb, 2.0);
+        assert!(
+            !worker.api_allow_image_urls,
+            "remote image URLs are off unless asked for"
+        );
         assert_eq!(worker.rank, 0);
         assert_eq!(worker.total, 1);
+    }
+
+    /// `run --api-allow-image-urls` must reach the worker that builds the API.
+    #[test]
+    fn run_forwards_the_image_url_opt_in() {
+        let cli = Cli::try_parse_from(["cascadia", "run", "m", "--api-allow-image-urls"])
+            .expect("parse run argv");
+        let Command::Run(args) = cli.cmd else {
+            panic!("expected run");
+        };
+        let worker = WorkerArgs::single_node(
+            args.model,
+            args.device,
+            args.engine,
+            args.api,
+            args.prefix_cache_gb,
+            args.api_max_body_mb,
+            args.api_allow_image_urls,
+            args.api_media,
+            args.vision_device,
+            args.ep_workers,
+            args.ep_placement,
+            args.ov_cache_dir,
+        );
+        assert!(worker.api_allow_image_urls);
+    }
+
+    /// `run`'s image and video limits reach the worker, and land on the
+    /// API's media settings; unset flags keep the API's defaults.
+    #[test]
+    fn run_forwards_the_media_limits() {
+        let cli = Cli::try_parse_from([
+            "cascadia",
+            "run",
+            "m",
+            "--api-ffmpeg",
+            "/opt/ffmpeg/bin/ffmpeg",
+            "--api-max-images",
+            "32",
+            "--api-max-video-frames",
+            "8",
+            "--api-video-fps",
+            "2",
+            "--api-max-video-seconds",
+            "60",
+            "--api-max-video-mb",
+            "8",
+            "--api-max-video-source-pixels",
+            "2073600",
+            "--api-video-decode-timeout",
+            "5",
+        ])
+        .expect("parse run argv");
+        let Command::Run(args) = cli.cmd else {
+            panic!("expected run");
+        };
+        let worker = WorkerArgs::single_node(
+            args.model,
+            args.device,
+            args.engine,
+            args.api,
+            args.prefix_cache_gb,
+            args.api_max_body_mb,
+            args.api_allow_image_urls,
+            args.api_media,
+            args.vision_device,
+            args.ep_workers,
+            args.ep_placement,
+            args.ov_cache_dir,
+        );
+        let m = &worker.api_media;
+        assert_eq!(
+            m.api_ffmpeg.as_deref(),
+            Some(std::path::Path::new("/opt/ffmpeg/bin/ffmpeg"))
+        );
+        assert!(m.any_video_flag());
+        let mut media = cascadia_api::MediaConfig::ov_genai(None);
+        m.apply(&mut media).unwrap();
+        assert_eq!(media.max_images, 32);
+        assert_eq!(media.max_video_frames, 8);
+        assert_eq!(media.video_fps, 2.0);
+        assert_eq!(media.max_video_seconds, 60.0);
+        assert_eq!(media.max_request_video_bytes, 8 << 20);
+        assert_eq!(media.max_video_source_pixels, 1920 * 1080);
+        assert_eq!(media.video_decode_timeout.as_secs(), 5);
+        let hour = ApiMediaArgs {
+            api_video_decode_timeout: Some(3600.0),
+            ..Default::default()
+        };
+        let mut at_cap = cascadia_api::MediaConfig::ov_genai(None);
+        hour.apply(&mut at_cap).unwrap();
+        assert_eq!(at_cap.video_decode_timeout.as_secs(), 3600);
+        assert_eq!(media.max_videos, 1, "unset flags keep the default");
+        assert_eq!(media.max_video_frame_pixels, 448 * 448);
+
+        let mut media = cascadia_api::MediaConfig::ov_genai(None);
+        ApiMediaArgs::default().apply(&mut media).unwrap();
+        assert_eq!(media.max_images, 8);
+        assert!(!ApiMediaArgs::default().any_video_flag());
+        for bad in [
+            ApiMediaArgs {
+                api_video_fps: Some(0.0),
+                ..Default::default()
+            },
+            ApiMediaArgs {
+                api_max_video_frames: Some(0),
+                ..Default::default()
+            },
+            ApiMediaArgs {
+                api_video_decode_timeout: Some(f64::NAN),
+                ..Default::default()
+            },
+            ApiMediaArgs {
+                api_max_video_mb: Some(1e12),
+                ..Default::default()
+            },
+            // Would panic in `Duration::from_secs_f64`, or overflow the
+            // per-request deadline.
+            ApiMediaArgs {
+                api_video_decode_timeout: Some(1e20),
+                ..Default::default()
+            },
+            ApiMediaArgs {
+                api_video_decode_timeout: Some(1e11),
+                ..Default::default()
+            },
+            ApiMediaArgs {
+                api_video_decode_timeout: Some(3600.5),
+                ..Default::default()
+            },
+        ] {
+            assert!(bad.apply(&mut media).is_err(), "{bad:?}");
+        }
     }
 
     #[test]
@@ -4137,11 +4844,47 @@ mod tests {
             args.api,
             args.prefix_cache_gb,
             args.api_max_body_mb,
+            args.api_allow_image_urls,
+            args.api_media,
+            args.vision_device,
             args.ep_workers,
             args.ep_placement,
+            args.ov_cache_dir,
         );
         assert_eq!(worker.ep_placement, Some(PathBuf::from("placement.json")));
         assert_eq!(worker.ep_workers, ["127.0.0.1:9201", "127.0.0.1:9202"]);
+    }
+
+    /// `run --ov-cache-dir` reaches the worker as `worker --ov-cache-dir`
+    /// would, `""` (disable) included; unset leaves the platform default.
+    #[test]
+    fn run_forwards_the_ov_cache_dir() {
+        for (argv, want) in [
+            (&["--ov-cache-dir", "/tmp/ovc"][..], Some("/tmp/ovc")),
+            (&["--ov-cache-dir", ""][..], Some("")),
+            (&[][..], None),
+        ] {
+            let cli = Cli::try_parse_from(["cascadia", "run", "m"].iter().chain(argv))
+                .expect("parse run argv");
+            let Command::Run(args) = cli.cmd else {
+                panic!("expected run");
+            };
+            let worker = WorkerArgs::single_node(
+                args.model,
+                args.device,
+                args.engine,
+                args.api,
+                args.prefix_cache_gb,
+                args.api_max_body_mb,
+                args.api_allow_image_urls,
+                args.api_media,
+                args.vision_device,
+                args.ep_workers,
+                args.ep_placement,
+                args.ov_cache_dir,
+            );
+            assert_eq!(worker.ov_cache_dir.as_deref(), want, "{argv:?}");
+        }
     }
 
     /// The engine renamed from `qwen36-moe` to `qwen35`; the old spelling is

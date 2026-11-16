@@ -60,6 +60,23 @@ struct PipelineConfig {
     num_layers: u32,
     #[serde(default)]
     num_kv_shared_layers: u32,
+    #[serde(default)]
+    hidden_size: usize,
+    /// `tools/export_gemma4.py --vision`: stage 0 takes `image_features`.
+    #[serde(default)]
+    vision: Option<G4Vision>,
+}
+
+/// The `vision` block of a gemma4_cached vision tree (E2B/E4B): stage 0
+/// splices `image_features` rows into its embedding at image tokens, and the
+/// tree root carries the vision encoder IR and processor configs for rank 0.
+#[derive(Debug, Deserialize)]
+struct G4Vision {
+    family: String,
+    image_token_id: i64,
+    boi_token_id: i64,
+    eoi_token_id: i64,
+    pad_token_id: i64,
 }
 
 fn default_true() -> bool {
@@ -416,11 +433,48 @@ fn decode_wire_position(t: &WireTensor) -> EngineResult<i64> {
     Ok(i64::from_le_bytes(b))
 }
 
+/// Where a span's `k` image tokens take their rows from, given `total` row
+/// floats of `hidden` width of which `fed` rows are consumed: `Some(range)`
+/// into the turn's rows, or `None` for zero rows. Zero rows are only for an
+/// image token nothing can supply: a decode step (the model emitting
+/// `<|image|>`) or a turn without images. Inside an image turn's prompt the
+/// expansion made one image token per row, so running out there is a
+/// row/token mismatch and answering from blank rows would be silently wrong.
+fn image_feature_rows(
+    total: usize,
+    fed: usize,
+    k: usize,
+    hidden: usize,
+    in_prompt: bool,
+) -> EngineResult<Option<std::ops::Range<usize>>> {
+    let start = fed * hidden;
+    let end = start + k * hidden;
+    if end <= total {
+        return Ok(Some(start..end));
+    }
+    if start >= total && !(in_prompt && total > 0) {
+        return Ok(None);
+    }
+    Err(EngineError::Backend(format!(
+        "span carries {k} image tokens but only {} image rows remain",
+        (total / hidden.max(1)).saturating_sub(fed)
+    )))
+}
+
 // -------- Engine --------
 
 struct ActiveTask {
     task: GenerationTask,
     prompt_ids: Vec<i64>,
+    /// Vision trees: every image's rows, flattened in prompt order, and how
+    /// many rows the stage-0 feeds have consumed (each span takes the rows of
+    /// the image tokens it carries).
+    image_rows: Vec<f32>,
+    image_rows_fed: usize,
+    /// The prompt's KV cache key (`vision_kv`); `None` keeps the turn out of
+    /// the cache.
+    #[cfg(feature = "kv_coord")]
+    kv_key: Option<Vec<i32>>,
     generated: Vec<i32>,
     last_text: String,
     prefilled: bool,
@@ -476,6 +530,46 @@ fn prefill_chunk() -> usize {
     }
 }
 
+/// Tokens admission prefills for `task`: the rendered prompt (each native video's `<|video|>`
+/// expanded in the text, as `step_first` does), each image placeholder expanded by `expand`, and
+/// the Option-B resume prefix. `None` when the prompt does not tokenize or `expand` refuses it;
+/// admission refuses those itself, with the reason.
+fn admitted_len(
+    tok: &Tokenizer,
+    vision: Option<&crate::gemma4_vision::ImageFrontend>,
+    task: &GenerationTask,
+    expand: impl FnOnce(&[i64]) -> Result<Vec<i64>, String>,
+) -> Option<usize> {
+    let text = match vision {
+        Some(v) => v.prompt_text(&task.prompt, &task.media),
+        None => std::borrow::Cow::Borrowed(task.prompt.as_str()),
+    };
+    let ids: Vec<i64> = tok
+        .encode(text.as_ref(), false)
+        .ok()?
+        .get_ids()
+        .iter()
+        .map(|&u| i64::from(u))
+        .collect();
+    let ids = if task.media.is_empty() {
+        ids
+    } else {
+        expand(&ids).ok()?
+    };
+    Some(ids.len() + task.resume_ids().map_or(0, <[i32]>::len))
+}
+
+/// "At or past" the window is refused: the first generated token needs a position too.
+fn window_check(n: usize, max: usize) -> EngineResult<()> {
+    if n >= max {
+        return Err(EngineError::PromptTooLong(format!(
+            "prompt is {n} tokens with its images and videos expanded; the model's window is \
+             {max} (max_position_embeddings)"
+        )));
+    }
+    Ok(())
+}
+
 /// The task's last chunk. The API reads `prompt_tokens` and `finish_reason` off
 /// the chunk with `is_final` set, so leaving them None reported
 /// `usage.prompt_tokens: 0` and a hardcoded `"stop"` on every gemma4 response.
@@ -513,6 +607,11 @@ fn final_chunk(
 
 pub struct Gemma4Engine {
     spec: ShardSpec,
+    /// Rank 0 of a vision tree: the image front end, the stage-0
+    /// `image_features` port, and the width of one row.
+    vision: Option<crate::gemma4_vision::ImageFrontend>,
+    image_features_in: Option<String>,
+    hidden_size: usize,
     /// Count of layers whose own KV lives entirely in stage_0 and is SHARED by later stages
     /// (Gemma 4 E2B/E4B KV-sharing). Own-KV layers are `[0, total_layers - num_kv_shared_layers)`.
     /// Zero for dense models (every stage bears its own KV).
@@ -521,6 +620,9 @@ pub struct Gemma4Engine {
     num_stages: u32,
     runtime: OvRuntime,
     tokenizer: Option<Arc<Tokenizer>>,
+    /// `max_position_embeddings` from `tokenizer/config.json` (rank 0 only; `None` = unknown, no
+    /// guard). `submit` refuses a prompt at or past it, counted after image and video expansion.
+    max_ctx: Option<usize>,
     /// All EOS token ids configured for the model. Generation stops on
     /// the first token that matches ANY of these. See `lookup_eos`.
     eos_token_ids: Vec<u32>,
@@ -561,6 +663,10 @@ pub struct Gemma4Engine {
     /// `kv_holder()` hands this out so a busy engine answers pulls without contending the engine lock.
     #[cfg(feature = "kv_coord")]
     kv_share: crate::kv_coordination::SharedKvCache,
+    /// [`crate::kv_coordination::config_digest`] of the tree's `pipeline_config.json`, read once
+    /// at load and folded into the KV fingerprint.
+    #[cfg(feature = "kv_coord")]
+    kv_config_digest: u64,
 }
 
 impl Gemma4Engine {
@@ -595,8 +701,46 @@ impl Gemma4Engine {
         self.runtime
             .set_input(&in_pos, ShimDType::I64, &[1, seq_len], &i64_to_bytes(&pos))
             .map_err(map_ov_err)?;
+        if let Some(port) = self.image_features_in.clone() {
+            self.feed_image_features(&port, input_ids, position)?;
+        }
         self.feed_external_kv()?;
         Ok(())
+    }
+
+    /// Vision tree, stage 0: the rows of exactly the image tokens in this
+    /// span, in order; none on a text span or a decode step (the IR appends a
+    /// zero row so an empty input still gathers). An image token with no
+    /// image left to supply it (the model emitting `<|image|>` while decoding,
+    /// or one in a turn without images) gets a zero row instead of failing
+    /// the turn; an image turn's PROMPT running out of rows is a count
+    /// mismatch and fails (see `image_feature_rows`).
+    fn feed_image_features(
+        &mut self,
+        port: &str,
+        input_ids: &[i64],
+        position: i64,
+    ) -> EngineResult<()> {
+        let image = self.vision.as_ref().map(|v| v.tokens.image);
+        let k = input_ids.iter().filter(|&&t| Some(t) == image).count();
+        let h = self.hidden_size;
+        let mut rows: Vec<f32> = Vec::new();
+        if k > 0 {
+            let a = self.active.as_mut().ok_or_else(|| {
+                EngineError::Backend("image tokens with no active task to splice".into())
+            })?;
+            let in_prompt = usize::try_from(position).is_ok_and(|p| p < a.prompt_ids.len());
+            match image_feature_rows(a.image_rows.len(), a.image_rows_fed, k, h, in_prompt)? {
+                Some(range) => {
+                    rows.extend_from_slice(&a.image_rows[range]);
+                    a.image_rows_fed += k;
+                }
+                None => rows.resize(k * h, 0.0),
+            }
+        }
+        self.runtime
+            .set_input(port, ShimDType::F32, &[k, h], &f32_to_bytes(&rows))
+            .map_err(map_ov_err)
     }
 
     fn build_feed_relay(
@@ -952,8 +1096,14 @@ impl Gemma4Engine {
                 .tokenizer
                 .clone()
                 .ok_or_else(|| EngineError::Backend("first stage requires tokenizer".into()))?;
+            // A native video's `<|video|>` is expanded in the text, as HF's
+            // processor does before it tokenizes.
+            let text = match self.vision.as_ref() {
+                Some(v) => v.prompt_text(&task.prompt, &task.media).into_owned(),
+                None => task.prompt.clone(),
+            };
             let enc = tok
-                .encode(task.prompt.clone(), false)
+                .encode(text, false)
                 .map_err(|e| EngineError::Backend(format!("tokenizer encode: {e}")))?;
             let mut prompt_ids: Vec<i64> = enc.get_ids().iter().map(|&u| u as i64).collect();
             // Option B forced-prefix resume: append the already-emitted assistant
@@ -968,7 +1118,13 @@ impl Gemma4Engine {
                     let id = task.task_id.clone();
                     return Ok(vec![(
                         id.clone(),
-                        Chunk::error(id, format!("invalid resume prefix: {e}")),
+                        Chunk::error(
+                            id,
+                            format!(
+                                "{}invalid resume prefix: {e}",
+                                cascadia_engine::CLIENT_ERROR_PREFIX
+                            ),
+                        ),
                     )]);
                 }
                 // Exhausted budget: finish Length with ZERO new tokens — the old
@@ -982,16 +1138,85 @@ impl Gemma4Engine {
                 }
             }
             cascadia_types::append_resume_ids(&mut prompt_ids, resume.as_deref());
+            // Vision trees: encode the images and expand each placeholder into
+            // its framed soft-token run; stage 0 splices the rows.
+            let mut image_rows: Vec<Vec<f32>> = Vec::new();
+            // The warm-resume key (`vision_kv`): image soft tokens stand for
+            // their image's hash. `None` keeps the turn out of the KV cache.
+            #[cfg(feature = "kv_coord")]
+            let mut kv_key: Option<(Vec<i32>, Option<crate::vision_kv::ImageSpans>)> = None;
+            if !task.media.is_empty() {
+                let refuse = |reason: String| {
+                    warn!(task = %task.task_id, reason = %reason, "gemma4: image turn refused");
+                    let id = task.task_id.clone();
+                    vec![(id.clone(), Chunk::error(id, reason))]
+                };
+                if resume.is_some() {
+                    return Ok(refuse(
+                        "resume_unsupported: a resumed turn cannot carry images".into(),
+                    ));
+                }
+                let Some(frontend) = self.vision.as_mut() else {
+                    return Ok(refuse("this gemma4 tree takes no images".into()));
+                };
+                let started = std::time::Instant::now();
+                match frontend.prepare(&task.media, &prompt_ids, &task.tenant) {
+                    Ok((ids, rows)) => {
+                        info!(
+                            task = %task.task_id,
+                            images = rows.len(),
+                            prompt = ids.len(),
+                            encode_ms = started.elapsed().as_millis() as u64,
+                            "gemma4: images encoded"
+                        );
+                        #[cfg(feature = "kv_coord")]
+                        match crate::vision_kv::for_turn(
+                            &ids,
+                            frontend.tokens.image,
+                            &rows,
+                            &task.media,
+                            &task.tenant,
+                        ) {
+                            Ok((key, spans)) => kv_key = Some((key, Some(spans))),
+                            Err(e) => warn!(task = %task.task_id, reason = %e,
+                                "gemma4: no KV warm-resume key for this image turn"),
+                        }
+                        prompt_ids = ids;
+                        image_rows = rows;
+                    }
+                    Err(e) => return Ok(refuse(e)),
+                }
+            }
             // Issue-34 warm-resume (gated, single-stage for now — multi-stage needs the RESTORE
             // broadcast). Restore a cached strict-prefix blob and prefill only the suffix; else cold.
             #[cfg_attr(not(feature = "kv_coord"), allow(unused_mut))]
             let mut warm_prefix = 0usize;
+            // A turn with images keys on its images' hashes (`vision_kv`), never
+            // on their placeholder ids, which every image of one size shares.
             #[cfg(feature = "kv_coord")]
-            {
-                let prompt_i32: Vec<i32> = prompt_ids.iter().map(|&t| t as i32).collect();
-                if let Some((blob, len, plane_pulled)) =
-                    self.kv.take_warm(&task.tenant, &prompt_i32)
-                {
+            if task.media.is_empty() {
+                kv_key = Some((prompt_ids.iter().map(|&t| t as i32).collect(), None));
+            }
+            #[cfg(feature = "kv_coord")]
+            if let Some((prompt_i32, spans)) = &kv_key {
+                // A prefix that ends inside an image cannot resume: the
+                // prefill would feed only part of its rows.
+                let taken = self
+                    .kv
+                    .take_warm_where(&task.tenant, prompt_i32, |blob, len| {
+                        let depth = crate::kv_coordination::kv_seq_from_blob(blob)
+                            .map(|s| s.min(len))
+                            .unwrap_or(len);
+                        let splits = spans.as_ref().is_some_and(|sp| sp.splits(depth));
+                        if splits {
+                            info!(
+                                depth,
+                                "gemma4: a cached prefix ends inside an image; skipped"
+                            );
+                        }
+                        !splits
+                    });
+                if let Some((blob, len, plane_pulled)) = taken {
                     // Restore must land on a CLEAN request: this model's `reset_state` leaves residue
                     // (shim.cpp), and set_state over the prior throwaway turn's live state corrupts the
                     // warm continuation + leaks into the next cold turn. Rebuild first, mark restored so
@@ -1070,6 +1295,20 @@ impl Gemma4Engine {
                     self.runtime.reset_state().map_err(map_ov_err)?;
                 }
             }
+            #[cfg(feature = "kv_coord")]
+            if warm_prefix > 0 {
+                // Images inside the resumed prefix are already in the KV.
+                if let Some((_, Some(spans))) = &kv_key {
+                    let before = image_rows.len();
+                    image_rows = spans.rows_from(warm_prefix, image_rows);
+                    info!(
+                        images_resumed = before - image_rows.len(),
+                        images_prefilled = image_rows.len(),
+                        "gemma4: image turn warm-resumed"
+                    );
+                }
+            }
+            let image_rows = image_rows.concat();
             self.position = warm_prefix as i64;
             info!(
                 task = %task.task_id,
@@ -1108,6 +1347,10 @@ impl Gemma4Engine {
             self.active = Some(ActiveTask {
                 task,
                 prompt_ids,
+                image_rows,
+                image_rows_fed: 0,
+                #[cfg(feature = "kv_coord")]
+                kv_key: kv_key.map(|(k, _)| k),
                 generated: resume_seed,
                 last_text: resume_last_text,
                 prefilled: false,
@@ -1176,9 +1419,10 @@ impl Gemma4Engine {
         // A generation request must carry at least one prompt token; an empty
         // prompt would otherwise emit a fabricated token with no inference.
         if prefill && tokens.is_empty() {
-            return Err(EngineError::Backend(
-                "empty prompt: no tokens to prefill".into(),
-            ));
+            return Err(EngineError::Backend(format!(
+                "{}empty prompt: no tokens to prefill",
+                cascadia_engine::CLIENT_ERROR_PREFIX
+            )));
         }
 
         // The whole prompt (prefill) or one decode token in a single
@@ -1339,6 +1583,15 @@ impl Gemma4Engine {
         };
 
         let max_tokens = active.task.max_tokens.max(1) as usize;
+        // The window bounds prompt + completion: `submit` refuses prompts at or past `max_ctx`,
+        // and this ends the turn AT the window instead of decoding past it. `generated` is
+        // pre-seeded with the resume tokens, which `prompt_ids` already carries.
+        let max_tokens = match self.max_ctx {
+            Some(max) => max_tokens
+                .min(active.resume_seed_len + max.saturating_sub(active.prompt_ids.len()))
+                .max(1),
+            None => max_tokens,
+        };
         let is_eos = self.eos_token_ids.contains(&(next_token as u32));
         let is_final = active.generated.len() >= max_tokens || is_eos;
 
@@ -1378,13 +1631,12 @@ impl Gemma4Engine {
             );
             // Issue-34: capture this stage's KV under (prompt + generated) for warm-pull. Best-effort
             // + gated. (Multi-stage CAPTURE broadcast added with the control protocol.)
+            // Keyed on `kv_key`, which names each image by its hash.
             #[cfg(feature = "kv_coord")]
-            {
+            if let Some(key) = active.kv_key.take() {
                 // Skip the resume seed: `prompt_ids` already carries those ids.
-                let full: Vec<i32> = active
-                    .prompt_ids
-                    .iter()
-                    .map(|&t| t as i32)
+                let full: Vec<i32> = key
+                    .into_iter()
                     .chain(
                         active
                             .generated
@@ -1408,10 +1660,11 @@ impl Gemma4Engine {
                         }
                         // Mirror into the lock-free holder cache so a busy node can serve this turn's
                         // KV to a moved peer without the engine lock.
+                        // A media turn stays out of it and keeps only the local copy below.
                         self.kv_share
                             .lock()
                             .unwrap_or_else(|e| e.into_inner())
-                            .capture(&tenant, full.clone(), blob.clone());
+                            .capture_for_plane(&tenant, full.clone(), blob.clone());
                         self.kv.capture(&tenant, full, blob);
                     }
                     Err(e) => tracing::debug!(error = %e, "gemma4 get_state_blob skipped"),
@@ -1489,6 +1742,15 @@ impl Engine for Gemma4Engine {
     }
 
     fn submit(&mut self, task: GenerationTask) -> EngineResult<()> {
+        // Only a vision tree (stage 0 takes image_features) serves images;
+        // one whose tokenizer has `<|video|>` takes video whole, any other
+        // gets a video as its frames.
+        if !self.vision.as_ref().is_some_and(|v| v.takes_video()) {
+            cascadia_engine::refuse_video(&task, "gemma4")?;
+        }
+        if self.vision.is_none() {
+            cascadia_engine::refuse_media(&task, "gemma4 (tree without a `vision` block)")?;
+        }
         if !self.spec.is_first_stage {
             warn!("gemma4 submit() ignored on non-first stage");
             return Err(EngineError::Backend(
@@ -1513,6 +1775,21 @@ impl Engine for Gemma4Engine {
                 queued: self.pending.len(),
                 cap: crate::dist_spec::MAX_PENDING_TASKS,
             });
+        }
+        // The API bounds request BYTES; this bounds tokens against the model's window, so an
+        // over-window prompt is a 400 `context_length_exceeded` rather than a step-time error
+        // (a 5xx) after encoding every image and prefilling every soft token in one pass.
+        // Images and videos count expanded, from their sizes, without encoding anything.
+        if let (Some(max), Some(tok)) = (self.max_ctx, self.tokenizer.as_deref()) {
+            let vision = self.vision.as_ref();
+            let n = admitted_len(tok, vision, &task, |ids| match vision {
+                Some(v) => v.expand_ids(&task.media, ids),
+                None => Ok(ids.to_vec()),
+            });
+            // A prompt the expansion refuses is refused again, with its reason, at admission.
+            if let Some(n) = n {
+                window_check(n, max)?;
+            }
         }
         self.pending.push(task);
         Ok(())
@@ -1758,11 +2035,17 @@ impl Gemma4Engine {
                     (e, tk, crate::kv_coordination::LOCAL_NS.to_string())
                 };
                 if let Ok(blob) = self.runtime.get_state_blob() {
-                    // Mirror into the lock-free holder cache (worker rank serves rank-N GET from here).
+                    // Mirror into the lock-free holder cache (worker rank serves rank-N GET from here),
+                    // except a media turn's slice: RESTORE reads `self.kv` below, not the mirror.
                     self.kv_share
                         .lock()
                         .unwrap_or_else(|e| e.into_inner())
-                        .capture_under_epoch_ns(&tenant, epoch, tokens.clone(), blob.clone());
+                        .capture_under_epoch_for_plane(
+                            &tenant,
+                            epoch,
+                            tokens.clone(),
+                            blob.clone(),
+                        );
                     self.kv
                         .capture_under_epoch_ns(&tenant, epoch, tokens.clone(), blob);
                 }
@@ -1820,13 +2103,15 @@ impl Gemma4Engine {
 
 #[cfg(feature = "kv_coord")]
 impl Gemma4Engine {
-    /// Stable model+stage fingerprint — a stage only matches the identical stage on a peer chain.
+    /// Stable model+stage fingerprint — a stage only matches the identical stage on a peer chain
+    /// of the same export (`pipeline_config.json` digest).
     fn kv_model_fingerprint(&self) -> u64 {
         let s = &self.spec;
         let mut buf = s.model_id.clone().into_bytes();
         buf.extend_from_slice(&s.layer_start.to_le_bytes());
         buf.extend_from_slice(&s.layer_end.to_le_bytes());
         buf.extend_from_slice(&s.total_layers.to_le_bytes());
+        buf.extend_from_slice(&self.kv_config_digest.to_le_bytes());
         crate::kv_coordination::fnv1a64(&buf)
     }
     /// Whether this stage bears any OWN KV: true iff its layer range starts before the own-KV
@@ -1968,6 +2253,7 @@ pub struct Gemma4Builder {
     /// [`Gemma4Engine::num_kv_shared_layers`].
     num_kv_shared_layers: u32,
     tokenizer: Option<Arc<Tokenizer>>,
+    max_ctx: Option<usize>,
     eos_token_ids: Vec<u32>,
     upstream: Option<Arc<tokio::sync::Mutex<ActivationServer>>>,
     downstream: Option<Arc<tokio::sync::Mutex<ActivationClient>>>,
@@ -1980,6 +2266,10 @@ pub struct Gemma4Builder {
     /// Global source-layer id for each `external_kv.{i}` this stage consumes, in
     /// port-index order (= external_shared_sources[i].src_global_layer).
     external_src_ids: Vec<i64>,
+    /// The tree has a `vision` block; rank 0 also holds its image front end.
+    vision_tree: bool,
+    vision_frontend: Option<crate::gemma4_vision::ImageFrontend>,
+    hidden_size: usize,
 }
 
 impl Gemma4Builder {
@@ -2218,6 +2508,8 @@ impl Builder for Gemma4Builder {
                     "tokenizer loaded; eos_token_ids={:?}",
                     self.eos_token_ids
                 )));
+                // The exporter writes the full HF config beside the tokenizer.
+                self.max_ctx = crate::read_max_ctx(&tokenizer_dir, "gemma4");
             } else {
                 events.push(LoadProgress::message(format!(
                     "warning: no tokenizer.json at {tok_path:?}; first-stage tokenization will fail"
@@ -2225,6 +2517,48 @@ impl Builder for Gemma4Builder {
             }
         }
 
+        if let Some(v) = pipeline_cfg.vision.as_ref() {
+            if v.family != "gemma4" {
+                return Err(EngineError::InvalidConfig(format!(
+                    "pipeline_config.json `vision.family` is {:?}; the gemma4 engine serves \
+                     \"gemma4\" only",
+                    v.family
+                )));
+            }
+            self.vision_tree = true;
+            self.hidden_size = pipeline_cfg.hidden_size;
+            if stage_cfg.has_embed {
+                let tokens = crate::gemma4_vision::ImageTokens {
+                    image: v.image_token_id,
+                    boi: v.boi_token_id,
+                    eoi: v.eoi_token_id,
+                    pad: v.pad_token_id,
+                };
+                let mut f = crate::gemma4_vision::ImageFrontend::load(&self.pipeline_dir, tokens)
+                    .map_err(|e| EngineError::InvalidConfig(format!("vision tree: {e}")))?;
+                events.push(LoadProgress::message(format!(
+                    "vision tree: rank 0 encodes images ({} soft tokens per image at most)",
+                    f.preprocess.max_soft_tokens
+                )));
+                // Native video needs `<|video|>` in the tokenizer (the chat
+                // template's video tag); the markup is spelled from its ids.
+                let video = self
+                    .tokenizer
+                    .as_deref()
+                    .is_some_and(|t| f.enable_video_from_tokenizer(t));
+                events.push(LoadProgress::message(if video {
+                    format!(
+                        "vision tree: rank 0 takes video whole ({} soft tokens per frame \
+                         at most, up to {} frames)",
+                        f.video.frame.max_soft_tokens, f.video.num_frames
+                    )
+                } else {
+                    "vision tree: no <|video|> in the tokenizer; native video is refused"
+                        .to_string()
+                }));
+                self.vision_frontend = Some(f);
+            }
+        }
         events.push(LoadProgress::ready());
         Ok(Box::pin(stream::iter(events)))
     }
@@ -2308,12 +2642,44 @@ impl Builder for Gemma4Builder {
             );
         }
 
+        // A vision tree's stage 0 must take `image_features`, and only a
+        // vision tree's may: rank 0 feeds it every step.
+        let image_features_in = runtime
+            .input_names()
+            .map_err(map_ov_err)?
+            .into_iter()
+            .find(|n| n == "image_features");
+        match (&self.vision_frontend, &image_features_in) {
+            (Some(_), None) => {
+                return Err(EngineError::InvalidConfig(
+                    "vision tree: stage 0 IR has no image_features input; re-export with \
+                     tools/export_gemma4.py --vision"
+                        .into(),
+                ))
+            }
+            (None, Some(_)) => {
+                return Err(EngineError::InvalidConfig(
+                    "stage 0 takes image_features but pipeline_config.json has no `vision` block"
+                        .into(),
+                ))
+            }
+            _ => {}
+        }
+        if self.vision_tree && self.hidden_size == 0 {
+            return Err(EngineError::InvalidConfig(
+                "vision tree: pipeline_config.json lacks hidden_size".into(),
+            ));
+        }
         Ok(Box::new(Gemma4Engine {
+            vision: self.vision_frontend,
+            image_features_in,
+            hidden_size: self.hidden_size,
             spec,
             num_kv_shared_layers: self.num_kv_shared_layers,
             num_stages: self.total,
             runtime,
             tokenizer: self.tokenizer,
+            max_ctx: self.max_ctx,
             eos_token_ids: self.eos_token_ids.clone(),
             upstream: self.upstream,
             downstream: self.downstream,
@@ -2333,6 +2699,10 @@ impl Builder for Gemma4Builder {
             kv_share: std::sync::Arc::new(std::sync::Mutex::new(
                 crate::kv_coordination::OvKvCache::default(),
             )),
+            #[cfg(feature = "kv_coord")]
+            kv_config_digest: crate::kv_coordination::config_digest(
+                &self.pipeline_dir.join("pipeline_config.json"),
+            ),
         }))
     }
 }
@@ -2340,6 +2710,82 @@ impl Builder for Gemma4Builder {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Whitespace tokenizer: `hi` is 0, `img` (the image placeholder) is 1.
+    fn tiny_tokenizer() -> Tokenizer {
+        let json = r#"{"version":"1.0","truncation":null,"padding":null,
+            "added_tokens":[],"normalizer":null,
+            "pre_tokenizer":{"type":"Whitespace"},
+            "post_processor":null,"decoder":null,
+            "model":{"type":"WordLevel","vocab":{"hi":0,"img":1},"unk_token":"[UNK]"}}"#;
+        Tokenizer::from_bytes(json.as_bytes()).expect("build tiny tokenizer")
+    }
+
+    /// Each `img` becomes a 10-token run, as an image's soft tokens do.
+    fn expand_images(ids: &[i64]) -> Result<Vec<i64>, String> {
+        Ok(ids
+            .iter()
+            .flat_map(|&t| if t == 1 { vec![1; 10] } else { vec![t] })
+            .collect())
+    }
+
+    fn image() -> cascadia_types::MediaInput {
+        cascadia_types::MediaInput {
+            kind: cascadia_types::MediaKind::Image,
+            pixels: std::sync::Arc::from(vec![0u8; 3]),
+            num_frames: 1,
+            width: 1,
+            height: 1,
+            timestamps_ms: None,
+            sha256: [0; 32],
+        }
+    }
+
+    /// The window guard counts what admission prefills: images expanded to their soft tokens
+    /// and the resume prefix, refused at or past `max_position_embeddings`.
+    #[test]
+    fn window_guard_counts_expanded_images_and_the_resume_prefix() {
+        let tok = tiny_tokenizer();
+        let text = GenerationTask::new("t", "hi hi hi");
+        assert_eq!(admitted_len(&tok, None, &text, expand_images), Some(3));
+        assert!(window_check(3, 4).is_ok());
+        assert!(matches!(
+            window_check(4, 4),
+            Err(EngineError::PromptTooLong(_))
+        ));
+
+        let mut img = GenerationTask::new("i", "hi img hi");
+        img.media = vec![image()];
+        let n = admitted_len(&tok, None, &img, expand_images).unwrap();
+        assert_eq!(n, 12, "the placeholder counts as its 10 soft tokens");
+        assert!(matches!(
+            window_check(n, 12),
+            Err(EngineError::PromptTooLong(_))
+        ));
+        assert!(window_check(n, 13).is_ok());
+
+        let mut resuming = GenerationTask::new("r", "hi hi");
+        resuming.resume_token_ids = Some(vec![0, 0, 0]);
+        assert_eq!(admitted_len(&tok, None, &resuming, expand_images), Some(5));
+
+        // An expansion refusal is left to admission, which states the reason.
+        assert_eq!(admitted_len(&tok, None, &img, |_| Err("bad".into())), None);
+    }
+
+    #[test]
+    fn image_rows_run_out_only_outside_an_image_prompt() {
+        // 3 rows of width 2.
+        assert_eq!(image_feature_rows(6, 0, 2, 2, true).unwrap(), Some(0..4));
+        assert_eq!(image_feature_rows(6, 2, 1, 2, true).unwrap(), Some(4..6));
+        // Decode: the model emitting the image token after the rows are used.
+        assert_eq!(image_feature_rows(6, 3, 1, 2, false).unwrap(), None);
+        // A text turn's prompt holding the image token.
+        assert_eq!(image_feature_rows(0, 0, 2, 2, true).unwrap(), None);
+        // An image turn's prompt past its rows, at or across the boundary.
+        assert!(image_feature_rows(6, 3, 1, 2, true).is_err());
+        assert!(image_feature_rows(6, 2, 2, 2, true).is_err());
+        assert!(image_feature_rows(6, 2, 2, 2, false).is_err());
+    }
     use cascadia_types::PeerLayout;
 
     /// Rig incident (2026-08-17): RESTORE/ABORT ack recvs were UNBOUNDED while

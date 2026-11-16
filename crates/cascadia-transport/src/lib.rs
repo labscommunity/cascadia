@@ -378,6 +378,14 @@ pub enum TransportError {
     /// keeping the socket safe here — see `recv_error_is_connection_fatal`.
     #[error("frame-start wait timed out after {0:?} with no bytes (retryable)")]
     FrameStartTimeout(Duration),
+
+    /// A send did not finish within [`send_timeout`]: the peer is connected
+    /// but stopped reading, so `write_all` blocked once the frame outgrew the
+    /// kernel buffers. Connection-fatal — part of the frame may be on the
+    /// wire, so the wrappers drop the socket and later calls fail fast with
+    /// [`Self::NotConnected`].
+    #[error("send did not complete within {0:?}; connection dropped (peer stopped reading?)")]
+    SendTimeout(Duration),
 }
 
 pub type TransportResult<T> = Result<T, TransportError>;
@@ -600,11 +608,69 @@ pub async fn recv_tensor_reply_prefill<R: AsyncRead + Unpin>(
 ) -> TransportResult<(Tensor, TransferStats)> {
     // saturating_mul: an absurdly large configured base must clamp, not
     // panic the engine thread (Duration's Mul panics on overflow).
-    recv_tensor_inner(
-        sock,
-        Some(recv_timeout().saturating_mul(PREFILL_REPLY_TIMEOUT_FACTOR)),
-    )
-    .await
+    recv_tensor_inner(sock, Some(prefill_reply_timeout())).await
+}
+
+/// Config override (seconds) for the prefill reply budget; 0 = unset.
+static PREFILL_REPLY_TIMEOUT_SECS: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+
+/// Bound every prefill reply by the caller's own first-token budget (e.g. a
+/// node entry's media budget) instead of [`PREFILL_REPLY_TIMEOUT_FACTOR`] x
+/// [`recv_timeout`], which is 600-1200 s and outlives any client. 0 restores
+/// the default. Process-global, last writer wins.
+pub fn set_prefill_reply_timeout_secs(secs: u64) {
+    PREFILL_REPLY_TIMEOUT_SECS.store(secs, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// The caller-set prefill reply budget, if any (see
+/// [`set_prefill_reply_timeout_secs`]).
+pub fn prefill_reply_timeout_override() -> Option<Duration> {
+    match PREFILL_REPLY_TIMEOUT_SECS.load(std::sync::atomic::Ordering::Relaxed) {
+        0 => None,
+        s => Some(Duration::from_secs(s)),
+    }
+}
+
+/// Budget for one prefill reply: the caller's override when set, else
+/// [`PREFILL_REPLY_TIMEOUT_FACTOR`] x [`recv_timeout`].
+pub fn prefill_reply_timeout() -> Duration {
+    resolve_prefill_reply_timeout(prefill_reply_timeout_override(), recv_timeout())
+}
+
+/// Pure, for testing. saturating_mul: an absurdly large configured base must
+/// clamp, not panic the engine thread (Duration's Mul panics on overflow).
+fn resolve_prefill_reply_timeout(explicit: Option<Duration>, base: Duration) -> Duration {
+    explicit.unwrap_or_else(|| base.saturating_mul(PREFILL_REPLY_TIMEOUT_FACTOR))
+}
+
+/// Whole-frame send budget: the same bound the receiver puts on reading a
+/// frame. A peer that stopped reading without RST/FIN otherwise blocks
+/// `write_all` forever once a frame (an image prefill's hidden state is
+/// several MB) outgrows the kernel buffers — with the task slot held.
+pub fn send_timeout() -> Duration {
+    recv_timeout()
+}
+
+/// Run a send under `to`; elapsing is [`TransportError::SendTimeout`].
+async fn send_within<T>(
+    to: Duration,
+    fut: impl std::future::Future<Output = TransportResult<T>>,
+) -> TransportResult<T> {
+    match tokio::time::timeout(to, fut).await {
+        Ok(res) => res,
+        Err(_) => Err(TransportError::SendTimeout(to)),
+    }
+}
+
+/// `write_all` + flush of raw bytes, counted like [`send_tensor`].
+async fn send_raw_bytes<W: AsyncWrite + Unpin>(sock: &mut W, bytes: &[u8]) -> TransportResult<()> {
+    sock.write_all(bytes).await?;
+    sock.flush().await?;
+    cascadia_metrics::TRANSPORT_SENT_BYTES_TOTAL
+        .with_label_values(&["raw"])
+        .inc_by(bytes.len() as u64);
+    Ok(())
 }
 
 async fn recv_tensor_inner<R: AsyncRead + Unpin>(
@@ -865,6 +931,8 @@ fn recv_error_is_connection_fatal(err: &TransportError) -> bool {
         // The peer is connected but silent past the idle ceiling: a frame it
         // sends later must never land in a different request.
         TransportError::FrameIdleCeiling(_) => true,
+        // A partial frame may be on the wire; the wrappers already dropped it.
+        TransportError::SendTimeout(_) => true,
         TransportError::Io(e) => matches!(
             e.kind(),
             io::ErrorKind::TimedOut
@@ -1384,22 +1452,26 @@ impl ActivationServer {
         self.accepted_peer = None;
     }
 
+    /// Bounded by [`send_timeout`]; a timeout poisons the connection.
     pub async fn send(&mut self, tensor: &Tensor) -> TransportResult<TransferStats> {
         let sock = self.client.as_mut().ok_or(TransportError::NotConnected)?;
-        send_tensor(sock, tensor).await
+        let res = send_within(send_timeout(), send_tensor(sock, tensor)).await;
+        if matches!(res, Err(TransportError::SendTimeout(_))) {
+            self.poison().await;
+        }
+        res
     }
 
     /// Send raw bytes over the established connection. Used by the
     /// dist-spec engines to prefix tensor frames with control bytes
-    /// (kind + logical_pos_start).
+    /// (kind + logical_pos_start). Bounded like [`Self::send`].
     pub async fn send_raw(&mut self, bytes: &[u8]) -> TransportResult<()> {
         let sock = self.client.as_mut().ok_or(TransportError::NotConnected)?;
-        sock.write_all(bytes).await?;
-        sock.flush().await?;
-        cascadia_metrics::TRANSPORT_SENT_BYTES_TOTAL
-            .with_label_values(&["raw"])
-            .inc_by(bytes.len() as u64);
-        Ok(())
+        let res = send_within(send_timeout(), send_raw_bytes(sock, bytes)).await;
+        if matches!(res, Err(TransportError::SendTimeout(_))) {
+            self.poison().await;
+        }
+        res
     }
 
     /// Receive exactly `n` raw bytes from the established connection.
@@ -1603,9 +1675,14 @@ impl ActivationClient {
         Ok(())
     }
 
+    /// Bounded by [`send_timeout`]; a timeout poisons the connection.
     pub async fn send(&mut self, tensor: &Tensor) -> TransportResult<TransferStats> {
         let sock = self.sock.as_mut().ok_or(TransportError::NotConnected)?;
-        send_tensor(sock, tensor).await
+        let res = send_within(send_timeout(), send_tensor(sock, tensor)).await;
+        if matches!(res, Err(TransportError::SendTimeout(_))) {
+            self.poison().await;
+        }
+        res
     }
 
     pub async fn recv(&mut self) -> TransportResult<(Tensor, TransferStats)> {
@@ -1678,14 +1755,14 @@ impl ActivationClient {
         }
     }
 
+    /// Bounded like [`Self::send`].
     pub async fn send_raw(&mut self, bytes: &[u8]) -> TransportResult<()> {
         let sock = self.sock.as_mut().ok_or(TransportError::NotConnected)?;
-        sock.write_all(bytes).await?;
-        sock.flush().await?;
-        cascadia_metrics::TRANSPORT_SENT_BYTES_TOTAL
-            .with_label_values(&["raw"])
-            .inc_by(bytes.len() as u64);
-        Ok(())
+        let res = send_within(send_timeout(), send_raw_bytes(sock, bytes)).await;
+        if matches!(res, Err(TransportError::SendTimeout(_))) {
+            self.poison().await;
+        }
+        res
     }
 
     pub async fn recv_raw(&mut self, n: usize) -> TransportResult<Vec<u8>> {
@@ -1743,6 +1820,47 @@ mod tests {
         assert_eq!(resolve_recv_timeout(0, Some(90)), Duration::from_secs(90));
         // neither -> 60s default
         assert_eq!(resolve_recv_timeout(0, None), DEFAULT_TIMEOUT);
+    }
+
+    #[test]
+    fn prefill_reply_timeout_caller_budget_over_widened_default() {
+        // A caller-set budget wins outright, even below the widened default.
+        assert_eq!(
+            resolve_prefill_reply_timeout(Some(Duration::from_secs(300)), Duration::from_secs(120)),
+            Duration::from_secs(300)
+        );
+        // Unset -> factor x base (600 s at the 60 s default).
+        assert_eq!(
+            resolve_prefill_reply_timeout(None, DEFAULT_TIMEOUT),
+            DEFAULT_TIMEOUT * PREFILL_REPLY_TIMEOUT_FACTOR
+        );
+        // An absurd base clamps rather than panicking.
+        assert_eq!(
+            resolve_prefill_reply_timeout(None, Duration::MAX),
+            Duration::MAX
+        );
+    }
+
+    /// The chain-image stall: the peer accepted but never reads, so a frame
+    /// larger than the kernel buffers blocks `write_all`. The bounded send
+    /// must surface `SendTimeout` instead of hanging.
+    #[tokio::test]
+    async fn send_to_a_peer_that_stopped_reading_times_out() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let accept = tokio::spawn(async move { listener.accept().await.unwrap().0 });
+        let mut sock = TcpStream::connect(addr).await.unwrap();
+        let _peer = accept.await.unwrap(); // held open, never read
+        let big = Tensor::new(DType::F32, [1, 1, 16 << 20], vec![0u8; 64 << 20]);
+        let to = Duration::from_millis(200);
+        let err = send_within(to, send_tensor(&mut sock, &big))
+            .await
+            .expect_err("a non-reading peer must not absorb 64 MiB");
+        assert!(
+            matches!(err, TransportError::SendTimeout(d) if d == to),
+            "{err:?}"
+        );
+        assert!(recv_error_is_connection_fatal(&err));
     }
 
     #[tokio::test]

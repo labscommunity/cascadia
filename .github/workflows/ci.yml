@@ -99,14 +99,18 @@ jobs:
         run: cargo clippy --workspace --all-targets
 
       - name: OpenVINO SDK pin consistency + resolver unit tests
-        # release.yml and this file each carry OV_VERSION; a drift would
-        # ship bundles against one SDK while CI pre-flights another.
+        # release.yml, ai-pc-tests.yml and this file each carry OV_VERSION; a
+        # drift would ship bundles against one SDK while CI tests another.
         run: |
           rel="$(grep -E '^  OV_VERSION: ' .github/workflows/release.yml | head -1 | sed -E 's/.*"([^"]+)".*/\1/')"
           if [ "$rel" != "$OV_VERSION" ]; then
             echo "::error::OV_VERSION differs: ci.yml=$OV_VERSION release.yml=$rel"; exit 1
           fi
-          echo "OV_VERSION $OV_VERSION (release.yml agrees)"
+          ai="$(grep -E '^  OV_VERSION: ' .github/workflows/ai-pc-tests.yml | head -1 | sed -E 's/.*"([^"]+)".*/\1/')"
+          if [ "$ai" != "$OV_VERSION" ]; then
+            echo "::error::OV_VERSION differs: ci.yml=$OV_VERSION ai-pc-tests.yml=$ai"; exit 1
+          fi
+          echo "OV_VERSION $OV_VERSION (release.yml and ai-pc-tests.yml agree)"
           python3 -m unittest scripts/test_ov_sdk.py
 
       - name: Build cascadia binary (needed by e2e tests)
@@ -120,6 +124,16 @@ jobs:
         # clean runtime error. Runs every unit test plus the binary
         # e2e tests against the mock engine.
         run: cargo test --workspace --all-targets
+
+      - name: OpenAI SDK conformance (mock engine)
+        # The unmodified `openai` Python SDK against the binary built above:
+        # wire shape, streaming, and the SDK's error classes, including
+        # image_url refused by a text-only model. A venv, because the
+        # runner's system Python refuses `pip install` (PEP 668).
+        run: |
+          python3 -m venv "$RUNNER_TEMP/sdk"
+          "$RUNNER_TEMP/sdk/bin/pip" install --quiet -r tests/conformance/requirements-openai-sdk.txt
+          "$RUNNER_TEMP/sdk/bin/python" tests/conformance/test_openai_sdk.py --bin target/debug/cascadia
 
       # Everything above builds default features, and `dashboard-embed` is
       # default-off — so without these steps the whole embedded-SPA path

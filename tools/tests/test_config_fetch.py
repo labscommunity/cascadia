@@ -46,7 +46,7 @@ def test_fetch_config_json_falls_back_to_hub_cache(tmp_path, monkeypatch):
     cached = tmp_path / "config.json"
     cached.write_text(json.dumps({"model_type": "gemma4"}))
 
-    def _download(repo_id, filename, local_dir=None, local_files_only=False):
+    def _download(repo_id, filename, local_dir=None, local_files_only=False, revision=None):
         if local_dir is not None:
             raise OSError("offline: local_dir bypasses the hub cache")
         assert local_files_only
@@ -57,7 +57,7 @@ def test_fetch_config_json_falls_back_to_hub_cache(tmp_path, monkeypatch):
 
 
 def test_fetch_config_json_reraises_the_first_error(monkeypatch):
-    def _download(repo_id, filename, local_dir=None, local_files_only=False):
+    def _download(repo_id, filename, local_dir=None, local_files_only=False, revision=None):
         raise OSError("first" if local_dir is not None else "second")
 
     _patch_hf_hub_download(monkeypatch, _download)
@@ -66,10 +66,13 @@ def test_fetch_config_json_reraises_the_first_error(monkeypatch):
 
 
 def test_main_warns_when_config_fetch_fails(tmp_path, monkeypatch, capsys):
-    def _boom(_model):
+    def _boom(_model, _revision=None):
         raise OSError("offline and not cached")
 
     monkeypatch.setattr(export_shards, "fetch_config_json", _boom)
+    # No hub lookup for the sidecar's revision either.
+    monkeypatch.setattr(export_shards, "_source_identity", lambda a: {
+        "model_id": "gemma-4-E2B-it", "repo": a.model, "revision": None})
     # Stop main() right after the skipped dispatch: the generic path needs torch.
     monkeypatch.setattr(export_shards, "torch", None)
     monkeypatch.setattr(

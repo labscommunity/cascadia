@@ -2,7 +2,7 @@
 //!
 //! Mirrors the subset of `cascadia/api/server.py` needed for parity with PR
 //! #2's e2e bench: `/health`, `/v1/models`, `/v1/chat/completions`
-//! (non-streaming + SSE streaming). Tools, logprobs, /events, /state,
+//! (non-streaming + SSE streaming), plus `/v1/responses` (see `responses`). Tools, logprobs, /events, /state,
 //! Ollama dialect deferred — see Phase 5 follow-up.
 
 use std::sync::atomic::Ordering;
@@ -74,6 +74,26 @@ fn record_stream_tokens(
     }
 }
 
+mod media;
+pub use media::{
+    check_request_pixels, image_url_bytes, is_remote, source_size, FetchPolicy, MediaConfig, Remote,
+};
+pub mod media_setup;
+mod video;
+pub use media_setup::{attach_ffmpeg, media_setup, MediaEngine, MediaSetup};
+pub use video::{video_url_bytes, Ffmpeg};
+mod responses;
+pub use responses::{ReasoningParam, ResponsesRequest};
+
+/// Tokens a chunk contributes to the cumulative counter. The convention
+/// (engine `n_tokens` authoritative, else one per non-empty chunk — #55)
+/// lives on [`cascadia_types::Chunk::token_count`] so the API's `usage`,
+/// the dashboard counters, and the runner's Prometheus metrics can never
+/// drift apart; this alias keeps the historical call sites and tests.
+fn chunk_token_count(chunk: &cascadia_types::Chunk) -> u32 {
+    chunk.token_count()
+}
+
 /// RAII guard: bumps `requests_in_flight` on construction and decrements it
 /// on drop, so the gauge is correct even on early return, client disconnect,
 /// or a mid-stream engine error. Mirrors into the Prometheus
@@ -102,6 +122,127 @@ fn count_rejected(reason: &str) {
     cascadia_metrics::API_REJECTED_TOTAL
         .with_label_values(&[reason])
         .inc();
+}
+
+/// An error response in the OpenAI shape:
+/// `{"error":{"message","type","param","code"}}`. The SDKs read
+/// `error.message`; a bare `{"error":"..."}` string surfaces as a generic
+/// failure with the reason lost. `type` follows OpenAI's split: a 4xx is the
+/// caller's (`invalid_request_error`), a 5xx is ours (`server_error`).
+fn api_error(status: StatusCode, message: impl Into<String>, code: Option<&str>) -> Response {
+    api_error_for(status, message, None, code)
+}
+
+/// [`api_error`] naming the request field at fault in `param`, as OpenAI
+/// does for a refused parameter (`"tools"`, `"input[0].content[1]"`).
+fn api_error_for(
+    status: StatusCode,
+    message: impl Into<String>,
+    param: Option<&str>,
+    code: Option<&str>,
+) -> Response {
+    let kind = if status.is_client_error() {
+        "invalid_request_error"
+    } else {
+        "server_error"
+    };
+    (
+        status,
+        Json(serde_json::json!({
+            "error": {
+                "message": message.into(),
+                "type": kind,
+                "param": param,
+                "code": code,
+            }
+        })),
+    )
+        .into_response()
+}
+
+/// `Json<T>` whose rejections (bad JSON, wrong field types, unsupported
+/// content parts) come back as an OpenAI-shaped error instead of axum's
+/// plain-text 400/415/422.
+struct OpenAiJson<T>(T);
+
+#[axum::async_trait]
+impl<S, T> axum::extract::FromRequest<S> for OpenAiJson<T>
+where
+    Json<T>: axum::extract::FromRequest<S, Rejection = axum::extract::rejection::JsonRejection>,
+    S: Send + Sync,
+    AppState: axum::extract::FromRef<S>,
+{
+    type Rejection = Response;
+
+    async fn from_request(req: axum::extract::Request, state: &S) -> Result<Self, Self::Rejection> {
+        match Json::<T>::from_request(req, state).await {
+            Ok(Json(v)) => Ok(Self(v)),
+            Err(rej) => {
+                count_rejected("malformed_body");
+                // A body over the limit keeps its 413; everything else is
+                // the caller's malformed request.
+                if rej.status() == StatusCode::PAYLOAD_TOO_LARGE {
+                    // axum's own text ("length limit exceeded") names no
+                    // cause. Images (and videos) are the usual one, and a
+                    // server whose model takes none grants them no allowance.
+                    let video = <AppState as axum::extract::FromRef<S>>::from_ref(state)
+                        .media
+                        .as_deref()
+                        .is_some_and(|m| m.max_videos > 0);
+                    let msg = if video {
+                        "request body is larger than this server accepts; if it carries \
+                         images or videos, send fewer or smaller images or a shorter video \
+                         (the operator sets the video allowance with `--api-max-video-mb`)"
+                    } else {
+                        "request body is larger than this server accepts; if it carries \
+                         images, check that the model accepts image input \
+                         (`input_modalities` in `/v1/models`) and send fewer or smaller images"
+                    };
+                    return Err(api_error(StatusCode::PAYLOAD_TOO_LARGE, msg, None));
+                }
+                Err(api_error(
+                    StatusCode::BAD_REQUEST,
+                    rejection_message(&rej),
+                    None,
+                ))
+            }
+        }
+    }
+}
+
+/// The caller-facing reason for a body that did not parse: serde's message
+/// with its JSON path (`messages[0]: missing field ...`), without axum's
+/// "Failed to deserialize the JSON body into the target type" wrapper or the
+/// `at line N column M` position, which OpenAI's errors do not carry either.
+fn rejection_message(rej: &axum::extract::rejection::JsonRejection) -> String {
+    use axum::extract::rejection::JsonRejection;
+    use std::error::Error as _;
+    let inner = match rej {
+        JsonRejection::JsonDataError(e) => e.source().map(|s| s.to_string()),
+        JsonRejection::JsonSyntaxError(e) => e
+            .source()
+            .map(|s| format!("request body is not valid JSON: {s}")),
+        JsonRejection::MissingJsonContentType(_) => {
+            Some("request must have `Content-Type: application/json`".into())
+        }
+        _ => None,
+    };
+    let msg = inner.unwrap_or_else(|| rej.body_text());
+    strip_json_position(&msg).to_string()
+}
+
+/// `"... at line 1 column 139"` -> `"..."`.
+fn strip_json_position(msg: &str) -> &str {
+    if let Some(at) = msg.rfind(" at line ") {
+        let tail = &msg[at + " at line ".len()..];
+        let mut it = tail.splitn(3, ' ');
+        if let (Some(line), Some("column"), Some(col)) = (it.next(), it.next(), it.next()) {
+            if line.parse::<u64>().is_ok() && col.parse::<u64>().is_ok() {
+                return &msg[..at];
+            }
+        }
+    }
+    msg
 }
 
 #[derive(Clone)]
@@ -144,7 +285,24 @@ pub struct AppState {
     /// `false`, a success flips it back `true` — so `/health` reflects the real
     /// state of the chain instead of always returning 200 while requests 503.
     pub ready: Arc<std::sync::atomic::AtomicBool>,
+    /// See [`Config::media`].
+    pub media: Option<Arc<MediaConfig>>,
+    /// See [`Config::no_media_reason`].
+    pub no_media_reason: Option<Arc<str>>,
+    /// Bytes of a chat request's text (everything but its image URLs), when
+    /// the body limit was raised for images: [`Config::max_body_bytes`]. A
+    /// text-only body may then be as large as the image allowance, and its
+    /// text is scanned and templated before the prompt cap applies, so it is
+    /// held to the limit a text-only server has. `None` without images.
+    pub max_text_bytes: Option<usize>,
+    /// Image decodes running at once, across all requests. Each can hold a
+    /// full-size source image, so this bounds the API's decode memory to
+    /// about this many times the largest accepted image.
+    pub decode_permits: Arc<Semaphore>,
 }
+
+/// See [`AppState::decode_permits`].
+const MAX_CONCURRENT_DECODES: usize = 2;
 
 #[derive(Clone, Debug, Default)]
 pub struct ChatTemplateConfig {
@@ -165,6 +323,21 @@ pub struct Config {
     pub engine_applies_template: bool,
     /// See [`MarkerDialect`]; the CLI loads it with [`MarkerDialect::load`].
     pub marker_dialect: Option<MarkerDialect>,
+    /// Image input settings; `None` (the default) when the served model takes
+    /// no images, so every `image_url` part is a 400. Raises the body limit of
+    /// the routes that carry images (`/v1/chat/completions`, `/v1/responses`)
+    /// by [`MediaConfig::max_request_image_bytes`]; their text stays held to
+    /// `max_body_bytes` (see [`AppState::max_text_bytes`]).
+    pub media: Option<MediaConfig>,
+    /// Why a model with a vision encoder still takes no images (no `media`),
+    /// appended to the 400 that refuses them, so the caller learns what
+    /// serves them instead (Pixtral on ov-genai).
+    pub no_media_reason: Option<String>,
+    /// How long a media route's body may take to arrive once it holds an
+    /// in-flight slot (see `gate_media_body`): past it the slot is freed and
+    /// the request answered `408`. 30 s carries the largest allowed body
+    /// (about 69 MB) at under 20 Mbit/s.
+    pub media_body_timeout: std::time::Duration,
 }
 
 impl Default for Config {
@@ -177,6 +350,9 @@ impl Default for Config {
             defer_template_on_thinking: false,
             engine_applies_template: false,
             marker_dialect: None,
+            media: None,
+            no_media_reason: None,
+            media_body_timeout: std::time::Duration::from_secs(30),
         }
     }
 }
@@ -439,6 +615,15 @@ pub fn load_chat_template_config_at(tok_dir: &std::path::Path) -> ChatTemplateCo
         .and_then(|t| t.as_str())
         .map(|s| s.to_owned())
         .or_else(|| std::fs::read_to_string(tok_dir.join("chat_template.jinja")).ok())
+        // Processor exports (LLaVA-NeXT-Video) keep the template only in
+        // chat_template.json, as `{"chat_template": "..."}`; transformers
+        // reads it from there too.
+        .or_else(|| {
+            std::fs::read(tok_dir.join("chat_template.json"))
+                .ok()
+                .and_then(|b| serde_json::from_slice::<serde_json::Value>(&b).ok())
+                .and_then(|j| j.get("chat_template")?.as_str().map(str::to_owned))
+        })
         // An empty / whitespace-only template (a zero-byte placeholder, or a
         // download truncated to empty) must NOT be treated as usable: rendering
         // through it produces an empty prompt, which is worse than the legacy
@@ -511,6 +696,10 @@ pub fn make_router_with_stats(
         effort_words: false,
         marker_dialect: cfg.marker_dialect.clone(),
         ready: Arc::new(std::sync::atomic::AtomicBool::new(true)),
+        media: cfg.media.clone().map(Arc::new),
+        no_media_reason: cfg.no_media_reason.as_deref().map(Arc::from),
+        max_text_bytes: cfg.media.as_ref().map(|_| cfg.max_body_bytes),
+        decode_permits: Arc::new(Semaphore::new(MAX_CONCURRENT_DECODES)),
     };
     let state = AppState {
         effort_words: state
@@ -529,12 +718,49 @@ pub fn make_router_with_stats(
     // any traffic still lists them (#16). Idempotent.
     cascadia_metrics::init();
     let mw_state = state.clone();
+    // The routes that carry images get the image allowance on top of the
+    // text limit; every other route keeps the text limit alone.
+    // A server that decodes videos adds their allowance too.
+    let image_body_bytes = cfg
+        .max_body_bytes
+        .saturating_add(cfg.media.as_ref().map_or(0, |m| {
+            // Frame lists need no ffmpeg, so the room is there whenever a
+            // request may carry a video.
+            media::base64_len(m.max_request_image_bytes).saturating_add(if m.max_videos > 0 {
+                media::base64_len(m.max_request_video_bytes)
+            } else {
+                0
+            })
+        }));
+    let image_body_limit = DefaultBodyLimit::max(image_body_bytes);
+    // The raised limit lets each such body be tens of MB, read and parsed
+    // before the handler's in-flight gate: bound how many are in flight
+    // before any is read (see `gate_media_body`).
+    let media_gate = axum::middleware::from_fn_with_state(
+        cfg.media.as_ref().map(|_| MediaGate {
+            slots: Arc::new(Semaphore::new(cfg.max_concurrent_requests)),
+            max_body_bytes: image_body_bytes,
+            body_timeout: cfg.media_body_timeout,
+        }),
+        gate_media_body,
+    );
     Router::new()
         .route("/health", get(health))
         .route("/metrics", get(metrics))
         .route("/v1/models", get(list_models))
-        .route("/v1/chat/completions", post(chat_completions))
+        .route(
+            "/v1/chat/completions",
+            post(chat_completions)
+                .layer(image_body_limit)
+                .layer(media_gate.clone()),
+        )
         .route("/v1/completions", post(completions))
+        .route(
+            "/v1/responses",
+            post(responses::create_response)
+                .layer(image_body_limit)
+                .layer(media_gate),
+        )
         .route("/v1/cancel/:task_id", post(cancel))
         .with_state(state)
         // Flip `ready` from each completion's final status so /health tracks the
@@ -546,11 +772,97 @@ pub fn make_router_with_stats(
         ))
         // Cap the JSON body so an attacker can't OOM the server with
         // a multi-GB request. Apply at router level so it applies to
-        // every route, not just chat_completions.
+        // every route; the image routes' own layer (inner, so it wins)
+        // raises theirs.
         .layer(DefaultBodyLimit::max(cfg.max_body_bytes))
         // Outermost: request count + latency per matched route (#16), so it
         // observes rejections from the inner layers too.
         .layer(axum::middleware::from_fn(track_http_metrics))
+}
+
+/// See [`gate_media_body`].
+#[derive(Clone)]
+struct MediaGate {
+    /// [`Config::max_concurrent_requests`] slots.
+    slots: Arc<Semaphore>,
+    /// The media routes' body limit; reading stops one byte past it.
+    max_body_bytes: usize,
+    /// See [`Config::media_body_timeout`].
+    body_timeout: std::time::Duration,
+}
+
+/// Request middleware on the routes whose body limit images raise: a slot
+/// out of [`Config::max_concurrent_requests`], taken before the body is
+/// read and held until the handler returns (by then the body is dropped; a
+/// stream's generation holds the in-flight permit instead). Without
+/// it, any number of callers could each have a body of the full media
+/// allowance buffered and parsed before the in-flight gate refused them.
+/// No slot is the in-flight gate's capacity 503, the body never read. A
+/// server without images (`None`) passes every request through.
+///
+/// The body is read here, by [`Config::media_body_timeout`]: a client that
+/// sends its headers and then trickles (or stalls) would otherwise hold its
+/// slot for as long as it likes, and a few such clients every slot. Past the
+/// deadline the slot is freed and the request gets a `408`. Reading stops
+/// one byte past the route's limit; the handler's body limit then answers
+/// with its usual `413`.
+async fn gate_media_body(
+    State(gate): State<Option<MediaGate>>,
+    req: axum::extract::Request,
+    next: axum::middleware::Next,
+) -> Response {
+    let Some(gate) = gate else {
+        return next.run(req).await;
+    };
+    let Ok(permit) = gate.slots.try_acquire_owned() else {
+        count_rejected("capacity");
+        let mut resp = api_error(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "engine at capacity; retry after current requests complete",
+            None,
+        );
+        resp.extensions_mut().insert(PreEngineFailure);
+        return resp;
+    };
+    let (parts, body) = req.into_parts();
+    let read = async {
+        let mut buf = bytes::BytesMut::new();
+        let mut chunks = body.into_data_stream();
+        while let Some(chunk) = chunks.next().await {
+            buf.extend_from_slice(&chunk?);
+            if buf.len() > gate.max_body_bytes {
+                break;
+            }
+        }
+        Ok::<_, axum::Error>(buf.freeze())
+    };
+    let body = match tokio::time::timeout(gate.body_timeout, read).await {
+        Ok(Ok(body)) => body,
+        Ok(Err(_)) => {
+            count_rejected("malformed_body");
+            return api_error(
+                StatusCode::BAD_REQUEST,
+                "could not read the request body",
+                None,
+            );
+        }
+        Err(_) => {
+            count_rejected("malformed_body");
+            return api_error(
+                StatusCode::REQUEST_TIMEOUT,
+                format!(
+                    "the request body did not arrive within {} s",
+                    gate.body_timeout.as_secs_f32()
+                ),
+                None,
+            );
+        }
+    };
+    let resp = next
+        .run(axum::extract::Request::from_parts(parts, Body::from(body)))
+        .await;
+    drop(permit);
+    resp
 }
 
 /// Request middleware: per-route request counter + latency histogram. Uses
@@ -610,7 +922,10 @@ async fn track_pipeline_health(
     next: axum::middleware::Next,
 ) -> axum::response::Response {
     use std::sync::atomic::Ordering;
-    let is_completion = matches!(req.uri().path(), "/v1/chat/completions" | "/v1/completions");
+    let is_completion = matches!(
+        req.uri().path(),
+        "/v1/chat/completions" | "/v1/completions" | "/v1/responses"
+    );
     let resp = next.run(req).await;
     if is_completion {
         let s = resp.status();
@@ -648,6 +963,12 @@ struct ModelEntry {
     object: &'static str,
     created: i64,
     owned_by: &'static str,
+    /// Additive to OpenAI's model object (the SDKs keep unknown fields):
+    /// which input kinds `/v1/chat/completions` and `/v1/responses` accept,
+    /// in OpenRouter's `input_modalities` vocabulary. `["text", "image"]`
+    /// when image parts are served (plus `"video"` when ffmpeg was found
+    /// too), `["text"]` otherwise.
+    input_modalities: Vec<&'static str>,
 }
 
 #[derive(Serialize)]
@@ -664,21 +985,138 @@ async fn list_models(State(state): State<AppState>) -> Json<ModelsResponse> {
             object: "model",
             created: 0,
             owned_by: "cascadia",
+            input_modalities: match state.media.as_deref() {
+                Some(m) if m.accepts_video() => vec!["text", "image", "video"],
+                Some(_) => vec!["text", "image"],
+                None => vec!["text"],
+            },
         }],
     })
 }
 
 #[derive(Deserialize, Debug, Clone)]
+#[serde(try_from = "RawChatMessage")]
 pub struct ChatMessage {
     pub role: String,
-    #[serde(default, deserialize_with = "de_null_content")]
+    /// The message's text: the string form as sent, or the array form's text
+    /// parts back to back, as HF's templates concatenate a content array. A
+    /// message with images is rebuilt from its text parts and image tags
+    /// back to back, and a server whose template trims each text part
+    /// (`MediaConfig::trim_text_parts`) rebuilds text-only arrays the same way.
     pub content: String,
-    #[serde(default)]
     pub name: Option<String>,
-    #[serde(default)]
     pub tool_calls: Option<Vec<ToolCall>>,
-    #[serde(default)]
     pub tool_call_id: Option<String>,
+    /// Every content part in order when `content` was an array (empty for
+    /// the string form). The image path rebuilds the text from these so each
+    /// image's placeholder lands where the caller put the image.
+    pub parts: Vec<ContentPart>,
+}
+
+/// One OpenAI content part the server accepts.
+#[derive(Debug, Clone, PartialEq)]
+pub enum ContentPart {
+    Text(String),
+    ImageUrl {
+        url: String,
+        detail: Option<String>,
+    },
+    /// The `video_url` extension (vLLM, SGLang, OpenRouter): served as its
+    /// sampled frames, each one image.
+    VideoUrl {
+        url: String,
+        detail: Option<String>,
+    },
+    /// A `video_url` whose `url` is an array (OVMS's form): the video's
+    /// frames, already extracted, each an image URL as `image_url` takes.
+    /// Served as a decoded video is, without ffmpeg; `fps` (else the
+    /// server's `video_fps`) spaces their times.
+    VideoFrames {
+        urls: Vec<String>,
+        detail: Option<String>,
+        fps: Option<f64>,
+    },
+}
+
+impl ContentPart {
+    fn is_video(&self) -> bool {
+        matches!(self, Self::VideoUrl { .. } | Self::VideoFrames { .. })
+    }
+}
+
+#[derive(Deserialize)]
+struct RawChatMessage {
+    role: String,
+    #[serde(default)]
+    content: Option<serde_json::Value>,
+    #[serde(default)]
+    name: Option<String>,
+    #[serde(default)]
+    tool_calls: Option<Vec<ToolCall>>,
+    #[serde(default)]
+    tool_call_id: Option<String>,
+}
+
+impl TryFrom<RawChatMessage> for ChatMessage {
+    type Error = String;
+
+    fn try_from(raw: RawChatMessage) -> Result<Self, String> {
+        // Templates print the role raw (`'<start_of_turn>' + role`), so an
+        // arbitrary one is caller text in the prompt's framing. OpenAI's
+        // deprecated `function` role (a function's result, named by `name`)
+        // is still in the SDKs' types; it renders as the `tool` turn it was
+        // replaced by, which every template knows.
+        let role = match raw.role.as_str() {
+            "user" | "assistant" | "system" | "developer" | "tool" => raw.role,
+            "function" => "tool".to_owned(),
+            other => {
+                return Err(format!(
+                    "role `{other}` is not supported; use `user`, `assistant`, `system`, \
+                     `developer` or `tool`"
+                ))
+            }
+        };
+        let (content, parts) = parse_content(raw.content)?;
+        Ok(Self {
+            role,
+            content,
+            name: raw.name,
+            tool_calls: raw.tool_calls,
+            tool_call_id: raw.tool_call_id,
+            parts,
+        })
+    }
+}
+
+impl ChatMessage {
+    /// The image parts, in order.
+    pub fn images(&self) -> impl Iterator<Item = (&str, Option<&str>)> {
+        self.parts.iter().filter_map(|p| match p {
+            ContentPart::ImageUrl { url, detail } => Some((url.as_str(), detail.as_deref())),
+            _ => None,
+        })
+    }
+
+    /// The video file parts, in order (frame lists are not files).
+    pub fn videos(&self) -> impl Iterator<Item = (&str, Option<&str>)> {
+        self.parts.iter().filter_map(|p| match p {
+            ContentPart::VideoUrl { url, detail } => Some((url.as_str(), detail.as_deref())),
+            _ => None,
+        })
+    }
+
+    /// Video parts of either kind, files and frame lists: what
+    /// `--api-max-videos` counts.
+    pub fn video_count(&self) -> usize {
+        self.parts.iter().filter(|p| p.is_video()).count()
+    }
+
+    /// Whether any part is an image or a video.
+    pub fn has_media(&self) -> bool {
+        self.parts
+            .iter()
+            .any(|p| !matches!(p, ContentPart::Text(_)))
+    }
 }
 
 /// OpenAI tool spec (request input). `function` is opaque JSON (name,
@@ -704,9 +1142,109 @@ pub struct FunctionCall {
     pub arguments: String,
 }
 
-/// null/missing content -> "" (assistant tool-call turns send content: null).
-fn de_null_content<'de, D: serde::Deserializer<'de>>(d: D) -> Result<String, D::Error> {
-    Ok(Option::<String>::deserialize(d)?.unwrap_or_default())
+/// OpenAI `content` is a string, null, or an array of typed parts.
+/// null/missing -> "" (assistant tool-call turns send content: null). The
+/// array's `text` parts join back to back into the one string the chat
+/// template sees, as HF's templates write a content array (a "\n" between
+/// them put a token the caller never sent into the prompt); every part is
+/// kept in order in `parts` for the image path and per-part trimming. Any other part type is rejected by name: silently dropping it would
+/// have the model answer about input it never saw.
+fn parse_content(value: Option<serde_json::Value>) -> Result<(String, Vec<ContentPart>), String> {
+    let parts = match value {
+        None | Some(serde_json::Value::Null) => return Ok((String::new(), Vec::new())),
+        Some(serde_json::Value::String(s)) => return Ok((s, Vec::new())),
+        Some(serde_json::Value::Array(parts)) => parts,
+        Some(_) => {
+            return Err("`content` must be a string, null, or an array of content parts".into())
+        }
+    };
+    let mut out = Vec::with_capacity(parts.len());
+    for part in parts {
+        let kind = part.get("type").and_then(|t| t.as_str()).unwrap_or("");
+        match kind {
+            "text" => match part.get("text").and_then(|t| t.as_str()) {
+                Some(text) => out.push(ContentPart::Text(text.to_owned())),
+                None => return Err("content part of type `text` needs a string `text`".into()),
+            },
+            "video_url" if part[kind]["url"].is_array() => out.push(parse_frame_list(&part[kind])?),
+            // `image_url` (and `video_url`) is an object `{url, detail}`;
+            // some clients send the bare URL string. A file's `fps` is
+            // ignored: the server samples it at its own rate.
+            "image_url" | "video_url" => {
+                let (url, detail) = match part.get(kind) {
+                    Some(serde_json::Value::String(u)) => (Some(u.as_str()), None),
+                    Some(obj) => (
+                        obj.get("url").and_then(|u| u.as_str()),
+                        obj.get("detail").and_then(|d| d.as_str()),
+                    ),
+                    None => (None, None),
+                };
+                let Some(url) = url else {
+                    return Err(format!("content part of type `{kind}` needs `{kind}.url`"));
+                };
+                let (url, detail) = (url.to_owned(), detail.map(str::to_owned));
+                out.push(if kind == "image_url" {
+                    ContentPart::ImageUrl { url, detail }
+                } else {
+                    ContentPart::VideoUrl { url, detail }
+                });
+            }
+            "" => return Err("content part is missing its `type`".into()),
+            other => {
+                return Err(format!(
+                    "content part type `{other}` is not supported; only `text`, \
+                     `image_url` and `video_url` parts are accepted"
+                ))
+            }
+        }
+    }
+    let text = out
+        .iter()
+        .filter_map(|p| match p {
+            ContentPart::Text(t) => Some(t.as_str()),
+            _ => None,
+        })
+        .collect::<String>();
+    Ok((text, out))
+}
+
+/// A `video_url` object whose `url` is an array: OVMS's frame list, a
+/// non-empty array of image URL strings, with an optional `detail` and our
+/// `fps` (a number in (0, [`video::MAX_FPS`]]).
+fn parse_frame_list(obj: &serde_json::Value) -> Result<ContentPart, String> {
+    let list = obj["url"].as_array().expect("checked by the caller");
+    if list.is_empty() {
+        return Err("`video_url.url` must be a non-empty array of frame image URLs".into());
+    }
+    let urls = list
+        .iter()
+        .enumerate()
+        .map(|(k, u)| {
+            u.as_str()
+                .map(str::to_owned)
+                .ok_or_else(|| format!("`video_url.url[{k}]` must be a string (an image URL)"))
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    let fps = match obj.get("fps") {
+        None | Some(serde_json::Value::Null) => None,
+        Some(f) => match f.as_f64() {
+            Some(f) if f > 0.0 && f <= video::MAX_FPS => Some(f),
+            _ => {
+                return Err(format!(
+                    "`video_url.fps` must be a number above 0 and at most {}",
+                    video::MAX_FPS
+                ))
+            }
+        },
+    };
+    Ok(ContentPart::VideoFrames {
+        urls,
+        detail: obj
+            .get("detail")
+            .and_then(|d| d.as_str())
+            .map(str::to_owned),
+        fps,
+    })
 }
 
 /// OpenAI `stop` is either a single string or an array of strings.
@@ -1336,6 +1874,7 @@ fn chat_template_smoke_failures(
             name: None,
             tool_calls: None,
             tool_call_id: None,
+            parts: Vec::new(),
         }
     }
     let tools = [Tool {
@@ -1395,6 +1934,12 @@ fn chat_template_smoke_failures(
 }
 
 fn build_chat_env(template_src: &str) -> Result<minijinja::Environment<'static>, String> {
+    // Jinja2 (what HF renders with) normalises \r\n and lone \r to \n in the
+    // whole source, string literals included. A template written on Windows
+    // (optimum-cli there writes chat_template.jinja with CRLF) otherwise keeps
+    // a \r per line: Ministral-3's default system prompt cost 51 tokens more
+    // than HF's count.
+    let template_src = &template_src.replace("\r\n", "\n").replace('\r', "\n");
     use minijinja::value::Value;
     use minijinja::{Environment, Error, ErrorKind};
 
@@ -1439,12 +1984,37 @@ fn build_chat_env(template_src: &str) -> Result<minijinja::Environment<'static>,
     // hits this; without the rewrite the whole template fails to parse and the
     // API silently drops to the legacy formatter.
     let src = sanitize_numeric_dot_index(template_src);
+    // transformers' `{% generation %}` / `{% endgeneration %}` (the LLaVA
+    // templates) only mark the assistant span for training masks; at
+    // inference the block renders its body as is. Minijinja has no such
+    // statement and refuses the whole template, so drop the tags.
+    let src = strip_generation_tags(&src);
 
     // add_template_owned (not add_template) so the Environment owns the source
     // and is 'static — it can then live in AppState behind an Arc.
-    env.add_template_owned("chat", src.into_owned())
+    env.add_template_owned("chat", src)
         .map_err(|e| format!("template parse: {e}"))?;
     Ok(env)
+}
+
+/// Remove transformers' `{% generation %}` and `{% endgeneration %}` tags
+/// (any whitespace-control form), keeping what sits between them.
+fn strip_generation_tags(src: &str) -> String {
+    let mut out = String::with_capacity(src.len());
+    let mut rest = src;
+    while let Some(start) = rest.find("{%") {
+        let Some(len) = rest[start..].find("%}") else {
+            break;
+        };
+        let inner = rest[start + 2..start + len].trim_matches(|c: char| c == '-' || c == '+');
+        out.push_str(&rest[..start]);
+        if !matches!(inner.trim(), "generation" | "endgeneration") {
+            out.push_str(&rest[start..start + len + 2]);
+        }
+        rest = &rest[start + len + 2..];
+    }
+    out.push_str(rest);
+    out
 }
 
 /// Rewrite Jinja2 numeric dot-index (`foo.0`, `bar.12`) to bracket-index
@@ -1499,6 +2069,34 @@ fn render_with_chat_env(
     reasoning_effort: Option<&str>,
     tools: Option<&[Tool]>,
 ) -> Result<String, PromptRenderError> {
+    render_chat_env_as(
+        env,
+        messages,
+        bos_token,
+        eos_token,
+        enable_thinking,
+        reasoning_effort,
+        tools,
+        false,
+    )
+}
+
+/// [`render_with_chat_env`], with each message's content handed to the
+/// template as one `{"type": "text", "text": …}` part when `content_parts`:
+/// the LLaVA templates read only typed parts (`selectattr('type', 'equalto',
+/// 'text')`), so a plain string renders an empty turn. Image placeholders are
+/// already inside the text, so no image part is needed.
+#[allow(clippy::too_many_arguments)]
+fn render_chat_env_as(
+    env: &minijinja::Environment<'static>,
+    messages: &[ChatMessage],
+    bos_token: &str,
+    eos_token: &str,
+    enable_thinking: bool,
+    reasoning_effort: Option<&str>,
+    tools: Option<&[Tool]>,
+    content_parts: bool,
+) -> Result<String, PromptRenderError> {
     use minijinja::context;
     use minijinja::value::Value;
     let tmpl = env
@@ -1507,7 +2105,12 @@ fn render_with_chat_env(
     let messages_value: Vec<Value> = messages
         .iter()
         .map(|m| {
-            let mut obj = serde_json::json!({ "role": m.role, "content": m.content });
+            let content = if content_parts {
+                serde_json::json!([{ "type": "text", "text": m.content }])
+            } else {
+                serde_json::json!(m.content)
+            };
+            let mut obj = serde_json::json!({ "role": m.role, "content": content });
             if let Some(tc) = &m.tool_calls {
                 // HF chat templates (Qwen3 etc.) iterate `tool_call.arguments | items`,
                 // expecting a JSON object; OpenAI ships `arguments` as a string. Parse it for
@@ -1649,6 +2252,7 @@ pub fn template_speaks_effort_words(
         name: None,
         tool_calls: None,
         tool_call_id: None,
+        parts: Vec::new(),
     }];
     let render =
         |w: &str| render_with_chat_env(env, &msgs, bos_token, eos_token, true, Some(w), None);
@@ -1668,6 +2272,18 @@ pub fn template_speaks_effort_words(
             false
         }
     }
+}
+
+/// Whether a render dropped every user message's text (each non-empty one
+/// is missing from it): the sign of a template that reads only typed parts.
+fn user_text_lost(messages: &[ChatMessage], rendered: &str) -> bool {
+    let mut users = messages
+        .iter()
+        .filter(|m| m.role == "user")
+        .map(|m| m.content.trim())
+        .filter(|c| !c.is_empty())
+        .peekable();
+    users.peek().is_some() && users.all(|c| !rendered.contains(c))
 }
 
 fn render_or_fallback(
@@ -1751,7 +2367,9 @@ fn render_or_fallback(
     // The caller's own word, when it is not also the API's.
     let callers = raw.filter(|r| Some(*r) != mapped);
     let mut first = Err(PromptRenderError::Failed("no render attempted".into()));
+    let mut used = None;
     for (i, candidate) in order.iter().enumerate() {
+        used = *candidate;
         first = render_with_chat_env(
             env,
             messages,
@@ -1776,6 +2394,26 @@ fn render_or_fallback(
             );
         }
     }
+    // A template that reads only typed content parts renders every message
+    // empty from plain strings; render it again with the text as one part.
+    if let Ok(s) = &first {
+        if user_text_lost(messages, s) {
+            if let Ok(p) = render_chat_env_as(
+                env,
+                messages,
+                bos_token,
+                eos_token,
+                enable_thinking,
+                used,
+                tools,
+                true,
+            ) {
+                if !user_text_lost(messages, &p) {
+                    first = Ok(p);
+                }
+            }
+        }
+    }
     match first {
         Ok(s) => Ok(s),
         // A raise_exception is the template validating its own input; other
@@ -1789,6 +2427,956 @@ fn render_or_fallback(
             );
             Ok(render_prompt_legacy(messages))
         }
+    }
+}
+
+/// A chat request's images, decoded, and its messages with each image part
+/// replaced by that image's placeholder ([`prepare_media_with`]). Render
+/// `messages` with the model's chat template, check the rendered prompt with
+/// [`PreparedMedia::check_placeholders`], and send `inputs` as the task's
+/// media with `prompt_rendered` set.
+pub struct PreparedMedia {
+    /// The request's messages, each media part replaced by its placeholder.
+    pub messages: Vec<ChatMessage>,
+    /// Decoded media, in placeholder order: the task's `media`.
+    pub inputs: Vec<cascadia_types::MediaInput>,
+    /// The config the request was prepared with.
+    pub cfg: Arc<MediaConfig>,
+    /// How many of `inputs` are video frames (served as images).
+    pub frames: usize,
+    /// How many of `inputs` are native videos ([`MediaConfig::native_video`]).
+    pub videos: usize,
+}
+
+impl PreparedMedia {
+    /// Every image must reach the rendered prompt exactly once. A template
+    /// (or the no-template fallback, which keeps only the last user message)
+    /// that drops a message would otherwise leave GenAI with more images than
+    /// tags, and the model would never see the dropped ones.
+    ///
+    /// Reserved text is checked here too, on the whole rendered prompt: the
+    /// per-message check sees text parts joined with "\n", but an image
+    /// message's parts reach the prompt back to back, so a tag split across
+    /// two parts would only appear here (as would one in tool-call arguments
+    /// or tool definitions). Each reserved string may occur only as often as
+    /// the placeholders themselves carry it.
+    pub fn check_placeholders(&self, prompt: &str) -> Result<(), String> {
+        let n = self.inputs.len() - self.videos;
+        if let Err(found) = self.cfg.placeholders_complete(prompt, n) {
+            let sent = if self.frames > 0 {
+                format!("{n} images (video frames included)")
+            } else {
+                format!("{n} images")
+            };
+            return Err(format!(
+                "{sent} were sent but the rendered prompt carries {found} image \
+                 placeholders; this model's prompt format dropped the messages holding the rest"
+            ));
+        }
+        if let Err(found) = self.cfg.video_placeholders_complete(prompt, self.videos) {
+            return Err(format!(
+                "{} videos were sent but the rendered prompt carries {found} video \
+                 placeholders; this model's prompt format dropped the messages holding the rest",
+                self.videos
+            ));
+        }
+        if let Some(tag) = self
+            .cfg
+            .reserved_beyond_placeholders(prompt, n, self.videos)
+        {
+            return Err(format!(
+                "message text must not contain `{tag}`: it is reserved for {} placeholders",
+                reserved_for(tag)
+            ));
+        }
+        Ok(())
+    }
+}
+
+/// What a reserved tag marks, for the 400 that refuses it: `video` for a
+/// video tag (`<ov_genai_video_`, `<|video_pad|>`, ...), else `image`.
+fn reserved_for(tag: &str) -> &'static str {
+    if tag.contains("video") {
+        "video"
+    } else {
+        "image"
+    }
+}
+
+/// On a server that takes images, refuse a model's image-tag text (`<|image|>`,
+/// `[IMG]`, ...) in any caller text that reaches the prompt, images attached
+/// or not: the engine reads it as an image slot whatever the request carries,
+/// and a tag with no image behind it fails the batch it rides in (on packed
+/// slots, every tenant's). `what` names the caller's field in the 400, which
+/// is returned. A server without image input has no reserved text.
+fn refuse_reserved_text<'a>(
+    state: &AppState,
+    what: &str,
+    texts: impl IntoIterator<Item = &'a str>,
+) -> Option<Response> {
+    let cfg = state.media.as_deref()?;
+    let tag = texts.into_iter().find_map(|t| cfg.reserved_in(t))?;
+    count_rejected("invalid_media");
+    Some(api_error(
+        StatusCode::BAD_REQUEST,
+        format!(
+            "{what} must not contain `{tag}`: it is reserved for {} placeholders",
+            reserved_for(tag)
+        ),
+        None,
+    ))
+}
+
+/// Caller-written strings of a chat request, scanned first so the 400 names
+/// the field: message text, names, tool-call ids, names and arguments, tool
+/// definitions, and the raw `reasoning_effort` word. Not the guard itself: a
+/// template decodes JSON escapes in `arguments`, so the rendered prompt is
+/// checked too (see `admit_chat`).
+/// Bytes of a chat request's text: everything a caller sent but its image
+/// URLs (message text, names, tool calls, tool definitions, stops and the
+/// other strings), counted without copying.
+fn chat_text_bytes(req: &ChatCompletionRequest) -> usize {
+    struct Count(usize);
+    impl std::io::Write for Count {
+        fn write(&mut self, b: &[u8]) -> std::io::Result<usize> {
+            self.0 += b.len();
+            Ok(b.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+    let json_len = |v: &serde_json::Value| {
+        let mut c = Count(0);
+        serde_json::to_writer(&mut c, v).map_or(0, |_| c.0)
+    };
+    let opt = |s: &Option<String>| s.as_ref().map_or(0, String::len);
+    let mut n = req.model.len() + opt(&req.reasoning_effort);
+    for m in &req.messages {
+        n += m.role.len() + m.content.len() + opt(&m.name) + opt(&m.tool_call_id);
+        for c in m.tool_calls.iter().flatten() {
+            n += c.id.len() + c.r#type.len() + c.function.name.len() + c.function.arguments.len();
+        }
+    }
+    for t in req.tools.iter().flatten() {
+        n += t.r#type.len() + json_len(&t.function);
+    }
+    n += req.tool_choice.as_ref().map_or(0, json_len);
+    n += match &req.stop {
+        Some(StopSpec::Single(s)) => s.len(),
+        Some(StopSpec::Multiple(v)) => v.iter().map(String::len).sum(),
+        None => 0,
+    };
+    n
+}
+
+fn chat_caller_text(req: &ChatCompletionRequest) -> Vec<std::borrow::Cow<'_, str>> {
+    use std::borrow::Cow;
+    let mut out: Vec<Cow<'_, str>> = Vec::new();
+    for m in &req.messages {
+        out.push(Cow::Borrowed(&m.content));
+        out.extend(m.name.as_deref().map(Cow::Borrowed));
+        out.extend(m.tool_call_id.as_deref().map(Cow::Borrowed));
+        for c in m.tool_calls.iter().flatten() {
+            out.push(Cow::Borrowed(&c.id));
+            out.push(Cow::Borrowed(&c.function.name));
+            out.push(Cow::Borrowed(&c.function.arguments));
+        }
+    }
+    for t in req.tools.iter().flatten() {
+        out.push(Cow::Owned(t.function.to_string()));
+    }
+    out.extend(req.reasoning_effort.as_deref().map(Cow::Borrowed));
+    out
+}
+
+/// Why [`prepare_media_with`] refused a request's media.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum MediaError {
+    /// The request's fault (bad, oversized, too many or misplaced media): a
+    /// 400; retrying it unchanged cannot succeed.
+    Invalid(String),
+    /// No decode slot came free within the config's `decode_wait`: a 503 with
+    /// `Retry-After`; retry later.
+    Busy(String),
+    /// A decoder or ffmpeg failure on this server: a 500.
+    Internal(String),
+    /// A remote (`http(s)://`) image or video URL on a config with
+    /// [`MediaConfig::allow_remote_urls`] off: a 400, kept apart from
+    /// [`MediaError::Invalid`] so a gateway can name its own setting.
+    RemoteDisabled(String),
+}
+
+impl MediaError {
+    /// The HTTP status for this refusal: 400, 503 or 500.
+    pub fn http_status(&self) -> u16 {
+        match self {
+            MediaError::Invalid(_) | MediaError::RemoteDisabled(_) => 400,
+            MediaError::Busy(_) => 503,
+            MediaError::Internal(_) => 500,
+        }
+    }
+
+    /// The refusal's message, for the error body.
+    pub fn message(&self) -> &str {
+        match self {
+            MediaError::Invalid(m)
+            | MediaError::Busy(m)
+            | MediaError::Internal(m)
+            | MediaError::RemoteDisabled(m) => m,
+        }
+    }
+}
+
+impl std::fmt::Display for MediaError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.message())
+    }
+}
+
+impl std::error::Error for MediaError {}
+
+/// The server's media path: [`prepare_media_with`] on this server's config,
+/// its refusals as HTTP responses (and rejection metrics), and the 400 that
+/// names why a model without image input refuses one.
+async fn prepare_media(
+    state: &AppState,
+    messages: &[ChatMessage],
+) -> Result<Option<PreparedMedia>, Response> {
+    let count: usize = messages.iter().map(|m| m.images().count()).sum();
+    let videos: usize = messages.iter().map(ChatMessage::video_count).sum();
+    if count == 0 && videos == 0 {
+        return Ok(None);
+    }
+    let Some(cfg) = state.media.clone() else {
+        let why = state
+            .no_media_reason
+            .as_deref()
+            .map(|r| format!(": {r}"))
+            .unwrap_or_default();
+        count_rejected("invalid_media");
+        return Err(api_error(
+            StatusCode::BAD_REQUEST,
+            if count > 0 {
+                format!(
+                    "model `{}` does not accept image input (`image_url` content parts){why}",
+                    state.model_id
+                )
+            } else {
+                format!(
+                    "model `{}` does not accept image input, which video input is served as \
+                     (`video_url` content parts){why}",
+                    state.model_id
+                )
+            },
+            None,
+        ));
+    };
+    prepare_media_with(cfg, &state.decode_permits, messages)
+        .await
+        .map_err(media_error_response)
+}
+
+/// A [`MediaError`] as the server answers it: the 400 and the capacity 503
+/// (with `Retry-After`) counted as rejections, and the pre-engine refusals
+/// kept out of readiness (see `PreEngineFailure`).
+fn media_error_response(err: MediaError) -> Response {
+    match err {
+        MediaError::Invalid(msg) | MediaError::RemoteDisabled(msg) => {
+            count_rejected("invalid_media");
+            api_error(StatusCode::BAD_REQUEST, msg, None)
+        }
+        MediaError::Busy(msg) => {
+            count_rejected("capacity");
+            let mut resp = api_error(StatusCode::SERVICE_UNAVAILABLE, msg, None);
+            resp.headers_mut()
+                .insert(header::RETRY_AFTER, header::HeaderValue::from_static("1"));
+            resp.extensions_mut().insert(PreEngineFailure);
+            resp
+        }
+        MediaError::Internal(msg) => {
+            let mut resp = api_error(StatusCode::INTERNAL_SERVER_ERROR, msg, None);
+            resp.extensions_mut().insert(PreEngineFailure);
+            resp
+        }
+    }
+}
+
+/// Validate and decode a chat request's `image_url` and `video_url` parts
+/// against `cfg`, for a caller that serves a model itself (cascadia-api's
+/// server calls it through its own wrapper). `Ok(None)` for a text-only
+/// request. Media is accepted in `user` messages only. Remote URLs are fetched
+/// only when `cfg.allow_remote_urls`. One permit of `decode_slots` is held
+/// while the request's images and videos decode, waited for at most
+/// `cfg.decode_wait` ([`MediaError::Busy`] past it). Image decoding runs on
+/// the blocking pool: a large JPEG takes tens of milliseconds and would stall
+/// every connection on this worker. A video is decoded by an ffmpeg subprocess
+/// (see [`video`]) into frames that are served as images, each behind a
+/// `Frame k (t s): ` label, as if the caller had sent them that way; on an
+/// engine that takes video natively ([`MediaConfig::native_video`]) the
+/// frames are one video item behind the video tag instead. Each
+/// [`MediaInput`](cascadia_types::MediaInput) carries the SHA-256 of its
+/// decoded pixels, which the engines' image caches and warm-resume key on.
+pub async fn prepare_media_with(
+    cfg: Arc<MediaConfig>,
+    decode_slots: &Arc<Semaphore>,
+    messages: &[ChatMessage],
+) -> Result<Option<PreparedMedia>, MediaError> {
+    let reject = MediaError::Invalid;
+    let count: usize = messages.iter().map(|m| m.images().count()).sum();
+    let videos: usize = messages.iter().map(ChatMessage::video_count).sum();
+    if count == 0 && videos == 0 {
+        return Ok(None);
+    }
+    check_media_parts(&cfg, messages, count, videos, true)?;
+    let GatheredMedia {
+        images: image_bytes,
+        videos: video_inputs,
+        frame_lists,
+        ..
+    } = gather_media_bytes(&cfg, messages).await?;
+    let messages = messages.to_vec();
+    let decode_cfg = Arc::clone(&cfg);
+    // One slot for the whole request, its videos included: ffmpeg runs
+    // under it, before the images decode.
+    let decode_permit = acquire_decode_slot(Arc::clone(decode_slots), cfg.decode_wait).await?;
+    // One deadline over all of the request's videos, as the fetches have.
+    let deadline = tokio::time::Instant::now() + cfg.video_decode_timeout;
+    let mut video_frames = Vec::with_capacity(video_inputs.len());
+    for (j, (bytes, detail)) in file_video_indices(&messages).into_iter().zip(video_inputs) {
+        match video::decode_video(bytes, detail.as_deref(), &cfg, deadline).await {
+            Ok(frames) => video_frames.push(frames),
+            Err(video::VideoError::Invalid(msg)) => {
+                return Err(reject(format!("video {j}: {msg}")))
+            }
+            Err(video::VideoError::Internal(msg)) => return Err(MediaError::Internal(msg)),
+        }
+    }
+    let frames: usize = video_frames.iter().map(Vec::len).sum::<usize>()
+        + frame_lists.iter().map(Vec::len).sum::<usize>();
+    // Each video's plan caps its frames, and the counts were checked above.
+    debug_assert!(count + frames <= cfg.max_images + cfg.max_videos * cfg.max_video_frames);
+    let several_videos = videos > 1;
+    // A native video is one item behind its own tag; otherwise its frames
+    // are images.
+    let (frames, native_videos) = if cfg.native_video {
+        (0, videos)
+    } else {
+        (frames, 0)
+    };
+    let decoded = tokio::task::spawn_blocking(move || {
+        let _decode_permit = decode_permit;
+        let mut image_bytes = image_bytes.into_iter();
+        let mut video_frames = video_frames.into_iter();
+        let mut frame_lists = frame_lists.into_iter();
+        // A video's frames: a file's from ffmpeg above, a frame list's
+        // decoded here as images, then served alike.
+        let deadline = deadline.into_std();
+        let mut next_frames = |part: &ContentPart, j: usize| match part {
+            ContentPart::VideoFrames { detail, fps, .. } => {
+                let images = frame_lists.next().expect("bytes for every frame list");
+                let fps = fps.unwrap_or(decode_cfg.video_fps);
+                video::frames_from_images(&images, detail.as_deref(), fps, &decode_cfg, deadline)
+                    .map_err(|e| format!("video {j}: {e}"))
+            }
+            _ => Ok(video_frames.next().expect("frames for every video file")),
+        };
+        let mut video_index = 0;
+        // Images (video frames included) and native videos number their
+        // tags apart, as GenAI matches them.
+        let mut image_index = 0;
+        let mut inputs = Vec::with_capacity(count + frames + native_videos);
+        let mut out = Vec::with_capacity(messages.len());
+        for mut m in messages {
+            if m.parts.is_empty() {
+                out.push(m);
+                continue;
+            }
+            let mut pieces = Vec::with_capacity(m.parts.len());
+            for part in std::mem::take(&mut m.parts) {
+                match part {
+                    ContentPart::Text(t) => pieces.push((false, decode_cfg.text_part(t))),
+                    ContentPart::ImageUrl { detail, .. } => {
+                        let i = image_index;
+                        image_index += 1;
+                        let bytes = image_bytes.next().expect("one byte buffer per image");
+                        let input =
+                            media::decode_image_bytes(&bytes, detail.as_deref(), &decode_cfg)
+                                .map_err(|e| format!("image {i}: {e}"))?;
+                        inputs.push(input);
+                        pieces.push((true, decode_cfg.placeholder(i)));
+                    }
+                    // The whole video behind its own tag: the engine (GenAI)
+                    // encodes its frames together, with their times.
+                    v @ (ContentPart::VideoUrl { .. } | ContentPart::VideoFrames { .. })
+                        if decode_cfg.native_video =>
+                    {
+                        let j = video_index;
+                        let frames = next_frames(&v, j)?;
+                        video_index += 1;
+                        let input = video::video_input(frames)
+                            .ok_or_else(|| format!("video {j}: its frames differ in size"))?;
+                        let min = decode_cfg.video_min_side;
+                        if input.width.min(input.height) < min {
+                            return Err(format!(
+                                "video {j}: its frames are {}x{} after scaling; this model's \
+                                 video encoder needs at least {min} pixels a side (send a \
+                                 larger video, `detail` other than \"low\", or its frames as \
+                                 `image_url` parts)",
+                                input.width, input.height
+                            ));
+                        }
+                        inputs.push(input);
+                        pieces.push((true, decode_cfg.video_tag(j)));
+                    }
+                    // Each frame as the caller would have sent it: a text
+                    // part naming it, then the image. A model that writes
+                    // its images first gets one line naming every frame
+                    // instead (the labels would all land after the images).
+                    v @ (ContentPart::VideoUrl { .. } | ContentPart::VideoFrames { .. }) => {
+                        let frames = next_frames(&v, video_index)?;
+                        let video_no = several_videos.then_some(video_index + 1);
+                        video_index += 1;
+                        if decode_cfg.images_first {
+                            let secs: Vec<f64> = frames.iter().map(|f| f.secs).collect();
+                            let note = video::frames_note(video_no, &secs);
+                            pieces.push((false, decode_cfg.text_part(note)));
+                            for frame in frames {
+                                pieces.push((true, decode_cfg.placeholder(image_index)));
+                                image_index += 1;
+                                inputs.push(frame.input);
+                            }
+                            continue;
+                        }
+                        for (k, frame) in frames.into_iter().enumerate() {
+                            // The label goes with its frame (`join_parts`).
+                            let label = video::frame_label(video_no, k + 1, frame.secs);
+                            pieces.push((true, decode_cfg.text_part(label)));
+                            pieces.push((true, decode_cfg.placeholder(image_index)));
+                            image_index += 1;
+                            inputs.push(frame.input);
+                        }
+                    }
+                }
+            }
+            // Back to back, as the model's own template writes a content
+            // array (see `MediaConfig::trim_text_parts`, `images_first`).
+            m.content = decode_cfg.join_parts(pieces);
+            out.push(m);
+        }
+        Ok::<_, String>((out, inputs))
+    })
+    .await;
+    match decoded {
+        Ok(Ok((messages, inputs))) => Ok(Some(PreparedMedia {
+            messages,
+            inputs,
+            cfg,
+            frames,
+            videos: native_videos,
+        })),
+        Ok(Err(msg)) => Err(reject(msg)),
+        Err(join_err) => Err(decode_task_error(join_err)),
+    }
+}
+
+/// The count and placement checks [`prepare_media_with`] and
+/// [`fetch_request_media`] share. `need_ffmpeg`: whether this node decodes
+/// video (an entry node that only fetches does not).
+fn check_media_parts(
+    cfg: &MediaConfig,
+    messages: &[ChatMessage],
+    count: usize,
+    videos: usize,
+    need_ffmpeg: bool,
+) -> Result<(), MediaError> {
+    let reject = MediaError::Invalid;
+    if let Some(m) = messages.iter().find(|m| m.role != "user" && m.has_media()) {
+        let kind = if m.images().next().is_some() {
+            "image_url"
+        } else {
+            "video_url"
+        };
+        return Err(reject(format!(
+            "`{kind}` parts are only accepted in `user` messages, not `{}`",
+            m.role
+        )));
+    }
+    if count > cfg.max_images {
+        return Err(reject(format!(
+            "{count} images in one request; the limit is {}",
+            cfg.max_images
+        )));
+    }
+    // Frame lists are decoded as images; only video files need ffmpeg.
+    let files = messages.iter().map(|m| m.videos().count()).sum::<usize>();
+    if files > 0 && need_ffmpeg && cfg.ffmpeg.is_none() {
+        return Err(reject(video::NEEDS_FFMPEG.into()));
+    }
+    if videos > 0 && cfg.max_videos == 0 {
+        return Err(reject(
+            "video input is turned off on this server; send the video's frames as \
+             `image_url` parts instead"
+                .into(),
+        ));
+    }
+    if videos > cfg.max_videos {
+        return Err(reject(format!(
+            "{videos} videos in one request; the limit is {}",
+            cfg.max_videos
+        )));
+    }
+    for (j, part) in video_parts(messages) {
+        let ContentPart::VideoFrames { urls, fps, .. } = part else {
+            continue;
+        };
+        let n = urls.len();
+        // The parser checks these too; a caller that builds its parts
+        // itself (a gateway's own parser) is checked here.
+        if n == 0 {
+            return Err(reject(format!(
+                "video {j}: a frame list needs at least one frame"
+            )));
+        }
+        if fps.is_some_and(|f| !(f > 0.0 && f <= video::MAX_FPS)) {
+            return Err(reject(format!(
+                "video {j}: `fps` must be above 0 and at most {}",
+                video::MAX_FPS
+            )));
+        }
+        // Refused, not thinned, as OVMS refuses past its cap.
+        if n > cfg.max_video_frames {
+            return Err(reject(format!(
+                "video {j}: {n} frames; the limit is {} (`--api-max-video-frames`)",
+                cfg.max_video_frames
+            )));
+        }
+        // The span bounds the frame times, which Qwen turns into positions.
+        let fps = fps.unwrap_or(cfg.video_fps);
+        let secs = n as f64 / fps;
+        if secs > cfg.max_video_seconds {
+            return Err(reject(format!(
+                "video {j}: {n} frames at {fps} fps span {secs:.1} s; the limit is {} s",
+                cfg.max_video_seconds
+            )));
+        }
+    }
+    Ok(())
+}
+
+/// The request's video parts, files and frame lists, each with its index
+/// among them: the `video {j}` every video error names.
+fn video_parts(messages: &[ChatMessage]) -> impl Iterator<Item = (usize, &ContentPart)> {
+    messages
+        .iter()
+        .flat_map(|m| &m.parts)
+        .filter(|p| p.is_video())
+        .enumerate()
+}
+
+/// The index among all videos ([`video_parts`]) of each video file, in order.
+fn file_video_indices(messages: &[ChatMessage]) -> Vec<usize> {
+    video_parts(messages)
+        .filter(|(_, p)| matches!(p, ContentPart::VideoUrl { .. }))
+        .map(|(j, _)| j)
+        .collect()
+}
+
+/// A request's media as bytes, in request order: each image's encoded bytes
+/// and each video's bytes with its `detail`, and which of them were fetched.
+struct GatheredMedia {
+    images: Vec<Vec<u8>>,
+    videos: Vec<(Vec<u8>, Option<String>)>,
+    /// Each frame list's encoded frames, in request order.
+    frame_lists: Vec<Vec<Vec<u8>>>,
+    remote_images: Vec<bool>,
+    remote_videos: Vec<bool>,
+    remote_frames: Vec<Vec<bool>>,
+}
+
+/// Fetch a request's remote media under `cfg.fetch_policy` (its byte budgets
+/// and one deadline over every fetch), read the `data:` ones, and check what
+/// can be checked without decoding: each image's header size, the request's
+/// source pixels, the videos' byte total.
+async fn gather_media_bytes(
+    cfg: &Arc<MediaConfig>,
+    messages: &[ChatMessage],
+) -> Result<GatheredMedia, MediaError> {
+    let reject = MediaError::Invalid;
+    let count: usize = messages.iter().map(|m| m.images().count()).sum();
+    let videos: usize = messages.iter().map(ChatMessage::video_count).sum();
+    // Each video file's and frame list's index among the request's videos,
+    // as errors name it; each list with its frame URLs and `detail`.
+    let files = file_video_indices(messages);
+    let lists: Vec<(usize, Vec<String>, Option<String>)> = video_parts(messages)
+        .filter_map(|(j, p)| match p {
+            ContentPart::VideoFrames { urls, detail, .. } => {
+                Some((j, urls.clone(), detail.clone()))
+            }
+            _ => None,
+        })
+        .collect();
+    // A remote URL on a config that fetches none is its own refusal, so a
+    // caller can name the setting; any other non-`data:` URL is `Invalid`
+    // below, from the `data:` decoders.
+    if !cfg.allow_remote_urls {
+        for (j, urls, _) in &lists {
+            if let Some(k) = urls.iter().position(|u| media::is_remote(u)) {
+                return Err(MediaError::RemoteDisabled(format!(
+                    "video {j} frame {k}: {}",
+                    media::DATA_ONLY_IMAGES
+                )));
+            }
+        }
+        if let Some(i) = messages
+            .iter()
+            .flat_map(|m| m.images())
+            .position(|(url, _)| media::is_remote(url))
+        {
+            return Err(MediaError::RemoteDisabled(format!(
+                "image {i}: {}",
+                media::DATA_ONLY_IMAGES
+            )));
+        }
+        if let Some(j) = messages
+            .iter()
+            .flat_map(|m| m.videos())
+            .position(|(url, _)| media::is_remote(url))
+        {
+            return Err(MediaError::RemoteDisabled(format!(
+                "video {}: {}",
+                files[j],
+                video::DATA_ONLY_VIDEOS
+            )));
+        }
+    }
+    let remote = |url: &str| cfg.allow_remote_urls && media::is_remote(url);
+    let remote_images: Vec<bool> = messages
+        .iter()
+        .flat_map(|m| m.images())
+        .map(|(url, _)| remote(url))
+        .collect();
+    let remote_videos: Vec<bool> = messages
+        .iter()
+        .flat_map(|m| m.videos())
+        .map(|(url, _)| remote(url))
+        .collect();
+    let remote_frames: Vec<Vec<bool>> = lists
+        .iter()
+        .map(|(_, urls, _)| urls.iter().map(|u| remote(u)).collect())
+        .collect();
+    // Remote images are fetched first, outside the decode slot (a fetch
+    // waits on the network, not the CPU), sharing one byte budget per request.
+    // One deadline over all of them: each fetch has its own, but eight
+    // images back to back would still hold the permit for eight of those.
+    // Remote videos the same way, on a budget of their own.
+    let fetch_all = async {
+        let mut fetched: Vec<Option<Vec<u8>>> = Vec::with_capacity(count);
+        let mut budget = cfg.max_request_image_bytes;
+        for (i, (url, _)) in messages.iter().flat_map(|m| m.images()).enumerate() {
+            if !(cfg.allow_remote_urls && media::is_remote(url)) {
+                fetched.push(None);
+                continue;
+            }
+            let bytes = media::fetch_image(url, budget, cfg.fetch_policy)
+                .await
+                .map_err(|e| format!("image {i}: {e}"))?;
+            budget -= bytes.len();
+            fetched.push(Some(bytes));
+        }
+        let mut fetched_videos: Vec<Option<Vec<u8>>> = Vec::with_capacity(videos);
+        let mut budget = cfg.max_request_video_bytes;
+        for (&j, (url, _)) in files.iter().zip(messages.iter().flat_map(|m| m.videos())) {
+            if !(cfg.allow_remote_urls && media::is_remote(url)) {
+                fetched_videos.push(None);
+                continue;
+            }
+            let bytes = media::fetch_remote(url, budget, cfg.fetch_policy, media::Remote::Video)
+                .await
+                .map_err(|e| format!("video {j}: {e}"))?;
+            budget -= bytes.len();
+            fetched_videos.push(Some(bytes));
+        }
+        // A frame list's frames are images on the video budget.
+        let mut fetched_frames: Vec<Vec<Option<Vec<u8>>>> = Vec::with_capacity(lists.len());
+        for (j, urls, _) in &lists {
+            let mut frames = Vec::with_capacity(urls.len());
+            for (k, url) in urls.iter().enumerate() {
+                if !(cfg.allow_remote_urls && media::is_remote(url)) {
+                    frames.push(None);
+                    continue;
+                }
+                let bytes = media::fetch_image(url, budget, cfg.fetch_policy)
+                    .await
+                    .map_err(|e| format!("video {j} frame {k}: {e}"))?;
+                budget -= bytes.len();
+                frames.push(Some(bytes));
+            }
+            fetched_frames.push(frames);
+        }
+        Ok::<_, String>((fetched, fetched_videos, fetched_frames))
+    };
+    let (fetched, fetched_videos, fetched_frames) =
+        match tokio::time::timeout(cfg.fetch_policy.per_request, fetch_all).await {
+            Ok(Ok(f)) => f,
+            Ok(Err(msg)) => return Err(reject(msg)),
+            Err(_) => {
+                return Err(reject(format!(
+                    "fetching this request's {} took longer than {} s",
+                    if videos == 0 { "images" } else { "media" },
+                    cfg.fetch_policy.per_request.as_secs_f32()
+                )))
+            }
+        };
+    // Every image's bytes and declared size, outside the decode slot: base64
+    // and a header read are cheap next to a decode, and the request's total
+    // source pixels are refused here before any image is decoded. Videos'
+    // bytes too, held to their own byte budget.
+    let header_cfg = Arc::clone(cfg);
+    let urls: Vec<(String, Option<String>)> = messages
+        .iter()
+        .flat_map(|m| m.images())
+        .map(|(u, d)| (u.to_owned(), d.map(str::to_owned)))
+        .collect();
+    let video_urls: Vec<(String, Option<String>)> = messages
+        .iter()
+        .flat_map(|m| m.videos())
+        .map(|(u, d)| (u.to_owned(), d.map(str::to_owned)))
+        .collect();
+    let sized = tokio::task::spawn_blocking(move || {
+        let mut bytes = Vec::with_capacity(urls.len());
+        let mut sizes = Vec::with_capacity(urls.len());
+        for (i, ((url, detail), fetched)) in urls.iter().zip(fetched).enumerate() {
+            let b = match fetched {
+                Some(b) => b,
+                None => media::image_url_bytes(url, detail.as_deref(), &header_cfg)
+                    .map_err(|e| format!("image {i}: {e}"))?,
+            };
+            sizes.push(media::source_size(&b, &header_cfg).map_err(|e| format!("image {i}: {e}"))?);
+            bytes.push(b);
+        }
+        media::check_request_pixels(&sizes, &header_cfg)?;
+        // A frame list's frames as images, each under a video's frame-size
+        // bound, all one size (as OVMS requires, and a native video needs),
+        // their bytes in the videos'. Their pixels are a video's, not in the
+        // images' total: a list is served wherever the file it came from is.
+        let over_video_bytes = || {
+            format!(
+                "this request's videos are over the {}-byte limit",
+                header_cfg.max_request_video_bytes
+            )
+        };
+        let mut video_bytes = 0;
+        let mut frame_lists = Vec::with_capacity(lists.len());
+        for ((j, urls, detail), fetched) in lists.into_iter().zip(fetched_frames) {
+            video::check_detail(detail.as_deref()).map_err(|e| format!("video {j}: {e}"))?;
+            let mut frames = Vec::with_capacity(urls.len());
+            let mut first = None;
+            for (k, (url, fetched)) in urls.iter().zip(fetched).enumerate() {
+                let at = |e: String| format!("video {j} frame {k}: {e}");
+                let b = match fetched {
+                    Some(b) => b,
+                    None => media::image_url_bytes(url, None, &header_cfg).map_err(at)?,
+                };
+                let (w, h) = media::source_size(&b, &header_cfg).map_err(at)?;
+                if u64::from(w) * u64::from(h) > header_cfg.max_video_source_pixels {
+                    return Err(at(format!(
+                        "the frame is {w}x{h}; a video frame may be at most {} pixels",
+                        header_cfg.max_video_source_pixels
+                    )));
+                }
+                match first {
+                    None => first = Some((w, h)),
+                    Some((w0, h0)) if (w0, h0) != (w, h) => {
+                        return Err(at(format!(
+                            "the frame is {w}x{h} but frame 0 is {w0}x{h0}; every frame of a \
+                             video must be the same size"
+                        )))
+                    }
+                    Some(_) => {}
+                }
+                video_bytes += b.len();
+                if video_bytes > header_cfg.max_request_video_bytes {
+                    return Err(over_video_bytes());
+                }
+                frames.push(b);
+            }
+            frame_lists.push(frames);
+        }
+        let mut videos = Vec::with_capacity(video_urls.len());
+        for (j, ((url, detail), fetched)) in files
+            .into_iter()
+            .zip(video_urls.into_iter().zip(fetched_videos))
+        {
+            let b = match fetched {
+                Some(b) => b,
+                None => video::video_url_bytes(&url, detail.as_deref(), &header_cfg)
+                    .map_err(|e| format!("video {j}: {e}"))?,
+            };
+            video_bytes += b.len();
+            if video_bytes > header_cfg.max_request_video_bytes {
+                return Err(over_video_bytes());
+            }
+            videos.push((b, detail));
+        }
+        Ok::<_, String>((bytes, videos, frame_lists))
+    })
+    .await;
+    let (images, videos, frame_lists) = match sized {
+        Ok(Ok(b)) => b,
+        Ok(Err(msg)) => return Err(reject(msg)),
+        Err(join_err) => return Err(decode_task_error(join_err)),
+    };
+    Ok(GatheredMedia {
+        images,
+        videos,
+        frame_lists,
+        remote_images,
+        remote_videos,
+        remote_frames,
+    })
+}
+
+/// Fetch a chat request's remote `image_url` / `video_url` parts the way this
+/// server would, for a gateway's entry node that forwards the request to the
+/// node that serves the model. Every check that needs no decoding runs here,
+/// as [`prepare_media_with`] runs it: media only in `user` messages, the image
+/// and video counts, the SSRF guard on each fetch (public `https` addresses
+/// only, redirects re-checked, content type, size read-capped), one byte
+/// budget per request for images and one for videos, one deadline
+/// ([`FetchPolicy::per_request`](media::FetchPolicy::per_request)) over all
+/// of a request's fetches, each image's header size and the request's source
+/// pixels; a fetched video must start like a container this server decodes.
+///
+/// Returns the messages with every fetched URL replaced by a base64 `data:`
+/// URL (`detail` kept), so the serving node needs no outbound access;
+/// `data:` parts are left as sent. Errors never contain a URL: they name the
+/// part (`image 2: ...`) and the reason. A remote URL with
+/// [`MediaConfig::allow_remote_urls`] off is [`MediaError::RemoteDisabled`];
+/// every other refusal is [`MediaError::Invalid`]. ffmpeg is not needed
+/// here; the serving node decodes.
+pub async fn fetch_request_media(
+    cfg: Arc<MediaConfig>,
+    messages: &[ChatMessage],
+) -> Result<Vec<ChatMessage>, MediaError> {
+    let count: usize = messages.iter().map(|m| m.images().count()).sum();
+    let videos: usize = messages.iter().map(ChatMessage::video_count).sum();
+    if count == 0 && videos == 0 {
+        return Ok(messages.to_vec());
+    }
+    check_media_parts(&cfg, messages, count, videos, false)?;
+    let gathered = gather_media_bytes(&cfg, messages).await?;
+    let mut images = gathered.images.into_iter().zip(gathered.remote_images);
+    let mut fetched_videos = gathered.videos.into_iter().zip(gathered.remote_videos);
+    let mut frame_lists = gathered.frame_lists.into_iter().zip(gathered.remote_frames);
+    let mut video_index = 0;
+    // `source_size` accepted the bytes, so their format is known.
+    let image_mime = |bytes: &[u8]| {
+        image::guess_format(bytes)
+            .map(|f| f.to_mime_type())
+            .unwrap_or("image/png")
+    };
+    let mut out = messages.to_vec();
+    for part in out.iter_mut().flat_map(|m| m.parts.iter_mut()) {
+        match part {
+            ContentPart::ImageUrl { url, .. } => {
+                let (bytes, remote) = images.next().expect("one entry per image part");
+                if remote {
+                    *url = data_url(image_mime(&bytes), &bytes);
+                }
+            }
+            ContentPart::VideoUrl { url, .. } => {
+                let ((bytes, _), remote) = fetched_videos.next().expect("one entry per video part");
+                let j = video_index;
+                video_index += 1;
+                if remote {
+                    let container = video::Container::sniff(&bytes).ok_or_else(|| {
+                        MediaError::Invalid(format!(
+                            "video {j}: the data is not a video this server decodes; {}",
+                            video::SUPPORTED
+                        ))
+                    })?;
+                    *url = data_url(container.mime(), &bytes);
+                }
+            }
+            ContentPart::VideoFrames { urls, .. } => {
+                video_index += 1;
+                let (frames, remote) = frame_lists.next().expect("one entry per frame list");
+                for ((url, bytes), remote) in urls.iter_mut().zip(frames).zip(remote) {
+                    if remote {
+                        *url = data_url(image_mime(&bytes), &bytes);
+                    }
+                }
+            }
+            ContentPart::Text(_) => {}
+        }
+    }
+    Ok(out)
+}
+
+/// A base64 `data:` URL for `bytes`.
+fn data_url(mime: &str, bytes: &[u8]) -> String {
+    use base64::Engine as _;
+    format!(
+        "data:{mime};base64,{}",
+        base64::engine::general_purpose::STANDARD.encode(bytes)
+    )
+}
+
+fn decode_task_error(join_err: tokio::task::JoinError) -> MediaError {
+    tracing::error!(error = %join_err, "image decode task failed");
+    // A decoder fault on one upload says nothing about the pipeline: the
+    // server keeps it out of readiness (see `PreEngineFailure`).
+    MediaError::Internal("image decoding failed".into())
+}
+
+/// A decode slot, waited for at most `wait`. The caller holds an in-flight
+/// permit meanwhile, so an unbounded wait behind another request's large
+/// images would pin it; past `wait` the request gets the capacity 503 (with
+/// `Retry-After`), kept out of readiness like any pre-engine refusal.
+async fn acquire_decode_slot(
+    permits: Arc<Semaphore>,
+    wait: std::time::Duration,
+) -> Result<tokio::sync::OwnedSemaphorePermit, MediaError> {
+    match tokio::time::timeout(wait, permits.acquire_owned()).await {
+        Ok(p) => Ok(p.expect("decode semaphore is never closed")),
+        Err(_) => Err(MediaError::Busy(
+            "image decoding at capacity; retry after current requests complete".into(),
+        )),
+    }
+}
+
+/// A text-only request's messages as the template sees them: on a server
+/// whose template trims each text part (`MediaConfig::trim_text_parts`), an
+/// array's text parts are rebuilt trimmed, as the image path rebuilds them.
+fn text_messages<'a>(
+    state: &AppState,
+    messages: &'a [ChatMessage],
+) -> std::borrow::Cow<'a, [ChatMessage]> {
+    use std::borrow::Cow;
+    match state.media.as_deref() {
+        Some(cfg) if cfg.trim_text_parts && messages.iter().any(|m| !m.parts.is_empty()) => {
+            Cow::Owned(
+                messages
+                    .iter()
+                    .map(|m| {
+                        let mut m = m.clone();
+                        if !m.parts.is_empty() {
+                            let pieces = std::mem::take(&mut m.parts)
+                                .into_iter()
+                                .filter_map(|p| match p {
+                                    ContentPart::Text(t) => Some((false, cfg.text_part(t))),
+                                    _ => None,
+                                })
+                                .collect();
+                            m.content = cfg.join_parts(pieces);
+                        }
+                        m
+                    })
+                    .collect(),
+            )
+        }
+        _ => Cow::Borrowed(messages),
     }
 }
 
@@ -2444,18 +4032,48 @@ fn chat_tools(req: &ChatCompletionRequest) -> Option<serde_json::Value> {
         .and_then(|ts| serde_json::to_value(ts).ok())
 }
 
-async fn chat_completions(
-    State(state): State<AppState>,
-    Json(req): Json<ChatCompletionRequest>,
-) -> axum::response::Response {
-    let task_id = format!("chatcmpl-{}", Uuid::new_v4().simple());
+/// A chat request past every pre-engine check: the task to submit, and the
+/// request slot and in-flight guard it holds until generation ends.
+struct AdmittedChat {
+    task: GenerationTask,
+    permit: tokio::sync::OwnedSemaphorePermit,
+    inflight: InFlightGuard,
+}
+
+/// Everything `/v1/chat/completions` does before the engine: images, the
+/// chat template, the prompt checks and the request gate. Shared with
+/// `/v1/responses`, which maps its request onto a chat request first, so
+/// both endpoints refuse and admit the same requests. `empty_hint` names the
+/// caller's field in the empty-prompt 400.
+async fn admit_chat(
+    state: &AppState,
+    req: &ChatCompletionRequest,
+    task_id: String,
+    empty_hint: &str,
+) -> Result<AdmittedChat, Response> {
+    // First, before any scan or render: the body limit was raised for
+    // images, so the text alone is held to the text limit here.
+    if let Some(max) = state.max_text_bytes {
+        let n = chat_text_bytes(req);
+        if n > max {
+            count_rejected("prompt_too_large");
+            return Err(api_error(
+                StatusCode::PAYLOAD_TOO_LARGE,
+                format!(
+                    "request text (everything but image URLs) is {n} bytes; max allowed \
+                     is {max} (max_body_bytes)"
+                ),
+                None,
+            ));
+        }
+    }
     if let Err(e) = req.validate_tool_choice() {
         count_rejected("invalid_request");
-        return (
+        return Err((
             StatusCode::BAD_REQUEST,
             Json(serde_json::json!({ "error": e })),
         )
-            .into_response();
+            .into_response());
     }
     let enable_thinking = req.effective_enable_thinking();
     // effective_reasoning_effort() hardcodes GLM's high/max vocabulary and is
@@ -2465,28 +4083,83 @@ async fn chat_completions(
     // client's "low" reaches such a template unescalated — or, when the caller
     // sent nothing of their own, with the effort undefined (the template's
     // default). A caller word the template also rejects is a 400.
-    let prompt = match render_prompt(
-        &state,
-        &req.messages,
-        enable_thinking,
-        EffortArgs {
-            mapped: Some(req.effective_reasoning_effort()),
-            raw: req.reasoning_effort.as_deref(),
-            explicit_thinking: req.enable_thinking.is_some(),
-            template_words: state.effort_words,
-        },
-        req.tools.as_deref(),
+    // An image request takes its in-flight permit BEFORE decoding: decoding
+    // is the expensive part (a source image may hold ~150 MB of RGB), and
+    // doing it ahead of the gate let any number of concurrent requests decode
+    // at once. Text requests keep the gate where it was, after rendering.
+    let early_permit = if req.messages.iter().any(ChatMessage::has_media) {
+        match state.permits.clone().try_acquire_owned() {
+            Ok(p) => Some(p),
+            Err(_) => {
+                count_rejected("capacity");
+                return Err(api_error(
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    "engine at capacity; retry after current requests complete",
+                    None,
+                ));
+            }
+        }
+    } else {
+        None
+    };
+    // Only function tools exist; any other `type` is text the template
+    // would print as is.
+    let mut calls = req
+        .messages
+        .iter()
+        .flat_map(|m| m.tool_calls.iter().flatten());
+    if req.tools.iter().flatten().any(|t| t.r#type != "function")
+        || calls.any(|c| c.r#type != "function")
+    {
+        count_rejected("malformed_body");
+        return Err(api_error(
+            StatusCode::BAD_REQUEST,
+            "only `function` tools and tool calls are supported (`type` must be `function`)",
+            None,
+        ));
+    }
+    if let Some(resp) = refuse_reserved_text(
+        state,
+        "message text",
+        chat_caller_text(req).iter().map(|t| t.as_ref()),
     ) {
+        return Err(resp);
+    }
+    let media = prepare_media(state, &req.messages).await?;
+    let effort = EffortArgs {
+        mapped: Some(req.effective_reasoning_effort()),
+        raw: req.reasoning_effort.as_deref(),
+        explicit_thinking: req.enable_thinking.is_some(),
+        template_words: state.effort_words,
+    };
+    let rendered = match &media {
+        // Image requests always render here, thinking or not, so each
+        // placeholder sits inside its own message; the engine is told not to
+        // template again (`prompt_rendered`).
+        Some(m) => render_or_fallback(
+            state.chat_env.as_deref(),
+            &m.messages,
+            &state.bos_token,
+            &state.eos_token,
+            enable_thinking,
+            effort,
+            req.tools.as_deref(),
+        ),
+        None => render_prompt(
+            state,
+            &text_messages(state, &req.messages),
+            enable_thinking,
+            effort,
+            req.tools.as_deref(),
+        ),
+    };
+    let prompt = match rendered {
         Ok(p) => p,
         // A tools request that cannot be templated must not return a 200: the
         // model would answer without ever seeing the tools, and the caller
         // cannot tell that from "the model chose not to call one".
         Err(e @ PromptRenderError::Rejected(_)) => {
-            return (
-                StatusCode::BAD_REQUEST,
-                Json(serde_json::json!({ "error": e.to_string() })),
-            )
-                .into_response();
+            return Err(api_error(StatusCode::BAD_REQUEST, e.to_string(), None));
         }
         Err(e @ PromptRenderError::Failed(_)) => {
             tracing::error!(error = %e, "chat_template render failed for a request that needs it");
@@ -2494,13 +4167,9 @@ async fn chat_completions(
             // an operator needs to see, not the caller's mistake. But it is
             // raised before the engine is involved, so it must not latch
             // readiness — see `PreEngineFailure`.
-            let mut resp = (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                Json(serde_json::json!({ "error": e.to_string() })),
-            )
-                .into_response();
+            let mut resp = api_error(StatusCode::INTERNAL_SERVER_ERROR, e.to_string(), None);
             resp.extensions_mut().insert(PreEngineFailure);
-            return resp;
+            return Err(resp);
         }
     };
     // Degenerate input (no messages, or a render that collapses to nothing)
@@ -2509,27 +4178,23 @@ async fn chat_completions(
     // with empty content — indistinguishable from a real failure.
     if prompt.trim().is_empty() {
         count_rejected("empty_prompt");
-        return (
+        return Err(api_error(
             StatusCode::BAD_REQUEST,
-            Json(serde_json::json!({
-                "error": "no prompt content: `messages` is empty or rendered to an empty prompt"
-            })),
-        )
-            .into_response();
+            format!("no prompt content: {empty_hint}"),
+            None,
+        ));
     }
     if prompt.len() > state.max_prompt_bytes {
         count_rejected("prompt_too_large");
-        return (
+        return Err(api_error(
             StatusCode::PAYLOAD_TOO_LARGE,
-            Json(serde_json::json!({
-                "error": format!(
-                    "prompt is {} bytes; max allowed is {} (max_prompt_bytes)",
-                    prompt.len(),
-                    state.max_prompt_bytes,
-                )
-            })),
-        )
-            .into_response();
+            format!(
+                "prompt is {} bytes; max allowed is {} (max_prompt_bytes)",
+                prompt.len(),
+                state.max_prompt_bytes,
+            ),
+            None,
+        ));
     }
     // Same bound on the structured turns: tool-call results ride as
     // messages and never count toward prompt.len(), so a request could
@@ -2548,7 +4213,7 @@ async fn chat_completions(
         .sum();
     if messages_bytes > state.max_prompt_bytes {
         count_rejected("prompt_too_large");
-        return (
+        return Err((
             StatusCode::PAYLOAD_TOO_LARGE,
             Json(serde_json::json!({
                 "error": format!(
@@ -2558,10 +4223,37 @@ async fn chat_completions(
                 )
             })),
         )
-            .into_response();
+            .into_response());
     }
+    if let Some(m) = &media {
+        if let Err(msg) = m.check_placeholders(&prompt) {
+            count_rejected("invalid_media");
+            return Err(api_error(StatusCode::BAD_REQUEST, msg, None));
+        }
+    } else if let Some(tag) = state
+        .media
+        .as_deref()
+        .and_then(|cfg| cfg.reserved_beyond_placeholders(&prompt, 0, 0))
+    {
+        // The per-field scan above only names the field; this is the check
+        // that holds. The template decodes tool-call `arguments` (JSON
+        // escapes included) and prints roles, ids and tool types raw, so the
+        // rendered prompt is the one place a tag can be counted. With no
+        // image attached, any reserved text in it is the caller's.
+        count_rejected("invalid_media");
+        return Err(api_error(
+            StatusCode::BAD_REQUEST,
+            format!(
+                "request text must not contain `{tag}`: it is reserved for {} placeholders",
+                reserved_for(tag)
+            ),
+            None,
+        ));
+    }
+    let prompt_rendered = media.is_some() && state.chat_env.is_some();
+    let media = media.map(|m| m.inputs).unwrap_or_default();
     let task = GenerationTask {
-        task_id: task_id.clone(),
+        task_id,
         prompt,
         // Structured turns for engines that forward the conversation to a
         // downstream chat server applying its own template (sycl-llama:
@@ -2585,6 +4277,8 @@ async fn chat_completions(
         // model's context PAST the rendered prompt. Only the scheduler's
         // rescue path sets it, engine-side of this API.
         resume_token_ids: None,
+        media,
+        prompt_rendered,
     };
 
     // Acquire a request slot before touching the engine. Contended streams
@@ -2594,18 +4288,19 @@ async fn chat_completions(
     // finite: the engine's own queue/slot depth, and the blocking pool the
     // submits land on. Backpressure is 503; clients should retry with
     // backoff.
-    let permit = match state.permits.clone().try_acquire_owned() {
-        Ok(p) => p,
-        Err(_) => {
-            count_rejected("capacity");
-            return (
-                StatusCode::SERVICE_UNAVAILABLE,
-                Json(serde_json::json!({
-                    "error": "engine at capacity; retry after current requests complete"
-                })),
-            )
-                .into_response();
-        }
+    let permit = match early_permit {
+        Some(p) => p,
+        None => match state.permits.clone().try_acquire_owned() {
+            Ok(p) => p,
+            Err(_) => {
+                count_rejected("capacity");
+                return Err(api_error(
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    "engine at capacity; retry after current requests complete",
+                    None,
+                ));
+            }
+        },
     };
 
     // Past the gate = an admitted request. Bump the cumulative counter and
@@ -2614,35 +4309,45 @@ async fn chat_completions(
     state.stats.requests_total.fetch_add(1, Ordering::Relaxed);
     let inflight = InFlightGuard::new(state.stats.clone());
 
-    if req.stream {
-        let include_usage = req
-            .stream_options
-            .as_ref()
-            .map(|o| o.include_usage)
-            .unwrap_or(false);
-        let tool_choice = req.tool_choice.clone();
-        let tools_present = req.tools.as_ref().is_some_and(|t| !t.is_empty());
-        return stream_completion(
-            state,
-            req.model,
-            task,
-            permit,
-            inflight,
-            include_usage,
-            tool_choice,
-            tools_present,
-        )
-        .await
-        .into_response();
-    }
+    Ok(AdmittedChat {
+        task,
+        permit,
+        inflight,
+    })
+}
 
-    // Non-streaming: collect full output. Hold the permit + in-flight guard
-    // until the task completes; drop frees the slot.
+/// A non-streaming generation, collected.
+struct Collected {
+    text: String,
+    prompt_tokens: u32,
+    completion_tokens: u32,
+    /// OpenAI `finish_reason`: `stop` or `length`.
+    finish_reason: &'static str,
+    logprobs: Vec<cascadia_types::TokenLogprobs>,
+    /// The engine's own reason from the final chunk (`Stop` when it gave
+    /// none); `None` when the stream ended without one, as a cancelled task's
+    /// does. `finish_reason` folds `Cancelled` into `stop`; this keeps it.
+    end: Option<cascadia_types::FinishReason>,
+}
+
+/// Run an admitted task to completion. Holds the permit + in-flight guard
+/// until the task completes; drop frees the slot.
+async fn collect_generation(
+    state: &AppState,
+    AdmittedChat {
+        task,
+        permit,
+        inflight,
+    }: AdmittedChat,
+    stops: &[String],
+    prompt_param: &str,
+) -> Result<Collected, Response> {
     let _permit = permit;
     let _inflight = inflight;
-    let mut chunk_stream = match state.runner.generate_async(task.clone()).await {
+    let task_id = task.task_id.clone();
+    let mut chunk_stream = match state.runner.generate_async(task).await {
         Ok(s) => s,
-        Err(err) => return engine_error_response(err),
+        Err(err) => return Err(engine_error_response(err, prompt_param)),
     };
     let mut marker = state.marker_dialect.clone().map(MarkerFilter::new);
     let mut buf = String::new();
@@ -2652,6 +4357,7 @@ async fn chat_completions(
     // `stop`. Engines that don't distinguish leave it None → "stop".
     let mut finish_reason: &'static str = "stop";
     let mut logprobs_content: Vec<cascadia_types::TokenLogprobs> = Vec::new();
+    let mut end = None;
     while let Some(chunk) = chunk_stream.next().await {
         // A failed task carries `error` on its final chunk. Without this
         // branch the empty text below would build a normal 200 with empty
@@ -2660,11 +4366,11 @@ async fn chat_completions(
         // handshake/manifest mismatch).
         if let Some(reason) = &chunk.error {
             warn!(task = %task_id, reason = %reason, "engine failed task; returning 503");
-            return (
+            return Err(api_error(
                 StatusCode::SERVICE_UNAVAILABLE,
-                Json(serde_json::json!({ "error": reason })),
-            )
-                .into_response();
+                reason.clone(),
+                None,
+            ));
         }
         // Count every chunk, but replace the running sum when the final
         // carries authoritative usage (including hidden thinking/tools).
@@ -2686,6 +4392,11 @@ async fn chat_completions(
             if let Some(fr) = chunk.finish_reason {
                 finish_reason = fr.as_openai_str();
             }
+            end = Some(
+                chunk
+                    .finish_reason
+                    .unwrap_or(cascadia_types::FinishReason::Stop),
+            );
         }
     }
     state
@@ -2697,7 +4408,6 @@ async fn chat_completions(
     // match. The engines don't early-stop on strings yet (an engine-side
     // follow-up would also save compute), so this enforces the OpenAI output
     // contract at the API boundary and forces finish_reason = "stop".
-    let stops = req.sampling_params().stop;
     if !stops.is_empty() {
         if let Some(cut) = stops
             .iter()
@@ -2710,6 +4420,67 @@ async fn chat_completions(
         }
     }
 
+    Ok(Collected {
+        text: buf,
+        prompt_tokens,
+        completion_tokens,
+        finish_reason,
+        logprobs: logprobs_content,
+        end,
+    })
+}
+
+async fn chat_completions(
+    State(state): State<AppState>,
+    OpenAiJson(req): OpenAiJson<ChatCompletionRequest>,
+) -> axum::response::Response {
+    let task_id = format!("chatcmpl-{}", Uuid::new_v4().simple());
+    let admitted = match admit_chat(
+        &state,
+        &req,
+        task_id.clone(),
+        "`messages` is empty or rendered to an empty prompt",
+    )
+    .await
+    {
+        Ok(a) => a,
+        Err(resp) => return resp,
+    };
+    let enable_thinking = admitted.task.enable_thinking;
+
+    if req.stream {
+        let include_usage = req
+            .stream_options
+            .as_ref()
+            .map(|o| o.include_usage)
+            .unwrap_or(false);
+        let tool_choice = req.tool_choice.clone();
+        let tools_present = req.tools.as_ref().is_some_and(|t| !t.is_empty());
+        return stream_completion(
+            state,
+            req.model,
+            admitted.task,
+            admitted.permit,
+            admitted.inflight,
+            include_usage,
+            tool_choice,
+            tools_present,
+        )
+        .await
+        .into_response();
+    }
+
+    let Collected {
+        text: buf,
+        prompt_tokens,
+        completion_tokens,
+        mut finish_reason,
+        logprobs: logprobs_content,
+        ..
+    } = match collect_generation(&state, admitted, &req.sampling_params().stop, "messages").await {
+        Ok(c) => c,
+        Err(resp) => return resp,
+    };
     let (message, choice_finish) = build_choice(
         buf,
         &req.tool_choice,
@@ -2754,45 +4525,52 @@ async fn chat_completions(
 /// of a `message`. Reuses the same sampling/finish_reason/usage path.
 async fn completions(
     State(state): State<AppState>,
-    Json(req): Json<CompletionRequest>,
+    OpenAiJson(req): OpenAiJson<CompletionRequest>,
 ) -> axum::response::Response {
+    // The raw prompt reaches the engine as is, so an image tag in it is
+    // refused here exactly as in chat text (both forms, before the array
+    // form's own 400).
+    let prompts = match &req.prompt {
+        PromptSpec::Single(s) => std::slice::from_ref(s),
+        PromptSpec::Multiple(v) => v.as_slice(),
+    };
+    if let Some(resp) = refuse_reserved_text(&state, "`prompt`", prompts.iter().map(String::as_str))
+    {
+        return resp;
+    }
     // Multi-prompt batching needs cross-task batching infra the engines don't
     // have yet (one task per step). Reject the array form with a clean 400.
     let prompt = match &req.prompt {
         PromptSpec::Single(s) => s.clone(),
         PromptSpec::Multiple(_) => {
             count_rejected("multi_prompt");
-            return (
+            return api_error(
                 StatusCode::BAD_REQUEST,
-                Json(serde_json::json!({
-                    "error": "multi-prompt batching not yet supported; submit one prompt per request"
-                })),
-            )
-                .into_response();
+                "multi-prompt batching not yet supported; submit one prompt per request",
+                None,
+            );
         }
     };
     let task_id = format!("cmpl-{}", Uuid::new_v4().simple());
     if prompt.trim().is_empty() {
         count_rejected("empty_prompt");
-        return (
+        return api_error(
             StatusCode::BAD_REQUEST,
-            Json(serde_json::json!({ "error": "no prompt content: `prompt` is empty" })),
-        )
-            .into_response();
+            "no prompt content: `prompt` is empty",
+            None,
+        );
     }
     if prompt.len() > state.max_prompt_bytes {
         count_rejected("prompt_too_large");
-        return (
+        return api_error(
             StatusCode::PAYLOAD_TOO_LARGE,
-            Json(serde_json::json!({
-                "error": format!(
-                    "prompt is {} bytes; max allowed is {} (max_prompt_bytes)",
-                    prompt.len(),
-                    state.max_prompt_bytes,
-                )
-            })),
-        )
-            .into_response();
+            format!(
+                "prompt is {} bytes; max allowed is {} (max_prompt_bytes)",
+                prompt.len(),
+                state.max_prompt_bytes,
+            ),
+            None,
+        );
     }
     let task = GenerationTask {
         task_id: task_id.clone(),
@@ -2812,19 +4590,19 @@ async fn completions(
         tenant: String::new(),
         // Never client-settable; see the chat endpoint's note.
         resume_token_ids: None,
+        media: Vec::new(),
+        prompt_rendered: false,
     };
 
     let permit = match state.permits.clone().try_acquire_owned() {
         Ok(p) => p,
         Err(_) => {
             count_rejected("capacity");
-            return (
+            return api_error(
                 StatusCode::SERVICE_UNAVAILABLE,
-                Json(serde_json::json!({
-                    "error": "engine at capacity; retry after current requests complete"
-                })),
-            )
-                .into_response();
+                "engine at capacity; retry after current requests complete",
+                None,
+            );
         }
     };
     state.stats.requests_total.fetch_add(1, Ordering::Relaxed);
@@ -2854,7 +4632,7 @@ async fn completions(
     let _inflight = inflight;
     let mut chunk_stream = match state.runner.generate_async(task).await {
         Ok(s) => s,
-        Err(err) => return engine_error_response(err),
+        Err(err) => return engine_error_response(err, "prompt"),
     };
     let mut marker = state.marker_dialect.clone().map(MarkerFilter::new);
     let mut buf = String::new();
@@ -2865,11 +4643,7 @@ async fn completions(
     while let Some(chunk) = chunk_stream.next().await {
         if let Some(reason) = &chunk.error {
             warn!(task = %task_id, reason = %reason, "engine failed task; returning 503");
-            return (
-                StatusCode::SERVICE_UNAVAILABLE,
-                Json(serde_json::json!({ "error": reason })),
-            )
-                .into_response();
+            return api_error(StatusCode::SERVICE_UNAVAILABLE, reason.clone(), None);
         }
         match marker.as_mut() {
             Some(f) => {
@@ -2960,7 +4734,7 @@ async fn stream_text_completion(
         Ok(s) => s,
         Err(err) => {
             warn!(error = %err, "completions-stream: generate failed");
-            return engine_error_response(err);
+            return engine_error_response(err, "prompt");
         }
     };
     let stats = state.stats.clone();
@@ -3095,7 +4869,7 @@ async fn stream_completion(
         Ok(s) => s,
         Err(err) => {
             warn!(error = %err, "ov-stream: generate failed");
-            return engine_error_response(err);
+            return engine_error_response(err, "messages");
         }
     };
     // Tools present and not disabled: content streams as the splitter
@@ -3537,7 +5311,13 @@ fn content_frame(
     format!("data: {payload}\n\n")
 }
 
-fn engine_error_response(err: cascadia_engine::EngineError) -> axum::response::Response {
+/// `prompt_param` is the request field that carries the prompt
+/// (`messages`, `prompt`, `input`): OpenAI names it in `param` when the
+/// prompt does not fit the context.
+fn engine_error_response(
+    err: cascadia_engine::EngineError,
+    prompt_param: &str,
+) -> axum::response::Response {
     use cascadia_engine::EngineError;
     // An engine-queue-full 503 is the same "at capacity" experience as the
     // permit-gate 503 (engines cap pending tasks BELOW the default permit
@@ -3550,49 +5330,26 @@ fn engine_error_response(err: cascadia_engine::EngineError) -> axum::response::R
     // edge case, and the fix is a sizing change (fewer slots, wider context).
     // Its own reason rather than `prompt_too_large` — that is the API's byte
     // limit on the request body, a different knob with a different owner.
-    // Exhaustive on purpose — no `_` arm. Every variant reaching here is a
-    // request rejected before generation started, which is exactly what this
-    // metric promises to count, and a catch-all is how PromptTooLong stayed
-    // invisible until someone went looking. A new EngineError variant should
-    // fail to compile until it is classified, not silently vanish.
-    //
-    // Reasons name the knob, not the status: `engine_unavailable` means bring
-    // the stage or its peer up, `engine_error` means read that node's logs,
-    // `invalid_request` means the caller sent something this worker can't
-    // serve. Without these a node failing 100% of requests looked identical
-    // to a healthy idle one on every metric here.
-    count_rejected(match &err {
-        EngineError::QueueFull { .. } => "capacity",
-        EngineError::PromptTooLong(_) => "prompt_over_window",
-        EngineError::NotLoaded | EngineError::NotConnected => "engine_unavailable",
-        EngineError::Backend(_)
-        | EngineError::Io(_)
-        | EngineError::Task { .. }
-        | EngineError::BatchAborted(_) => "engine_error",
-        EngineError::InvalidConfig(_)
-        | EngineError::PeerRejected(_)
-        | EngineError::ShardRejected(_)
-        | EngineError::ModelNotFound(_) => "invalid_request",
-    });
-    let status = match &err {
-        EngineError::QueueFull { .. } => StatusCode::SERVICE_UNAVAILABLE,
-        EngineError::NotLoaded | EngineError::NotConnected => StatusCode::SERVICE_UNAVAILABLE,
-        // Permanent for this request: retrying sends the identical prompt into
-        // the identical window. 413 is what every SDK treats as non-retryable.
-        EngineError::PromptTooLong(_) => StatusCode::PAYLOAD_TOO_LARGE,
-        EngineError::InvalidConfig(_)
-        | EngineError::PeerRejected(_)
-        | EngineError::ShardRejected(_) => StatusCode::BAD_REQUEST,
-        EngineError::ModelNotFound(_) => StatusCode::NOT_FOUND,
-        EngineError::Backend(_) | EngineError::Io(_) => StatusCode::INTERNAL_SERVER_ERROR,
-        // A task-attributed step failure: the engine abandoned a task; the
-        // underlying cause is a backend/transport failure.
-        EngineError::Task { .. } => StatusCode::INTERNAL_SERVER_ERROR,
-        // A pipeline stage abandoned the in-flight batch. Server-side and
-        // this node's to explain, like any other engine failure.
-        EngineError::BatchAborted(_) => StatusCode::INTERNAL_SERVER_ERROR,
-    };
-    (status, Json(serde_json::json!({"error": err.to_string()}))).into_response()
+    // Every variant reaching here is a request rejected before generation
+    // started, which is what this metric counts. The reasons and statuses are
+    // one exhaustive table in cascadia-engine (`EngineError::rejection_reason`
+    // / `http_status`), shared with every other caller that fronts an engine,
+    // so a new variant fails to compile until it is classified.
+    count_rejected(err.rejection_reason());
+    let status =
+        StatusCode::from_u16(err.http_status()).unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
+    // OpenAI's shape for a prompt over the model's window: 400,
+    // `invalid_request_error`, `context_length_exceeded`, and `param` naming
+    // the prompt field. SDKs and agents key truncate-and-retry off the code.
+    if matches!(err, EngineError::PromptTooLong(_)) {
+        return api_error_for(
+            status,
+            err.to_string(),
+            Some(prompt_param),
+            Some("context_length_exceeded"),
+        );
+    }
+    api_error(status, err.to_string(), None)
 }
 
 async fn cancel(State(state): State<AppState>, Path(task_id): Path<String>) -> impl IntoResponse {
@@ -3651,12 +5408,50 @@ mod tests {
     /// map to 503: the official SDKs retry 5xx with backoff, so a request that
     /// can never succeed would be sent three times before surfacing, and the
     /// operator could not tell it apart from genuine "engine at capacity".
+    /// OpenAI answers it with a 400, not a 413 (that is for byte limits).
     #[test]
-    fn prompt_too_long_maps_to_413_not_503() {
-        let r = engine_error_response(cascadia_engine::EngineError::PromptTooLong(
-            "prompt is 207 tokens but this worker's per-slot KV region holds 127".into(),
-        ));
-        assert_eq!(r.status(), StatusCode::PAYLOAD_TOO_LARGE);
+    fn prompt_too_long_maps_to_400_not_503() {
+        let r = engine_error_response(
+            cascadia_engine::EngineError::PromptTooLong(
+                "prompt is 207 tokens but this worker's per-slot KV region holds 127".into(),
+            ),
+            "messages",
+        );
+        assert_eq!(r.status(), StatusCode::BAD_REQUEST);
+    }
+
+    /// Over-window is OpenAI's `context_length_exceeded`, with `param`
+    /// naming the prompt field; clients key truncate-and-retry off that
+    /// code, not off the message text.
+    #[tokio::test]
+    async fn prompt_too_long_carries_context_length_exceeded() {
+        let r = engine_error_response(
+            cascadia_engine::EngineError::PromptTooLong("x".into()),
+            "messages",
+        );
+        let body = to_bytes(r.into_body(), 4096).await.unwrap();
+        let v: Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(v["error"]["type"], "invalid_request_error");
+        assert_eq!(v["error"]["code"], "context_length_exceeded");
+        assert_eq!(v["error"]["param"], "messages");
+        assert!(v["error"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("prompt too long"));
+    }
+
+    /// Only the window refusal carries `param` and a code; every other
+    /// engine error keeps both null.
+    #[tokio::test]
+    async fn other_engine_errors_carry_no_context_code() {
+        let r = engine_error_response(
+            cascadia_engine::EngineError::UnsupportedInput("img".into()),
+            "messages",
+        );
+        let v: Value =
+            serde_json::from_slice(&to_bytes(r.into_body(), 4096).await.unwrap()).unwrap();
+        assert!(v["error"]["code"].is_null(), "{v}");
+        assert!(v["error"]["param"].is_null(), "{v}");
     }
 
     /// The window rejection is a rejection, and it must be countable on its
@@ -3686,12 +5481,16 @@ mod tests {
             (EngineError::BatchAborted("x".into()), "engine_error"),
             (EngineError::InvalidConfig("bad".into()), "invalid_request"),
             (EngineError::ModelNotFound("nope".into()), "invalid_request"),
+            (
+                EngineError::UnsupportedInput("img".into()),
+                "invalid_request",
+            ),
         ];
         for (err, reason) in cases {
             let before = cascadia_metrics::API_REJECTED_TOTAL
                 .with_label_values(&[reason])
                 .get();
-            let status = engine_error_response(err).status();
+            let status = engine_error_response(err, "messages").status();
             let after = cascadia_metrics::API_REJECTED_TOTAL
                 .with_label_values(&[reason])
                 .get();
@@ -3703,7 +5502,7 @@ mod tests {
     }
 
     /// Strictly-greater, not an exact delta: the registry is process-global
-    /// and `prompt_too_long_maps_to_413_not_503` drives the same arm on
+    /// and `prompt_too_long_maps_to_400_not_503` drives the same arm on
     /// another test thread, so an `== before + 1` assertion races it. That
     /// this is NOT also booked as `capacity` needs no assertion — the two
     /// live in exclusive arms of one `match`.
@@ -3712,10 +5511,13 @@ mod tests {
         let before = cascadia_metrics::API_REJECTED_TOTAL
             .with_label_values(&["prompt_over_window"])
             .get();
-        let r = engine_error_response(cascadia_engine::EngineError::PromptTooLong(
-            "prompt is 207 tokens but this worker's per-slot KV region holds 127".into(),
-        ));
-        assert_eq!(r.status(), StatusCode::PAYLOAD_TOO_LARGE);
+        let r = engine_error_response(
+            cascadia_engine::EngineError::PromptTooLong(
+                "prompt is 207 tokens but this worker's per-slot KV region holds 127".into(),
+            ),
+            "messages",
+        );
+        assert_eq!(r.status(), StatusCode::BAD_REQUEST);
         let after = cascadia_metrics::API_REJECTED_TOTAL
             .with_label_values(&["prompt_over_window"])
             .get();
@@ -3770,6 +5572,7 @@ mod tests {
             name: None,
             tool_calls: None,
             tool_call_id: None,
+            parts: Vec::new(),
         }
     }
 
@@ -3899,7 +5702,7 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    async fn make_app() -> Router {
+    pub(crate) async fn make_app() -> Router {
         let mut runner = Runner::new(Box::new(MockBuilder::new()));
         runner
             .start(
@@ -4276,6 +6079,31 @@ mod tests {
         let body = to_bytes(response.into_body(), 1024).await.unwrap();
         let v: Value = serde_json::from_slice(&body).unwrap();
         assert_eq!(v["data"][0]["id"], "mock-model");
+        assert_eq!(
+            v["data"][0]["input_modalities"],
+            serde_json::json!(["text"])
+        );
+    }
+
+    /// Clients discover image support from `/v1/models` before sending one.
+    #[tokio::test]
+    async fn list_models_advertises_image_input_on_vlm() {
+        let response = make_image_app()
+            .await
+            .oneshot(
+                Request::builder()
+                    .uri("/v1/models")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let v: Value =
+            serde_json::from_slice(&to_bytes(response.into_body(), 1024).await.unwrap()).unwrap();
+        assert_eq!(
+            v["data"][0]["input_modalities"],
+            serde_json::json!(["text", "image"])
+        );
     }
 
     #[tokio::test]
@@ -4309,7 +6137,7 @@ mod tests {
     }
 
     // Helper: POST a chat-completions request body, return (status, parsed JSON).
-    async fn post_chat(app: Router, payload: serde_json::Value) -> (StatusCode, Value) {
+    pub(crate) async fn post_chat(app: Router, payload: serde_json::Value) -> (StatusCode, Value) {
         let response = app
             .oneshot(
                 Request::builder()
@@ -4544,6 +6372,1217 @@ mod tests {
         assert_eq!(status, StatusCode::BAD_REQUEST);
     }
 
+    /// End to end: an array-content request is served like the string form.
+    #[tokio::test]
+    async fn chat_accepts_content_part_array() {
+        let (status, v) = post_chat(
+            make_app().await,
+            serde_json::json!({
+                "model": "mock-model",
+                "messages": [{"role": "user", "content": [{"type": "text", "text": "hello there"}]}],
+                "max_tokens": 4,
+            }),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "body: {v}");
+        assert_eq!(v["object"], "chat.completion");
+    }
+
+    /// Every pre-engine error, including a body that fails to parse, comes
+    /// back in OpenAI's `{"error":{message,type,param,code}}` shape — the
+    /// SDKs read `error.message` and drop anything else.
+    #[tokio::test]
+    async fn errors_use_openai_shape() {
+        let image = serde_json::json!({
+            "model": "mock-model",
+            "messages": [{"role": "user", "content": [
+                {"type": "image_url", "image_url": {"url": "data:image/png;base64,AA=="}}]}],
+        });
+        let empty = serde_json::json!({"model": "mock-model", "messages": []});
+        let missing_model = serde_json::json!({"messages": [{"role": "user", "content": "hi"}]});
+        for (payload, needle) in [
+            (image, "image_url"),
+            (empty, "no prompt content"),
+            (missing_model, "model"),
+        ] {
+            let (status, v) = post_chat(make_app().await, payload).await;
+            assert_eq!(status, StatusCode::BAD_REQUEST, "body: {v}");
+            let err = &v["error"];
+            assert_eq!(err["type"], "invalid_request_error", "body: {v}");
+            assert!(err["param"].is_null() && err["code"].is_null(), "body: {v}");
+            let msg = err["message"].as_str().unwrap_or_default();
+            assert!(msg.contains(needle), "expected {needle:?} in {msg:?}");
+        }
+        let (status, v) = post_completions(
+            make_app().await,
+            serde_json::json!({"model": "mock-model", "prompt": ["one", "two"]}),
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert!(v["error"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("multi-prompt"));
+    }
+
+    /// A body that fails to parse reports serde's reason and JSON path only:
+    /// no axum wrapper text, no `at line N column M`.
+    #[tokio::test]
+    async fn parse_errors_carry_only_the_reason() {
+        let cases = [
+            (
+                r#"{"model":"m","messages":[{"role":"user","content":[{"type":"input_audio"}]}]}"#,
+                "messages[0]: content part type `input_audio` is not supported; only `text`, \
+                 `image_url` and `video_url` parts are accepted",
+            ),
+            (r#"{"messages":[]}"#, "missing field `model`"),
+        ];
+        for (body, want) in cases {
+            let response = make_app()
+                .await
+                .oneshot(
+                    Request::builder()
+                        .method("POST")
+                        .uri("/v1/chat/completions")
+                        .header("content-type", "application/json")
+                        .body(Body::from(body))
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+            let v: Value =
+                serde_json::from_slice(&to_bytes(response.into_body(), 4096).await.unwrap())
+                    .unwrap();
+            assert_eq!(v["error"]["message"], want, "body: {v}");
+        }
+        let response = make_app()
+            .await
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/v1/chat/completions")
+                    .header("content-type", "application/json")
+                    .body(Body::from("{not json"))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let v: Value =
+            serde_json::from_slice(&to_bytes(response.into_body(), 4096).await.unwrap()).unwrap();
+        let msg = v["error"]["message"].as_str().unwrap();
+        assert!(
+            msg.starts_with("request body is not valid JSON") && !msg.contains(" at line "),
+            "{msg}"
+        );
+    }
+
+    #[test]
+    fn strip_json_position_only_strips_a_real_position() {
+        assert_eq!(strip_json_position("bad at line 1 column 9"), "bad");
+        assert_eq!(strip_json_position("look at line one"), "look at line one");
+        assert_eq!(strip_json_position("plain"), "plain");
+    }
+
+    /// A router whose model takes images, with a template that prints each
+    /// message so the placeholder's position is visible in the mock's echo.
+    pub(crate) async fn make_image_app() -> Router {
+        let runner = Runner::new(Box::new(MockBuilder::new()));
+        runner
+            .start(
+                PeerLayout::single_stage(),
+                ShardSpec::single_stage("mock-model", "CPU"),
+            )
+            .await
+            .unwrap();
+        let cfg = Config {
+            chat_template: ChatTemplateConfig {
+                template: Some(
+                    "{% for m in messages %}{{ m.role }}: {{ m.content }}\n{% endfor %}".into(),
+                ),
+                bos_token: None,
+                eos_token: None,
+            },
+            media: Some(MediaConfig::ov_genai(None)),
+            ..Config::default()
+        };
+        make_router_with_config(Arc::new(runner), "mock-model", cfg)
+    }
+
+    pub(crate) fn png_url(w: u32, h: u32) -> String {
+        png_data_url(&image::RgbImage::from_pixel(
+            w,
+            h,
+            image::Rgb([200, 10, 10]),
+        ))
+    }
+
+    /// `img` as a PNG `data:` URL.
+    pub(crate) fn png_data_url(img: &image::RgbImage) -> String {
+        use base64::Engine as _;
+        let mut buf = Vec::new();
+        img.write_to(&mut std::io::Cursor::new(&mut buf), image::ImageFormat::Png)
+            .unwrap();
+        format!(
+            "data:image/png;base64,{}",
+            base64::engine::general_purpose::STANDARD.encode(buf)
+        )
+    }
+
+    fn image_msg(text: &str, url: &str) -> serde_json::Value {
+        serde_json::json!({"role": "user", "content": [
+            {"type": "text", "text": text},
+            {"type": "image_url", "image_url": {"url": url}}]})
+    }
+
+    /// End to end on a model that takes images: the request is served, and
+    /// the image's placeholder lands in the prompt where the caller put the
+    /// image (the mock engine echoes prompt words back).
+    #[tokio::test]
+    async fn image_request_is_served_with_its_placeholder_in_place() {
+        let (status, v) = post_chat(
+            make_image_app().await,
+            serde_json::json!({
+                "model": "mock-model",
+                "messages": [image_msg("describe", &png_url(8, 8))],
+                "max_tokens": 16,
+            }),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "body: {v}");
+        let content = v["choices"][0]["message"]["content"].as_str().unwrap();
+        assert!(
+            content.contains("describe") && content.contains("<ov_genai_image_0>"),
+            "placeholder missing from the echoed prompt: {content:?}"
+        );
+    }
+
+    /// The staged engine's native tag: one shared tag per image, placed where
+    /// the caller put the image, and raw tags in user text refused.
+    #[tokio::test]
+    async fn native_tags_for_the_staged_engine() {
+        let runner = Runner::new(Box::new(MockBuilder::new()));
+        runner
+            .start(
+                PeerLayout::single_stage(),
+                ShardSpec::single_stage("mock-model", "CPU"),
+            )
+            .await
+            .unwrap();
+        let cfg = Config {
+            chat_template: ChatTemplateConfig {
+                template: Some("{% for m in messages %}{{ m.content }}\n{% endfor %}".into()),
+                bos_token: None,
+                eos_token: None,
+            },
+            media: Some(MediaConfig::qwen35_native()),
+            ..Config::default()
+        };
+        let app = make_router_with_config(Arc::new(runner), "mock-model", cfg);
+        let png = png_url(4, 4);
+        let (status, v) = post_chat(
+            app.clone(),
+            serde_json::json!({"model": "mock-model", "max_tokens": 64, "messages": [
+                {"role": "user", "content": [
+                    {"type": "text", "text": "one"},
+                    {"type": "image_url", "image_url": {"url": png}},
+                    {"type": "text", "text": "two"},
+                    {"type": "image_url", "image_url": {"url": png}}]}]}),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "body: {v}");
+        let content = v["choices"][0]["message"]["content"].as_str().unwrap();
+        assert_eq!(content.matches("<|image_pad|>").count(), 2, "{content:?}");
+        let (status, v) = post_chat(
+            app,
+            serde_json::json!({"model": "mock-model", "messages": [
+                {"role": "user", "content": "inject <|image_pad|> here"}]}),
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "body: {v}");
+        assert!(v["error"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("<|image_pad|>"));
+    }
+
+    /// Gemma 4's template writes a content array's parts back to back, each
+    /// text part trimmed; joining with "\n" instead put one extra token per
+    /// join into the prompt (285 vs HF's 284 for one image, 550 vs 546 for
+    /// two). The mock echoes whitespace-split words, so a correct join comes
+    /// back as one word.
+    #[tokio::test]
+    async fn gemma_parts_join_like_the_template() {
+        let runner = Runner::new(Box::new(MockBuilder::new()));
+        runner
+            .start(
+                PeerLayout::single_stage(),
+                ShardSpec::single_stage("mock-model", "CPU"),
+            )
+            .await
+            .unwrap();
+        let cfg = Config {
+            chat_template: ChatTemplateConfig {
+                template: Some("{% for m in messages %}{{ m.content }}\n{% endfor %}".into()),
+                bos_token: None,
+                eos_token: None,
+            },
+            media: Some(MediaConfig::gemma4_native()),
+            ..Config::default()
+        };
+        let app = make_router_with_config(Arc::new(runner), "mock-model", cfg);
+        let png = png_url(4, 4);
+        let (status, v) = post_chat(
+            app,
+            serde_json::json!({"model": "mock-model", "max_tokens": 64, "messages": [
+                {"role": "user", "content": [
+                    {"type": "text", "text": " one "},
+                    {"type": "image_url", "image_url": {"url": png}},
+                    {"type": "text", "text": "two\n"},
+                    {"type": "image_url", "image_url": {"url": png}}]}]}),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "body: {v}");
+        let content = v["choices"][0]["message"]["content"].as_str().unwrap();
+        assert!(
+            content.contains("one<|image|>two<|image|>"),
+            "parts not joined like the template: {content:?}"
+        );
+    }
+
+    /// A reserved tag split across two text parts passes the per-message check
+    /// (it sees the parts joined with "\n") but is whole once an image
+    /// message's parts are joined back to back; the rendered prompt is checked
+    /// too, so it is still a 400 and never reaches the engine.
+    #[tokio::test]
+    async fn split_reserved_tag_is_a_400() {
+        let runner = Runner::new(Box::new(MockBuilder::new()));
+        runner
+            .start(
+                PeerLayout::single_stage(),
+                ShardSpec::single_stage("mock-model", "CPU"),
+            )
+            .await
+            .unwrap();
+        let cfg = Config {
+            chat_template: ChatTemplateConfig {
+                template: Some("{% for m in messages %}{{ m.content }}\n{% endfor %}".into()),
+                bos_token: None,
+                eos_token: None,
+            },
+            media: Some(MediaConfig::qwen35_native()),
+            ..Config::default()
+        };
+        let app = make_router_with_config(Arc::new(runner), "mock-model", cfg);
+        let (status, v) = post_chat(
+            app,
+            serde_json::json!({"model": "mock-model", "messages": [
+                {"role": "user", "content": [
+                    {"type": "text", "text": "<|video"},
+                    {"type": "text", "text": "_pad|>"},
+                    {"type": "image_url", "image_url": {"url": png_url(4, 4)}}]}]}),
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "body: {v}");
+        assert!(v["error"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("<|video_pad|>"));
+    }
+
+    /// A template saved with Windows line endings renders exactly like the
+    /// same template with \n, as Jinja2 normalises them.
+    #[test]
+    fn crlf_templates_render_like_lf() {
+        let lf = "{%- set sys = 'line one\nline two' %}[S]{{ sys }}[/S]\n{%- for m in messages %}{{ m.content }}\n{% endfor %}";
+        let crlf = lf.replace('\n', "\r\n");
+        let msgs = [ChatMessage {
+            role: "user".into(),
+            content: "hi".into(),
+            name: None,
+            tool_calls: None,
+            tool_call_id: None,
+            parts: Vec::new(),
+        }];
+        let render = |src: &str| {
+            let env = build_chat_env(src).unwrap();
+            render_with_chat_env(&env, &msgs, "<s>", "</s>", false, None, None).unwrap()
+        };
+        let want = render(lf);
+        assert!(!want.contains('\r'));
+        assert_eq!(render(&crlf), want);
+        assert_eq!(render(&lf.replace('\n', "\r")), want);
+    }
+
+    /// Everything the image path refuses comes back as an OpenAI-shaped 400
+    /// naming the reason.
+    /// A model without image input refuses `image_url` parts with an OpenAI
+    /// 400 naming the cause, and an engine that still receives media (the
+    /// in-engine refusal) maps to the same 400.
+    #[tokio::test]
+    async fn text_only_models_refuse_images_with_a_400() {
+        let (status, v) = post_chat(
+            make_app().await,
+            serde_json::json!({"model": "mock-model",
+                "messages": [image_msg("what is this?", &png_url(4, 4))]}),
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{v}");
+        assert_eq!(v["error"]["type"], "invalid_request_error");
+        let msg = v["error"]["message"].as_str().unwrap();
+        assert!(msg.contains("does not accept image input"), "{msg}");
+
+        let r = engine_error_response(
+            cascadia_engine::EngineError::UnsupportedInput(
+                "the gemma4 engine does not accept image input (1 image(s) in the request)".into(),
+            ),
+            "messages",
+        );
+        assert_eq!(r.status(), StatusCode::BAD_REQUEST);
+    }
+
+    /// A VLM export served without images (Pixtral on ov-genai) says why and
+    /// what serves them, after the usual refusal.
+    #[tokio::test]
+    async fn image_refusal_carries_the_no_media_reason() {
+        let runner = Runner::new(Box::new(MockBuilder::new()));
+        runner
+            .start(
+                PeerLayout::single_stage(),
+                ShardSpec::single_stage("mock-model", "CPU"),
+            )
+            .await
+            .unwrap();
+        let cfg = Config {
+            no_media_reason: Some("serve its images with ov-runtime".into()),
+            ..Config::default()
+        };
+        let app = make_router_with_config(Arc::new(runner), "mock-model", cfg);
+        let (status, v) = post_chat(
+            app,
+            serde_json::json!({"model": "mock-model",
+                "messages": [image_msg("what is this?", &png_url(4, 4))]}),
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{v}");
+        assert_eq!(
+            v["error"]["message"],
+            "model `mock-model` does not accept image input (`image_url` content parts): \
+             serve its images with ov-runtime"
+        );
+    }
+
+    /// A body over the limit stays a 413, with a message that names the
+    /// likely cause instead of axum's "length limit exceeded".
+    #[tokio::test]
+    async fn oversized_bodies_get_a_readable_openai_413() {
+        let big = "A".repeat(DEFAULT_MAX_BODY_BYTES + 1024);
+        let response = make_app()
+            .await
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/v1/chat/completions")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        serde_json::json!({"model": "mock-model", "messages": [
+                            image_msg("x", &format!("data:image/png;base64,{big}"))]})
+                        .to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::PAYLOAD_TOO_LARGE);
+        let body = to_bytes(response.into_body(), 16384).await.unwrap();
+        let v: Value = serde_json::from_slice(&body).unwrap();
+        let msg = v["error"]["message"].as_str().unwrap();
+        assert!(msg.contains("larger than this server accepts"), "{msg}");
+        assert!(msg.contains("input_modalities"), "{msg}");
+        // A byte limit is not the context window.
+        assert!(v["error"]["code"].is_null(), "{v}");
+    }
+
+    /// A prompt the engine refuses as over its window is OpenAI's 400
+    /// `context_length_exceeded` on every route, streamed or not, with
+    /// `param` naming the route's prompt field. A streamed request is
+    /// refused at submit, before the stream opens, so it too gets a plain
+    /// JSON 400 and not an SSE error frame.
+    #[tokio::test]
+    async fn over_window_prompts_are_openai_400_on_every_route() {
+        let p = "__prompt_too_long__";
+        let cases = [
+            (
+                "/v1/chat/completions",
+                serde_json::json!({"model": "mock-model",
+                    "messages": [{"role": "user", "content": p}]}),
+                "messages",
+            ),
+            (
+                "/v1/completions",
+                serde_json::json!({"model": "mock-model", "prompt": p}),
+                "prompt",
+            ),
+            (
+                "/v1/responses",
+                serde_json::json!({"model": "mock-model", "input": p}),
+                "input",
+            ),
+        ];
+        for (uri, body, param) in cases {
+            for stream in [false, true] {
+                let mut body = body.clone();
+                body["stream"] = serde_json::json!(stream);
+                let response = make_app()
+                    .await
+                    .oneshot(
+                        Request::builder()
+                            .method("POST")
+                            .uri(uri)
+                            .header("content-type", "application/json")
+                            .body(Body::from(body.to_string()))
+                            .unwrap(),
+                    )
+                    .await
+                    .unwrap();
+                let ctx = format!("{uri} stream={stream}");
+                assert_eq!(response.status(), StatusCode::BAD_REQUEST, "{ctx}");
+                let ct = response
+                    .headers()
+                    .get("content-type")
+                    .and_then(|v| v.to_str().ok())
+                    .unwrap_or_default()
+                    .to_owned();
+                assert!(ct.starts_with("application/json"), "{ctx}: {ct}");
+                let v: Value =
+                    serde_json::from_slice(&to_bytes(response.into_body(), 16384).await.unwrap())
+                        .unwrap();
+                assert_eq!(v["error"]["type"], "invalid_request_error", "{ctx}: {v}");
+                assert_eq!(v["error"]["code"], "context_length_exceeded", "{ctx}: {v}");
+                assert_eq!(v["error"]["param"], param, "{ctx}: {v}");
+                assert!(
+                    v["error"]["message"]
+                        .as_str()
+                        .is_some_and(|m| m.contains("window")),
+                    "{ctx}: {v}"
+                );
+            }
+        }
+    }
+
+    /// `max_prompt_bytes` bounds the rendered prompt's BYTES, a transport
+    /// limit rather than the context window: it stays a 413 and does not
+    /// claim `context_length_exceeded`.
+    #[tokio::test]
+    async fn prompt_byte_limit_stays_413_without_context_code() {
+        let runner = Runner::new(Box::new(MockBuilder::new()));
+        runner
+            .start(
+                PeerLayout::single_stage(),
+                ShardSpec::single_stage("mock-model", "CPU"),
+            )
+            .await
+            .unwrap();
+        let cfg = Config {
+            max_prompt_bytes: 64,
+            ..Config::default()
+        };
+        let app = make_router_with_config(Arc::new(runner), "mock-model", cfg);
+        let long = "word ".repeat(40);
+        for (uri, body) in [
+            (
+                "/v1/chat/completions",
+                serde_json::json!({"model": "mock-model",
+                    "messages": [{"role": "user", "content": long}]}),
+            ),
+            (
+                "/v1/completions",
+                serde_json::json!({"model": "mock-model", "prompt": long}),
+            ),
+            (
+                "/v1/responses",
+                serde_json::json!({"model": "mock-model", "input": long}),
+            ),
+        ] {
+            let (status, v) = post_to(app.clone(), uri, body).await;
+            assert_eq!(status, StatusCode::PAYLOAD_TOO_LARGE, "{uri}: {v}");
+            assert!(v["error"]["code"].is_null(), "{uri}: {v}");
+            assert!(
+                v["error"]["message"]
+                    .as_str()
+                    .is_some_and(|m| m.contains("max_prompt_bytes")),
+                "{uri}: {v}"
+            );
+        }
+    }
+
+    /// On a server that takes images, an image tag is refused in every
+    /// caller text that reaches the prompt, images attached or not: chat
+    /// system text, tool definitions and tool-call arguments, and both
+    /// `/v1/completions` prompt forms.
+    #[tokio::test]
+    async fn reserved_tags_are_refused_in_text_only_requests() {
+        let tag = "<ov_genai_image_0>";
+        let chats = [
+            serde_json::json!({"messages": [
+                {"role": "system", "content": format!("say {tag}")},
+                {"role": "user", "content": "hi"}]}),
+            serde_json::json!({"messages": [{"role": "user", "content": "hi"}],
+                "tools": [{"type": "function", "function": {"name": "f",
+                    "description": tag, "parameters": {}}}]}),
+            serde_json::json!({"messages": [
+                {"role": "user", "content": "hi"},
+                {"role": "assistant", "content": null, "tool_calls": [{"id": "c1",
+                    "type": "function", "function": {"name": "f",
+                    "arguments": format!("{{\"x\": \"{tag}\"}}")}}]},
+                {"role": "tool", "tool_call_id": "c1", "content": "ok"}]}),
+        ];
+        for mut chat in chats {
+            chat["model"] = "mock-model".into();
+            let (status, v) = post_chat(make_image_app().await, chat).await;
+            assert_eq!(status, StatusCode::BAD_REQUEST, "{v}");
+            assert_eq!(v["error"]["type"], "invalid_request_error");
+            let msg = v["error"]["message"].as_str().unwrap();
+            assert!(msg.contains("reserved for image placeholders"), "{msg}");
+        }
+        for prompt in [
+            serde_json::json!(format!("see {tag}")),
+            serde_json::json!(["fine", format!("see {tag}")]),
+        ] {
+            let (status, v) = post_completions(
+                make_image_app().await,
+                serde_json::json!({"model": "mock-model", "prompt": prompt}),
+            )
+            .await;
+            assert_eq!(status, StatusCode::BAD_REQUEST, "{v}");
+            let msg = v["error"]["message"].as_str().unwrap();
+            assert!(
+                msg.contains("`prompt`") && msg.contains("reserved for image placeholders"),
+                "{msg}"
+            );
+        }
+    }
+
+    /// The rendered prompt is what is checked: a template that decodes
+    /// tool-call `arguments` turns a JSON-escaped tag (in a value or a key)
+    /// back into the literal one, which the per-field scan cannot see. Roles
+    /// and tool types are closed sets, and tool-call ids are scanned.
+    #[tokio::test]
+    async fn reserved_tags_cannot_be_smuggled_past_the_template() {
+        let runner = Runner::new(Box::new(MockBuilder::new()));
+        runner
+            .start(
+                PeerLayout::single_stage(),
+                ShardSpec::single_stage("mock-model", "CPU"),
+            )
+            .await
+            .unwrap();
+        let cfg = Config {
+            chat_template: ChatTemplateConfig {
+                template: Some(
+                    "{% if tools %}{{ tools | tojson }}{% endif %}{% for m in messages %}\
+                     {{ m.role }}: {{ m.content }}{% for c in m.tool_calls or [] %}\
+                     {{ c.id }} {{ c.function.arguments | tojson }}{% endfor %}\n{% endfor %}"
+                        .into(),
+                ),
+                bos_token: None,
+                eos_token: None,
+            },
+            media: Some(MediaConfig::ov_genai(None)),
+            ..Config::default()
+        };
+        let app = make_router_with_config(Arc::new(runner), "mock-model", cfg);
+        let call = |id: &str, args: &str| {
+            serde_json::json!({"messages": [
+                {"role": "user", "content": "hi"},
+                {"role": "assistant", "content": null, "tool_calls": [{"id": id,
+                    "type": "function", "function": {"name": "f", "arguments": args}}]},
+                {"role": "tool", "tool_call_id": "c1", "content": "ok"}]})
+        };
+        let tool = |kind: &str| {
+            serde_json::json!({"messages": [{"role": "user", "content": "hi"}],
+                "tools": [{"type": kind, "function": {"name": "f", "parameters": {}}}]})
+        };
+        let cases = [
+            // Escaped value and escaped key, decoded by the template.
+            (
+                call("c1", r#"{"x": "\u003cov_genai_image_0\u003e"}"#),
+                "request text must not contain `<ov_genai_image_`",
+            ),
+            (
+                call("c1", r#"{"\u003cov_genai_image_0>": 1}"#),
+                "request text must not contain `<ov_genai_image_`",
+            ),
+            (
+                call("<ov_genai_image_0>", "{}"),
+                "reserved for image placeholders",
+            ),
+            (
+                serde_json::json!({"messages": [
+                    {"role": "user<ov_genai_image_0>", "content": "hi"}]}),
+                "role `user<ov_genai_image_0>` is not supported",
+            ),
+            (tool("<ov_genai_image_0>"), "`type` must be `function`"),
+        ];
+        for (mut body, needle) in cases {
+            body["model"] = "mock-model".into();
+            let (status, v) = post_chat(app.clone(), body).await;
+            assert_eq!(status, StatusCode::BAD_REQUEST, "{v}");
+            assert_eq!(v["error"]["type"], "invalid_request_error");
+            let msg = v["error"]["message"].as_str().unwrap();
+            assert!(msg.contains(needle), "expected {needle:?} in {msg:?}");
+        }
+        // The same tool call without a tag is served.
+        let mut ok = call("c1", r#"{"x": "plain"}"#);
+        ok["model"] = "mock-model".into();
+        let (status, v) = post_chat(app, ok).await;
+        assert_eq!(status, StatusCode::OK, "{v}");
+    }
+
+    /// A text-only server reserves nothing: the same text is served.
+    #[tokio::test]
+    async fn text_only_servers_do_not_reserve_image_tags() {
+        let (status, v) = post_chat(
+            make_app().await,
+            serde_json::json!({"model": "mock-model", "messages": [
+                {"role": "system", "content": "say <ov_genai_image_0>"},
+                {"role": "user", "content": "hi"}]}),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{v}");
+        let (status, v) = post_completions(
+            make_app().await,
+            serde_json::json!({"model": "mock-model", "prompt": "see <ov_genai_image_0>"}),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{v}");
+    }
+
+    #[tokio::test]
+    async fn image_requests_are_refused_with_openai_400s() {
+        let png = png_url(4, 4);
+        let nine: Vec<_> = (0..9).map(|_| image_msg("x", &png)).collect();
+        let cases = [
+            (
+                serde_json::json!([image_msg("x", "https://example.com/a.png")]),
+                "only `data:`",
+            ),
+            (
+                serde_json::json!([image_msg("x", "data:image/png;base64,aGVsbG8=")]),
+                "image 0: unsupported image format",
+            ),
+            (serde_json::json!(nine), "the limit is 8"),
+            (
+                serde_json::json!([{"role": "system", "content": [
+                    {"type": "image_url", "image_url": {"url": png}}]}]),
+                "only accepted in `user` messages",
+            ),
+            (
+                serde_json::json!([{"role": "user", "content": "see <ov_genai_image_0>"}]),
+                "reserved for image placeholders",
+            ),
+        ];
+        for (messages, needle) in cases {
+            let (status, v) = post_chat(
+                make_image_app().await,
+                serde_json::json!({"model": "mock-model", "messages": messages}),
+            )
+            .await;
+            assert_eq!(status, StatusCode::BAD_REQUEST, "body: {v}");
+            assert_eq!(v["error"]["type"], "invalid_request_error");
+            let msg = v["error"]["message"].as_str().unwrap_or_default();
+            assert!(msg.contains(needle), "expected {needle:?} in {msg:?}");
+        }
+    }
+
+    /// With remote URLs enabled the image is fetched, decoded and placed like
+    /// a `data:` one; with them disabled (the default) the same URL is a 400.
+    #[tokio::test]
+    async fn remote_image_urls_are_opt_in() {
+        let png = {
+            let img = image::RgbImage::from_pixel(4, 4, image::Rgb([9, 9, 9]));
+            let mut buf = Vec::new();
+            img.write_to(&mut std::io::Cursor::new(&mut buf), image::ImageFormat::Png)
+                .unwrap();
+            buf
+        };
+        let srv = Router::new().route(
+            "/a.png",
+            get(move || async move { ([(header::CONTENT_TYPE, "image/png")], png.clone()) }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}/a.png", listener.local_addr().unwrap());
+        tokio::spawn(async move { axum::serve(listener, srv).await.unwrap() });
+
+        let app = |allow: bool| async move {
+            let runner = Runner::new(Box::new(MockBuilder::new()));
+            runner
+                .start(
+                    PeerLayout::single_stage(),
+                    ShardSpec::single_stage("mock-model", "CPU"),
+                )
+                .await
+                .unwrap();
+            let mut media = MediaConfig::ov_genai(None);
+            media.allow_remote_urls = allow;
+            // Loopback over plain HTTP stands in for a public host here; the
+            // production policy refuses both (see media::tests).
+            media.fetch_policy = media::FetchPolicy {
+                allow_http: true,
+                allow_non_public: true,
+                ..media::FetchPolicy::PUBLIC_HTTPS
+            };
+            let cfg = Config {
+                chat_template: ChatTemplateConfig {
+                    template: Some("{% for m in messages %}{{ m.content }}\n{% endfor %}".into()),
+                    bos_token: None,
+                    eos_token: None,
+                },
+                media: Some(media),
+                ..Config::default()
+            };
+            make_router_with_config(Arc::new(runner), "mock-model", cfg)
+        };
+        let body = serde_json::json!({"model": "mock-model", "max_tokens": 16,
+            "messages": [image_msg("look", &url)]});
+        let (status, v) = post_chat(app(true).await, body.clone()).await;
+        assert_eq!(status, StatusCode::OK, "body: {v}");
+        let content = v["choices"][0]["message"]["content"].as_str().unwrap();
+        assert!(content.contains("<ov_genai_image_0>"), "{content:?}");
+        let (status, v) = post_chat(app(false).await, body).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "body: {v}");
+        assert!(v["error"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("only `data:`"));
+    }
+
+    fn user_msg(parts: serde_json::Value) -> ChatMessage {
+        serde_json::from_value(serde_json::json!({"role": "user", "content": parts})).unwrap()
+    }
+
+    fn png_bytes() -> Vec<u8> {
+        let img = image::RgbImage::from_pixel(4, 4, image::Rgb([9, 9, 9]));
+        let mut buf = Vec::new();
+        img.write_to(&mut std::io::Cursor::new(&mut buf), image::ImageFormat::Png)
+            .unwrap();
+        buf
+    }
+
+    /// A config that fetches from a loopback test server over plain HTTP,
+    /// which stands in for a public host (the production policy refuses both).
+    fn loopback_fetch_cfg() -> Arc<MediaConfig> {
+        let mut media = MediaConfig::ov_genai(None);
+        media.allow_remote_urls = true;
+        media.fetch_policy = media::FetchPolicy {
+            allow_http: true,
+            allow_non_public: true,
+            ..media::FetchPolicy::PUBLIC_HTTPS
+        };
+        Arc::new(media)
+    }
+
+    /// The entry-node fetch: remote images and videos come back as `data:`
+    /// URLs holding the fetched bytes, `data:` parts and text as sent, and
+    /// `detail` kept.
+    #[tokio::test]
+    async fn fetch_request_media_inlines_remote_media() {
+        use base64::Engine as _;
+        let png = png_bytes();
+        let mp4 = b"\x00\x00\x00\x20ftypisom\x00\x00\x02\x00isomiso2mp41".to_vec();
+        let (png_srv, mp4_srv) = (png.clone(), mp4.clone());
+        let srv = Router::new()
+            .route(
+                "/a.png",
+                get(
+                    move || async move { ([(header::CONTENT_TYPE, "image/png")], png_srv.clone()) },
+                ),
+            )
+            .route(
+                "/v.mp4",
+                get(move || async move {
+                    (
+                        [(header::CONTENT_TYPE, "application/octet-stream")],
+                        mp4_srv.clone(),
+                    )
+                }),
+            );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let base = format!("http://{}", listener.local_addr().unwrap());
+        tokio::spawn(async move { axum::serve(listener, srv).await.unwrap() });
+
+        let inline = png_url(2, 2);
+        // A frame list's remote frames are inlined too (the same size as
+        // `a.png`, as a video's frames must be).
+        let frame = png_url(4, 4);
+        let messages = vec![
+            user_msg(serde_json::json!([
+                {"type": "text", "text": "compare"},
+                {"type": "image_url", "image_url": {"url": format!("{base}/a.png"), "detail": "low"}},
+                {"type": "image_url", "image_url": {"url": inline}},
+                {"type": "video_url", "video_url": {"url": format!("{base}/v.mp4")}},
+                {"type": "video_url", "video_url": {"url": [format!("{base}/a.png"), frame.clone()],
+                    "fps": 2}},
+            ])),
+            serde_json::from_value(serde_json::json!({"role": "assistant", "content": "ok"}))
+                .unwrap(),
+        ];
+        let mut two_videos = (*loopback_fetch_cfg()).clone();
+        two_videos.max_videos = 2;
+        let out = fetch_request_media(Arc::new(two_videos), &messages)
+            .await
+            .unwrap();
+        assert_eq!(out.len(), 2);
+        let b64 = |b: &[u8]| base64::engine::general_purpose::STANDARD.encode(b);
+        assert_eq!(
+            out[0].parts,
+            vec![
+                ContentPart::Text("compare".into()),
+                ContentPart::ImageUrl {
+                    url: format!("data:image/png;base64,{}", b64(&png)),
+                    detail: Some("low".into()),
+                },
+                ContentPart::ImageUrl {
+                    url: inline,
+                    detail: None,
+                },
+                ContentPart::VideoUrl {
+                    url: format!("data:video/mp4;base64,{}", b64(&mp4)),
+                    detail: None,
+                },
+                ContentPart::VideoFrames {
+                    urls: vec![format!("data:image/png;base64,{}", b64(&png)), frame],
+                    detail: None,
+                    fps: Some(2.0),
+                },
+            ]
+        );
+        assert_eq!(out[1].content, "ok");
+        // Text only: returned as sent.
+        let text = vec![user_msg(
+            serde_json::json!([{"type": "text", "text": "hi"}]),
+        )];
+        let out = fetch_request_media(loopback_fetch_cfg(), &text)
+            .await
+            .unwrap();
+        assert_eq!(out[0].parts, text[0].parts);
+    }
+
+    /// A fetched "video" that is no container this server decodes is refused
+    /// at the entry node, as the serving node would refuse it.
+    #[tokio::test]
+    async fn fetch_request_media_refuses_a_fetched_non_video() {
+        let srv = Router::new().route(
+            "/v.mp4",
+            get(|| async {
+                (
+                    [(header::CONTENT_TYPE, "video/mp4")],
+                    b"not a video".to_vec(),
+                )
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}/v.mp4", listener.local_addr().unwrap());
+        tokio::spawn(async move { axum::serve(listener, srv).await.unwrap() });
+        let messages = vec![user_msg(serde_json::json!([
+            {"type": "video_url", "video_url": {"url": url}}]))];
+        let err = fetch_request_media(loopback_fetch_cfg(), &messages)
+            .await
+            .unwrap_err();
+        assert!(matches!(err, MediaError::Invalid(_)), "{err:?}");
+        assert!(
+            err.message()
+                .starts_with("video 0: the data is not a video"),
+            "{err}"
+        );
+    }
+
+    /// With remote URLs off, a remote image or video is `RemoteDisabled` (a
+    /// 400) on both paths, with the message the server has always sent; a
+    /// `data:` request passes.
+    #[tokio::test]
+    async fn remote_urls_off_is_its_own_refusal() {
+        let cfg = Arc::new(MediaConfig::ov_genai(None));
+        assert!(!cfg.allow_remote_urls);
+        let cases = [
+            (
+                serde_json::json!([{"type": "image_url",
+                    "image_url": {"url": "https://example.com/a.png"}}]),
+                "image 0: only `data:` image URLs",
+            ),
+            (
+                serde_json::json!([{"type": "video_url",
+                    "video_url": {"url": "https://example.com/v.mp4"}}]),
+                "video 0: only `data:` video URLs",
+            ),
+        ];
+        for (parts, want) in cases {
+            let messages = vec![user_msg(parts)];
+            let err = fetch_request_media(Arc::clone(&cfg), &messages)
+                .await
+                .unwrap_err();
+            assert!(matches!(err, MediaError::RemoteDisabled(_)), "{err:?}");
+            assert_eq!(err.http_status(), 400);
+            assert!(err.message().starts_with(want), "{err}");
+        }
+        let slots = Arc::new(Semaphore::new(1));
+        let messages = vec![user_msg(serde_json::json!([{"type": "image_url",
+            "image_url": {"url": "https://example.com/a.png"}}]))];
+        let err = prepare_media_with(Arc::clone(&cfg), &slots, &messages).await;
+        assert!(matches!(err, Err(MediaError::RemoteDisabled(_))));
+        let ok = vec![user_msg(serde_json::json!([{"type": "image_url",
+            "image_url": {"url": png_url(2, 2)}}]))];
+        assert!(fetch_request_media(cfg, &ok).await.is_ok());
+    }
+
+    /// A refused fetch never echoes its URL: presigned URLs carry
+    /// credentials in the query (and sometimes the path or userinfo).
+    #[tokio::test]
+    async fn fetch_errors_never_contain_the_url() {
+        let mut media = MediaConfig::ov_genai(None);
+        media.allow_remote_urls = true;
+        let cfg = Arc::new(media);
+        for url in [
+            "https://127.0.0.1/SECRETPATH/a.png?X-Amz-Signature=SECRETSIG",
+            "https://10.1.2.3/SECRETPATH/a.png?sig=SECRETSIG",
+            "http://example.com/SECRETPATH/a.png?sig=SECRETSIG",
+            "https://example.com:8443/SECRETPATH/a.png?sig=SECRETSIG",
+            "https://user:SECRETPW@example.com/SECRETPATH/a.png",
+            "https://exa mple.com/SECRETPATH/a.png?sig=SECRETSIG",
+        ] {
+            for parts in [
+                serde_json::json!([{"type": "image_url", "image_url": {"url": url}}]),
+                serde_json::json!([{"type": "video_url", "video_url": {"url": url}}]),
+            ] {
+                let err = fetch_request_media(Arc::clone(&cfg), &[user_msg(parts)])
+                    .await
+                    .unwrap_err();
+                let msg = err.message();
+                assert!(!msg.contains("SECRET"), "{url} -> {msg}");
+                assert!(!msg.contains("a.png"), "{url} -> {msg}");
+            }
+        }
+    }
+
+    /// An image request is admitted (or refused) before any decoding: with
+    /// no capacity left, even an undecodable image gets the 503, proving no
+    /// decode ran outside the in-flight cap.
+    #[tokio::test]
+    async fn image_request_takes_its_permit_before_decoding() {
+        let runner = Runner::new(Box::new(MockBuilder::new()));
+        runner
+            .start(
+                PeerLayout::single_stage(),
+                ShardSpec::single_stage("mock-model", "CPU"),
+            )
+            .await
+            .unwrap();
+        let cfg = Config {
+            media: Some(MediaConfig::ov_genai(None)),
+            max_concurrent_requests: 0,
+            ..Config::default()
+        };
+        let app = make_router_with_config(Arc::new(runner), "mock-model", cfg);
+        let (status, v) = post_chat(
+            app,
+            serde_json::json!({"model": "mock-model", "messages": [
+                image_msg("x", "data:image/png;base64,aGVsbG8=")]}),
+        )
+        .await;
+        assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE, "body: {v}");
+    }
+
+    /// On a server that takes images, the request past the in-flight cap
+    /// on a media route is refused before its body is read: a slow upload
+    /// holding the only slot leaves the next one a 503 whose body was never
+    /// polled. Text routes, and servers without images, are not gated.
+    #[tokio::test]
+    async fn media_bodies_are_gated_before_they_are_read() {
+        use std::sync::atomic::AtomicBool;
+        let app = |media: bool| async move {
+            let runner = Runner::new(Box::new(MockBuilder::new()));
+            runner
+                .start(
+                    PeerLayout::single_stage(),
+                    ShardSpec::single_stage("mock-model", "CPU"),
+                )
+                .await
+                .unwrap();
+            let cfg = Config {
+                media: media.then(|| MediaConfig::ov_genai(None)),
+                max_concurrent_requests: 1,
+                ..Config::default()
+            };
+            make_router_with_config(Arc::new(runner), "mock-model", cfg)
+        };
+        // A body that sends its first bytes, then never ends.
+        let stalled = |polled: Arc<AtomicBool>| {
+            let mut sent = false;
+            Body::from_stream(futures::stream::poll_fn(move |_| {
+                polled.store(true, Ordering::SeqCst);
+                if sent {
+                    std::task::Poll::Pending
+                } else {
+                    sent = true;
+                    std::task::Poll::Ready(Some(Ok::<_, std::io::Error>(Bytes::from_static(
+                        b"{\"model\": \"mock-model\", \"messages\": [",
+                    ))))
+                }
+            }))
+        };
+        let post = |uri: &str, body: Body| {
+            Request::builder()
+                .method("POST")
+                .uri(uri)
+                .header("content-type", "application/json")
+                .body(body)
+                .unwrap()
+        };
+        for uri in ["/v1/chat/completions", "/v1/responses"] {
+            let router = app(true).await;
+            let first_read = Arc::new(AtomicBool::new(false));
+            let first = tokio::spawn(
+                router
+                    .clone()
+                    .oneshot(post(uri, stalled(Arc::clone(&first_read)))),
+            );
+            while !first_read.load(Ordering::SeqCst) {
+                tokio::task::yield_now().await;
+            }
+            let second_read = Arc::new(AtomicBool::new(false));
+            // Ungated, the second request would wait on its body forever.
+            let resp = tokio::time::timeout(
+                std::time::Duration::from_secs(5),
+                router
+                    .clone()
+                    .oneshot(post(uri, stalled(Arc::clone(&second_read)))),
+            )
+            .await
+            .expect("refused without reading its body")
+            .unwrap();
+            assert_eq!(resp.status(), StatusCode::SERVICE_UNAVAILABLE, "{uri}");
+            assert!(!second_read.load(Ordering::SeqCst), "{uri}: body was read");
+            let body = to_bytes(resp.into_body(), 4096).await.unwrap();
+            let v: Value = serde_json::from_slice(&body).unwrap();
+            assert!(v["error"]["message"]
+                .as_str()
+                .unwrap()
+                .contains("at capacity"));
+            // The text-only route keeps its own gate, after the body.
+            let resp = router
+                .clone()
+                .oneshot(post(
+                    "/v1/completions",
+                    Body::from(r#"{"model": "mock-model", "prompt": "hi", "max_tokens": 2}"#),
+                ))
+                .await
+                .unwrap();
+            assert_eq!(resp.status(), StatusCode::OK, "{uri}");
+            // The slot comes back when the stalled request ends.
+            first.abort();
+            let _ = first.await;
+            let (status, v) = post_chat(
+                router,
+                serde_json::json!({"model": "mock-model", "max_tokens": 2,
+                    "messages": [{"role": "user", "content": "hi"}]}),
+            )
+            .await;
+            assert_eq!(status, StatusCode::OK, "{v}");
+        }
+        // A client that sends its headers and stalls holds its slot only
+        // until the body deadline: then it gets a 408 and the slot is free.
+        let runner = Runner::new(Box::new(MockBuilder::new()));
+        runner
+            .start(
+                PeerLayout::single_stage(),
+                ShardSpec::single_stage("mock-model", "CPU"),
+            )
+            .await
+            .unwrap();
+        let router = make_router_with_config(
+            Arc::new(runner),
+            "mock-model",
+            Config {
+                media: Some(MediaConfig::ov_genai(None)),
+                max_concurrent_requests: 1,
+                media_body_timeout: std::time::Duration::from_millis(300),
+                ..Config::default()
+            },
+        );
+        let started = std::time::Instant::now();
+        let stalled_req = tokio::spawn(router.clone().oneshot(post(
+            "/v1/chat/completions",
+            stalled(Arc::new(AtomicBool::new(false))),
+        )));
+        let resp = tokio::time::timeout(std::time::Duration::from_secs(5), stalled_req)
+            .await
+            .expect("the stalled body is cut off at its deadline")
+            .unwrap()
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::REQUEST_TIMEOUT);
+        assert!(started.elapsed() >= std::time::Duration::from_millis(300));
+        let body = to_bytes(resp.into_body(), 4096).await.unwrap();
+        let v: Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(v["error"]["type"], "invalid_request_error", "{v}");
+        let (status, v) = post_chat(
+            router,
+            serde_json::json!({"model": "mock-model", "max_tokens": 2,
+                "messages": [{"role": "user", "content": "hi"}]}),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{v}");
+
+        // Without images the body limit is the text one: no early gate.
+        let router = app(false).await;
+        let first_read = Arc::new(AtomicBool::new(false));
+        let first = tokio::spawn(router.clone().oneshot(post(
+            "/v1/chat/completions",
+            stalled(Arc::clone(&first_read)),
+        )));
+        while !first_read.load(Ordering::SeqCst) {
+            tokio::task::yield_now().await;
+        }
+        let (status, v) = post_chat(
+            router,
+            serde_json::json!({"model": "mock-model", "max_tokens": 2,
+                "messages": [{"role": "user", "content": "hi"}]}),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{v}");
+        first.abort();
+    }
+
+    /// Without a chat template only the last user message is sent, so an
+    /// image in an earlier one would never reach the model. That is a 400,
+    /// not an answer that silently ignores the image.
+    #[tokio::test]
+    async fn image_dropped_by_the_prompt_format_is_a_400() {
+        let runner = Runner::new(Box::new(MockBuilder::new()));
+        runner
+            .start(
+                PeerLayout::single_stage(),
+                ShardSpec::single_stage("mock-model", "CPU"),
+            )
+            .await
+            .unwrap();
+        let cfg = Config {
+            media: Some(MediaConfig::ov_genai(None)),
+            ..Config::default()
+        };
+        let app = make_router_with_config(Arc::new(runner), "mock-model", cfg);
+        let (status, v) = post_chat(
+            app,
+            serde_json::json!({"model": "mock-model", "messages": [
+                image_msg("first", &png_url(4, 4)),
+                {"role": "assistant", "content": "ok"},
+                {"role": "user", "content": "and now?"}]}),
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "body: {v}");
+        let msg = v["error"]["message"].as_str().unwrap();
+        assert!(msg.contains("1 images were sent"), "{msg}");
+    }
+
     #[tokio::test]
     async fn completions_honor_stop_and_finish_reason() {
         let (status, v) = post_completions(
@@ -4710,9 +7749,34 @@ mod tests {
         let body = to_bytes(response.into_body(), 4096).await.unwrap();
         let v: Value = serde_json::from_slice(&body).unwrap();
         assert!(
-            v["error"].as_str().unwrap().contains("mock injected"),
+            v["error"]["message"]
+                .as_str()
+                .unwrap()
+                .contains("mock injected"),
             "5xx body should carry the engine's failure reason, got {v}"
         );
+    }
+
+    #[test]
+    fn load_chat_template_reads_processor_chat_template_json() {
+        // LLaVA-NeXT-Video: no inline field, no .jinja, the template only in
+        // the processor's chat_template.json.
+        let dir = std::env::temp_dir().join(format!("cascadia_lnv_tmpl_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("tokenizer_config.json"), r#"{"bos_token": "<s>"}"#).unwrap();
+        std::fs::write(
+            dir.join("chat_template.json"),
+            r#"{"chat_template": "{% for m in messages %}{{ m['role'] }}{% endfor %}"}"#,
+        )
+        .unwrap();
+        let cfg = load_chat_template_config_at(&dir);
+        std::fs::remove_dir_all(&dir).ok();
+        assert_eq!(
+            cfg.template.as_deref(),
+            Some("{% for m in messages %}{{ m['role'] }}{% endfor %}")
+        );
+        assert_eq!(cfg.bos_token.as_deref(), Some("<s>"));
     }
 
     #[test]
@@ -4760,6 +7824,7 @@ mod tests {
             name: None,
             tool_calls: None,
             tool_call_id: None,
+            parts: Vec::new(),
         }];
         let env = build_chat_env(MACRO_TEMPLATE).expect("macro-based template must parse");
         let out = render_with_chat_env(&env, &msgs, "<bos>", "<eos>", true, None, None)
@@ -4789,6 +7854,7 @@ mod tests {
             name: None,
             tool_calls: None,
             tool_call_id: None,
+            parts: Vec::new(),
         }];
         let on = renderer.render_with_tools(&msgs, None).unwrap();
         assert!(on.ends_with("<think>"), "thinking-on render: {on}");
@@ -4822,6 +7888,7 @@ mod tests {
                 },
             }]),
             tool_call_id: None,
+            parts: Vec::new(),
         }];
         let env = build_chat_env(T).expect("template parses");
         let out = render_with_chat_env(&env, &msgs, "<bos>", "<eos>", true, None, None)
@@ -4838,6 +7905,7 @@ mod tests {
             name: None,
             tool_calls: None,
             tool_call_id: None,
+            parts: Vec::new(),
         }];
 
         // Template present: renders through the parsed env (parsed once in `new`).
@@ -4901,6 +7969,225 @@ mod tests {
         assert_eq!(tools[0].r#type, "function");
         assert_eq!(tools[0].function["name"], "get_weather");
         assert_eq!(req.tool_choice.unwrap(), serde_json::json!("auto"));
+    }
+
+    /// OpenAI SDKs and LangChain send `content` as an array of parts even
+    /// for plain text. Text parts join back to back into the one string the
+    /// template sees, as HF's templates concatenate a content array.
+    #[test]
+    fn message_accepts_text_content_parts() {
+        let raw = r#"{"role":"user","content":[
+            {"type":"text","text":"first "},{"type":"text","text":"second"}]}"#;
+        let m: ChatMessage = serde_json::from_str(raw).unwrap();
+        assert_eq!(m.content, "first second");
+        let raw = r#"{"role":"user","content":[
+            {"type":"text","text":"a"},{"type":"text","text":"b"}]}"#;
+        let m: ChatMessage = serde_json::from_str(raw).unwrap();
+        assert_eq!(m.content, "ab");
+        let m: ChatMessage = serde_json::from_str(r#"{"role":"user","content":[]}"#).unwrap();
+        assert!(m.content.is_empty());
+    }
+
+    /// A part the model cannot see is refused by name, never dropped: a
+    /// silently stripped image would get an answer about a picture the model
+    /// never saw.
+    /// Image parts are kept in order with the text around them; the plain
+    /// `content` string stays the text alone, so every text-only path is
+    /// unchanged. Both `image_url` shapes (object and bare string) parse.
+    #[test]
+    fn message_keeps_image_parts_in_order() {
+        let raw = r#"{"role":"user","content":[
+            {"type":"text","text":"compare"},
+            {"type":"image_url","image_url":{"url":"data:a","detail":"low"}},
+            {"type":"image_url","image_url":"data:b"}]}"#;
+        let m: ChatMessage = serde_json::from_str(raw).unwrap();
+        assert_eq!(m.content, "compare");
+        assert_eq!(
+            m.parts,
+            vec![
+                ContentPart::Text("compare".into()),
+                ContentPart::ImageUrl {
+                    url: "data:a".into(),
+                    detail: Some("low".into())
+                },
+                ContentPart::ImageUrl {
+                    url: "data:b".into(),
+                    detail: None
+                },
+            ]
+        );
+        assert_eq!(m.images().count(), 2);
+        let text_only: ChatMessage =
+            serde_json::from_str(r#"{"role":"user","content":[{"type":"text","text":"hi"}]}"#)
+                .unwrap();
+        assert_eq!(text_only.parts, vec![ContentPart::Text("hi".into())]);
+        let string_form: ChatMessage =
+            serde_json::from_str(r#"{"role":"user","content":"hi"}"#).unwrap();
+        assert!(string_form.parts.is_empty());
+    }
+
+    /// `video_url` parses like `image_url`: an object `{url, detail}` or the
+    /// bare URL string, kept in order and out of the text.
+    #[test]
+    fn message_keeps_video_parts_in_order() {
+        let raw = r#"{"role":"user","content":[
+            {"type":"video_url","video_url":{"url":"data:v","detail":"low"}},
+            {"type":"text","text":"and"},
+            {"type":"video_url","video_url":"data:w"}]}"#;
+        let m: ChatMessage = serde_json::from_str(raw).unwrap();
+        assert_eq!(m.content, "and");
+        assert_eq!(
+            m.parts,
+            vec![
+                ContentPart::VideoUrl {
+                    url: "data:v".into(),
+                    detail: Some("low".into())
+                },
+                ContentPart::Text("and".into()),
+                ContentPart::VideoUrl {
+                    url: "data:w".into(),
+                    detail: None
+                },
+            ]
+        );
+        assert_eq!((m.images().count(), m.videos().count()), (0, 2));
+        assert!(m.has_media());
+        let err = serde_json::from_str::<ChatMessage>(
+            r#"{"role":"user","content":[{"type":"video_url","video_url":{}}]}"#,
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(err.contains("needs `video_url.url`"), "{err}");
+    }
+
+    /// OVMS's frame list: `video_url.url` an array of image URL strings
+    /// (with our optional `fps`) is a `VideoFrames` part, counted as a video
+    /// but not among the files; an empty array, a non-string entry or a bad
+    /// `fps` is a 400 at parse time. A video file's `fps` is ignored, as it
+    /// always was.
+    #[test]
+    fn message_takes_a_frame_list_video() {
+        let raw = r#"{"role":"user","content":[
+            {"type":"video_url","video_url":{"url":["data:a","data:b"],"detail":"low","fps":2}},
+            {"type":"video_url","video_url":{"url":["data:c"],"fps":null}}]}"#;
+        let m: ChatMessage = serde_json::from_str(raw).unwrap();
+        assert_eq!(
+            m.parts,
+            vec![
+                ContentPart::VideoFrames {
+                    urls: vec!["data:a".into(), "data:b".into()],
+                    detail: Some("low".into()),
+                    fps: Some(2.0),
+                },
+                ContentPart::VideoFrames {
+                    urls: vec!["data:c".into()],
+                    detail: None,
+                    fps: None,
+                },
+            ]
+        );
+        assert_eq!((m.videos().count(), m.video_count()), (0, 2));
+        assert!(m.has_media());
+        let refused = |video_url: &str| {
+            serde_json::from_str::<ChatMessage>(&format!(
+                r#"{{"role":"user","content":[{{"type":"video_url","video_url":{video_url}}}]}}"#
+            ))
+            .unwrap_err()
+            .to_string()
+        };
+        assert!(refused(r#"{"url":[]}"#).contains("non-empty array"));
+        assert!(refused(r#"{"url":["data:a",3]}"#).contains("`video_url.url[1]` must be a string"));
+        for fps in ["0", "-1", "121", "\"2\""] {
+            let err = refused(&format!(r#"{{"url":["data:a"],"fps":{fps}}}"#));
+            assert!(
+                err.contains("`video_url.fps` must be a number"),
+                "{fps}: {err}"
+            );
+        }
+        let m: ChatMessage = serde_json::from_str(
+            r#"{"role":"user","content":[{"type":"video_url","video_url":{"url":"data:v","fps":2}}]}"#,
+        )
+        .unwrap();
+        assert_eq!(m.videos().collect::<Vec<_>>(), vec![("data:v", None)]);
+    }
+
+    /// A caller that builds its `VideoFrames` parts itself, past the parser
+    /// (a gateway with its own), still gets the parser's bounds: an empty
+    /// list, or an `fps` that is 0, negative, NaN or past 120, is a 400
+    /// before anything is decoded.
+    #[tokio::test]
+    async fn prepare_media_checks_frame_lists_built_without_the_parser() {
+        let slots = Arc::new(Semaphore::new(1));
+        let with = |urls: Vec<String>, fps: Option<f64>| {
+            let mut m = user_msg(serde_json::json!([{"type": "text", "text": "x"}]));
+            m.parts.push(ContentPart::VideoFrames {
+                urls,
+                detail: None,
+                fps,
+            });
+            vec![m]
+        };
+        let cfg = Arc::new(MediaConfig::ov_genai(None));
+        let frame = png_url(8, 8);
+        for fps in [0.0, -1.0, f64::NAN, 121.0] {
+            let err = prepare_media_with(
+                Arc::clone(&cfg),
+                &slots,
+                &with(vec![frame.clone()], Some(fps)),
+            )
+            .await
+            .err()
+            .expect("refused");
+            assert_eq!(
+                err,
+                MediaError::Invalid("video 0: `fps` must be above 0 and at most 120".into()),
+                "{fps}"
+            );
+        }
+        let err = prepare_media_with(Arc::clone(&cfg), &slots, &with(Vec::new(), None))
+            .await
+            .err()
+            .expect("refused");
+        assert_eq!(
+            err,
+            MediaError::Invalid("video 0: a frame list needs at least one frame".into())
+        );
+        let ok = prepare_media_with(cfg, &slots, &with(vec![frame], Some(2.0)))
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(ok.inputs.len(), 1);
+    }
+
+    #[test]
+    fn message_rejects_non_text_content_parts() {
+        for (raw, needle) in [
+            (
+                r#"{"role":"user","content":[{"type":"input_audio","input_audio":{}}]}"#,
+                "`input_audio` is not supported",
+            ),
+            (
+                r#"{"role":"user","content":[{"type":"image_url","image_url":{}}]}"#,
+                "needs `image_url.url`",
+            ),
+            (
+                r#"{"role":"user","content":[{"text":"no type"}]}"#,
+                "missing its `type`",
+            ),
+            (
+                r#"{"role":"user","content":[{"type":"text"}]}"#,
+                "needs a string `text`",
+            ),
+            (
+                r#"{"role":"user","content":42}"#,
+                "must be a string, null, or an array",
+            ),
+        ] {
+            let err = serde_json::from_str::<ChatMessage>(raw)
+                .unwrap_err()
+                .to_string();
+            assert!(err.contains(needle), "{raw}: {err}");
+        }
     }
 
     #[test]
@@ -5332,6 +8619,7 @@ mod tests {
             name: None,
             tool_calls: None,
             tool_call_id: None,
+            parts: Vec::new(),
         }];
         let tools = vec![Tool {
             r#type: "function".into(),
@@ -5357,6 +8645,7 @@ mod tests {
             name: None,
             tool_calls: None,
             tool_call_id: None,
+            parts: Vec::new(),
         }];
         let tools = vec![Tool {
             r#type: "function".into(),
@@ -5513,6 +8802,7 @@ mod tests {
             name: None,
             tool_calls: None,
             tool_call_id: None,
+            parts: Vec::new(),
         }];
         let tools = vec![Tool {
             r#type: "function".into(),
@@ -5567,6 +8857,69 @@ mod tests {
         assert!(!cases.contains(&"system"), "rejection reported: {cases:?}");
     }
 
+    /// llava-hf/llava-1.5-7b-hf's chat template: `{% generation %}` tags and
+    /// typed content parts only. It used to fail to parse (legacy formatter,
+    /// no role markers); a plain-string render would leave every turn empty.
+    #[test]
+    fn llava_parts_template_renders_the_messages() {
+        let tmpl = "{% for message in messages %}{% if message['role'] != 'system' %}{{ message['role'].upper() + ': '}}{% endif %}{# Render all images first #}{% for content in message['content'] | selectattr('type', 'equalto', 'image') %}{{ '<image>\n' }}{% endfor %}{# Render all text next #}{% if message['role'] != 'assistant' %}{% for content in message['content'] | selectattr('type', 'equalto', 'text') %}{{ content['text'] + ' '}}{% endfor %}{% else %}{% for content in message['content'] | selectattr('type', 'equalto', 'text') %}{% generation %}{{ content['text'] + ' '}}{% endgeneration %}{% endfor %}{% endif %}{% endfor %}{% if add_generation_prompt %}{{ 'ASSISTANT:' }}{% endif %}";
+        let env = build_chat_env(tmpl).expect("generation tags are stripped");
+        let msg = |role: &str, content: &str| ChatMessage {
+            role: role.into(),
+            content: content.into(),
+            name: None,
+            tool_calls: None,
+            tool_call_id: None,
+            parts: Vec::new(),
+        };
+        let msgs = vec![
+            msg("user", "<ov_genai_image_0>What colour is it?"),
+            msg("assistant", "Red."),
+            msg("user", "And the shape?"),
+        ];
+        let out = render_or_fallback(
+            Some(&env),
+            &msgs,
+            "",
+            "",
+            false,
+            EffortArgs {
+                mapped: None,
+                raw: None,
+                ..Default::default()
+            },
+            None,
+        )
+        .unwrap();
+        assert_eq!(
+            out,
+            "USER: <ov_genai_image_0>What colour is it? ASSISTANT: Red. USER: And the shape? ASSISTANT:"
+        );
+        // A template that reads plain strings keeps the plain-string render.
+        let plain =
+            build_chat_env("{% for m in messages %}{{ m.role }}: {{ m.content }}\n{% endfor %}")
+                .unwrap();
+        let out = render_or_fallback(
+            Some(&plain),
+            &msgs[..1],
+            "",
+            "",
+            false,
+            EffortArgs {
+                mapped: None,
+                raw: None,
+                ..Default::default()
+            },
+            None,
+        )
+        .unwrap();
+        assert_eq!(out, "user: <ov_genai_image_0>What colour is it?\n");
+        assert_eq!(
+            strip_generation_tags("a{%- generation -%}b{% endgeneration %}c{% if x %}d{% endif %}"),
+            "abc{% if x %}d{% endif %}"
+        );
+    }
+
     #[test]
     fn tools_request_errors_instead_of_silently_falling_back() {
         // The incident this whole path exists for: a render failure inside a
@@ -5579,6 +8932,7 @@ mod tests {
             name: None,
             tool_calls: None,
             tool_call_id: None,
+            parts: Vec::new(),
         }];
         let tools = vec![Tool {
             r#type: "function".into(),
@@ -5642,6 +8996,7 @@ mod tests {
             name: None,
             tool_calls: None,
             tool_call_id: None,
+            parts: Vec::new(),
         }];
 
         let unset = render_with_chat_env(&env, &msgs, "", "", true, None, None).unwrap();
@@ -6232,6 +9587,7 @@ level={{ effort_map[eff] }}";
             name: None,
             tool_calls: None,
             tool_call_id: None,
+            parts: Vec::new(),
         }];
         let tools = vec![Tool {
             r#type: "function".into(),
@@ -6285,6 +9641,7 @@ level={{ effort_map[eff] }}";
             name: None,
             tool_calls: None,
             tool_call_id: None,
+            parts: Vec::new(),
         }];
         match render_or_fallback(
             Some(&env),
@@ -6391,6 +9748,7 @@ level={{ effort_map[eff] }}";
             name: None,
             tool_calls: None,
             tool_call_id: None,
+            parts: Vec::new(),
         }];
         let out = render_with_chat_env(&env, &msgs, "", "", true, None, Some(&tools)).unwrap();
         assert_eq!(out, r#"{"description": "a", "name": "b"}"#);
@@ -6408,6 +9766,7 @@ level={{ effort_map[eff] }}";
             name: None,
             tool_calls: None,
             tool_call_id: None,
+            parts: Vec::new(),
         }];
         let out = render_with_chat_env(&env, &msgs, "", "", true, None, None).unwrap();
         assert_eq!(out.len(), 4, "expected a 4-digit year, got {out:?}");
@@ -6437,6 +9796,7 @@ level={{ effort_map[eff] }}";
                     },
                 }]),
                 tool_call_id: None,
+                parts: Vec::new(),
             },
             ChatMessage {
                 role: "tool".into(),
@@ -6444,6 +9804,7 @@ level={{ effort_map[eff] }}";
                 name: Some("get_weather".into()),
                 tool_calls: None,
                 tool_call_id: Some("call_1".into()),
+                parts: Vec::new(),
             },
         ];
         let out = render_with_chat_env(&env, &msgs, "", "", true, None, None).unwrap();
@@ -7382,7 +10743,7 @@ level={{ effort_map[eff] }}";
             "teardown must not return 200: {body}"
         );
         assert!(
-            body["error"]
+            body["error"]["message"]
                 .as_str()
                 .unwrap_or_default()
                 .contains("shutting down"),
@@ -7422,5 +10783,217 @@ level={{ effort_map[eff] }}";
             text.contains("cascadia_api_rejected_total{reason=\"empty_prompt\"}"),
             "{text}"
         );
+    }
+
+    /// An image-capable router with `media` and a template that brackets
+    /// each message, so the echo shows how its content was joined.
+    async fn media_app(media: MediaConfig, max_body_bytes: usize) -> Router {
+        let runner = Runner::new(Box::new(MockBuilder::new()));
+        runner
+            .start(
+                PeerLayout::single_stage(),
+                ShardSpec::single_stage("mock-model", "CPU"),
+            )
+            .await
+            .unwrap();
+        let cfg = Config {
+            chat_template: ChatTemplateConfig {
+                template: Some(
+                    "{% for m in messages %}{{ m.role }}: [{{ m.content }}]\n{% endfor %}".into(),
+                ),
+                bos_token: None,
+                eos_token: None,
+            },
+            max_body_bytes,
+            max_prompt_bytes: max_body_bytes,
+            media: Some(media),
+            ..Config::default()
+        };
+        make_router_with_config(Arc::new(runner), "mock-model", cfg)
+    }
+
+    async fn post_to(app: Router, uri: &str, payload: serde_json::Value) -> (StatusCode, Value) {
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri(uri)
+                    .header("content-type", "application/json")
+                    .body(Body::from(payload.to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let status = response.status();
+        let body = to_bytes(response.into_body(), 1 << 20).await.unwrap();
+        (status, serde_json::from_slice(&body).unwrap_or(Value::Null))
+    }
+
+    /// The image allowance raises the body limit for images only: text past
+    /// the text limit is a 413 on every route of an image server, while an
+    /// image request whose body is over that limit is still served.
+    #[tokio::test]
+    async fn image_allowance_is_for_image_bytes_only() {
+        let limit = 4096;
+        let app = media_app(MediaConfig::ov_genai(None), limit).await;
+        let long = "word ".repeat(1000);
+        let chat = serde_json::json!({"model": "mock-model", "max_tokens": 4,
+            "messages": [{"role": "user", "content": long}]});
+        let (status, v) = post_to(app.clone(), "/v1/chat/completions", chat).await;
+        assert_eq!(status, StatusCode::PAYLOAD_TOO_LARGE, "{v}");
+        assert!(v["error"]["code"].is_null(), "{v}");
+        assert!(v["error"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("max_body_bytes"));
+        // Text hidden in a tool definition counts too.
+        let tools = serde_json::json!({"model": "mock-model", "max_tokens": 4,
+            "messages": [{"role": "user", "content": "hi"}],
+            "tools": [{"type": "function", "function": {"name": "f", "description": long}}]});
+        let (status, _) = post_to(app.clone(), "/v1/chat/completions", tools).await;
+        assert_eq!(status, StatusCode::PAYLOAD_TOO_LARGE);
+        let resp = serde_json::json!({"model": "mock-model", "input": long});
+        let (status, _) = post_to(app.clone(), "/v1/responses", resp).await;
+        assert_eq!(status, StatusCode::PAYLOAD_TOO_LARGE);
+        // `/v1/completions` carries no images: the body limit itself holds.
+        let cmpl = serde_json::json!({"model": "mock-model", "prompt": long});
+        let (status, v) = post_to(app.clone(), "/v1/completions", cmpl).await;
+        assert_eq!(status, StatusCode::PAYLOAD_TOO_LARGE);
+        assert_ne!(v["error"]["code"], "context_length_exceeded", "{v}");
+
+        // A 300x300 noise PNG is well over 4 KiB of base64.
+        let img = image::RgbImage::from_fn(300, 300, |x, y| {
+            let v = (x.wrapping_mul(2654435761) ^ y.wrapping_mul(40503)) as u8;
+            image::Rgb([v, v.rotate_left(3), v ^ 0x5a])
+        });
+        let mut buf = Vec::new();
+        img.write_to(&mut std::io::Cursor::new(&mut buf), image::ImageFormat::Png)
+            .unwrap();
+        use base64::Engine as _;
+        let url = format!(
+            "data:image/png;base64,{}",
+            base64::engine::general_purpose::STANDARD.encode(buf)
+        );
+        assert!(url.len() > limit);
+        let body = serde_json::json!({"model": "mock-model", "max_tokens": 4,
+            "messages": [image_msg("describe", &url)]});
+        let (status, v) = post_to(app.clone(), "/v1/chat/completions", body).await;
+        assert_eq!(status, StatusCode::OK, "{v}");
+        let body = serde_json::json!({"model": "mock-model", "max_output_tokens": 4,
+            "input": [{"role": "user", "content": [
+                {"type": "input_text", "text": "describe"},
+                {"type": "input_image", "image_url": url}]}]});
+        let (status, v) = post_to(app, "/v1/responses", body).await;
+        assert_eq!(status, StatusCode::OK, "{v}");
+    }
+
+    /// OpenAI's deprecated `function` role parses and renders as `tool`,
+    /// keeping its `name`, so no template prints an unknown role.
+    #[tokio::test]
+    async fn function_role_renders_as_tool() {
+        let m: ChatMessage =
+            serde_json::from_str(r#"{"role":"function","name":"get_weather","content":"sunny"}"#)
+                .unwrap();
+        assert_eq!(m.role, "tool");
+        assert_eq!(m.name.as_deref(), Some("get_weather"));
+        let (status, v) = post_chat(
+            media_app(MediaConfig::ov_genai(None), DEFAULT_MAX_BODY_BYTES).await,
+            serde_json::json!({"model": "mock-model", "max_tokens": 32, "messages": [
+                {"role": "user", "content": "weather?"},
+                {"role": "function", "name": "get_weather", "content": "sunny"}]}),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{v}");
+        let content = v["choices"][0]["message"]["content"].as_str().unwrap();
+        assert!(content.contains("tool:"), "{content:?}");
+        assert!(!content.contains("function"), "{content:?}");
+        assert!(serde_json::from_str::<ChatMessage>(r#"{"role":"robot","content":"x"}"#).is_err());
+    }
+
+    /// `detail: "original"`, in the current SDKs' types, is served as `high`.
+    #[tokio::test]
+    async fn original_detail_is_accepted() {
+        let body = serde_json::json!({"model": "mock-model", "max_tokens": 16,
+            "messages": [{"role": "user", "content": [
+                {"type": "text", "text": "describe"},
+                {"type": "image_url", "image_url": {"url": png_url(8, 8), "detail": "original"}}]}]});
+        let (status, v) = post_chat(make_image_app().await, body).await;
+        assert_eq!(status, StatusCode::OK, "{v}");
+    }
+
+    /// A request's images are held to a total source-pixel budget, read from
+    /// their headers before any decode.
+    #[tokio::test]
+    async fn request_source_pixels_are_capped_before_decoding() {
+        let mut media = MediaConfig::ov_genai(None);
+        media.max_request_source_pixels = 100;
+        let app = media_app(media, DEFAULT_MAX_BODY_BYTES).await;
+        let two = serde_json::json!({"model": "mock-model", "max_tokens": 4,
+            "messages": [{"role": "user", "content": [
+                {"type": "image_url", "image_url": {"url": png_url(8, 8)}},
+                {"type": "image_url", "image_url": {"url": png_url(8, 8)}}]}]});
+        let (status, v) = post_chat(app.clone(), two).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{v}");
+        assert!(v["error"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("pixels together"));
+        let one = serde_json::json!({"model": "mock-model", "max_tokens": 4,
+            "messages": [image_msg("x", &png_url(8, 8))]});
+        let (status, v) = post_chat(app, one).await;
+        assert_eq!(status, StatusCode::OK, "{v}");
+    }
+
+    /// A request that cannot get a decode slot in time gets the capacity 503
+    /// with `Retry-After`, kept out of readiness, rather than waiting forever.
+    #[tokio::test]
+    async fn decode_slot_wait_is_bounded() {
+        let busy = Arc::new(Semaphore::new(0));
+        let err = acquire_decode_slot(busy, std::time::Duration::from_millis(20))
+            .await
+            .unwrap_err();
+        assert!(matches!(err, MediaError::Busy(_)), "{err:?}");
+        assert_eq!(err.http_status(), 503);
+        let resp = media_error_response(err);
+        assert_eq!(resp.status(), StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(resp.headers()[header::RETRY_AFTER], "1");
+        assert!(resp.extensions().get::<PreEngineFailure>().is_some());
+        let free = Arc::new(Semaphore::new(1));
+        assert!(
+            acquire_decode_slot(free, std::time::Duration::from_millis(20))
+                .await
+                .is_ok()
+        );
+    }
+
+    /// A text-only content array joins back to back like an image message's,
+    /// and on a template that trims each part (Gemma) its parts are trimmed.
+    #[tokio::test]
+    async fn text_only_arrays_join_like_image_messages() {
+        let body = serde_json::json!({"model": "mock-model", "max_tokens": 16,
+            "messages": [{"role": "user", "content": [
+                {"type": "text", "text": " a "}, {"type": "text", "text": "b "}]}]});
+        let echo = |v: Value| {
+            v["choices"][0]["message"]["content"]
+                .as_str()
+                .unwrap()
+                .to_owned()
+        };
+        let (status, v) = post_chat(
+            media_app(MediaConfig::gemma4_native(), DEFAULT_MAX_BODY_BYTES).await,
+            body.clone(),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{v}");
+        assert!(echo(v.clone()).contains("[ab]"), "{v}");
+        let (status, v) = post_chat(
+            media_app(MediaConfig::ov_genai(None), DEFAULT_MAX_BODY_BYTES).await,
+            body,
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{v}");
+        let text = echo(v.clone());
+        // The echo splits on whitespace: "[ a b ]" comes back as its words.
+        assert!(text.contains("[ a b ]"), "{text:?}");
     }
 }

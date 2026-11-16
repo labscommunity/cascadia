@@ -214,7 +214,9 @@ def _sha256(path: str) -> str:
 
 def _extract_stripped(archive: str, dest: str) -> None:
     """Extract into dest, dropping the single top-level SDK directory."""
-    tmp = tempfile.mkdtemp(prefix="ov_sdk_", dir=os.path.dirname(os.path.abspath(dest)) or None)
+    parent = os.path.dirname(os.path.abspath(dest))
+    os.makedirs(parent, exist_ok=True)
+    tmp = tempfile.mkdtemp(prefix="ov_sdk_", dir=parent)
     try:
         if archive.endswith(".zip"):
             with zipfile.ZipFile(archive) as z:
@@ -233,7 +235,6 @@ def _extract_stripped(archive: str, dest: str) -> None:
         root = os.path.join(tmp, entries[0])
         if os.path.isdir(dest):
             shutil.rmtree(dest)
-        os.makedirs(os.path.dirname(os.path.abspath(dest)) or ".", exist_ok=True)
         shutil.move(root, dest)
     finally:
         shutil.rmtree(tmp, ignore_errors=True)

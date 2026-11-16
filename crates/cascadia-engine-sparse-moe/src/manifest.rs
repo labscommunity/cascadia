@@ -66,6 +66,29 @@ pub struct Manifest {
     /// `int4_bin` backend to compute per-expert byte offsets. 0 = unset.
     #[serde(default)]
     pub expert_intermediate: u32,
+    /// Digest of the whole `manifest.json` ([`config_digest`]), set by [`Manifest::load`]. It
+    /// goes into the KV fingerprint, so a re-export under one id with any other config (say a
+    /// different `partial_rotary_dim`, which no typed field above carries) refuses this export's KV.
+    #[serde(skip)]
+    pub config_digest: u64,
+}
+
+/// FNV-1a over `manifest.json` parsed and re-serialized (sorted keys, no whitespace), so line
+/// endings or indentation cannot split one export. `exported_layers` is left out: it is a debug
+/// subset that a per-rank tree may narrow, and the fingerprint must match on every rank. 0 when
+/// the bytes are not a JSON object.
+pub fn config_digest(bytes: &[u8]) -> u64 {
+    let Ok(serde_json::Value::Object(mut v)) = serde_json::from_slice(bytes) else {
+        return 0;
+    };
+    v.remove("exported_layers");
+    let canon = serde_json::to_vec(&v).unwrap_or_default();
+    let mut h: u64 = 0xcbf2_9ce4_8422_2325;
+    for &b in &canon {
+        h ^= u64::from(b);
+        h = h.wrapping_mul(0x0000_0100_0000_01b3);
+    }
+    h
 }
 
 fn default_experts_format() -> String {
@@ -83,7 +106,10 @@ impl Manifest {
             return Err(ManifestError::Missing(p));
         }
         let bytes = std::fs::read(&p)?;
-        serde_json::from_slice(&bytes).map_err(|e| ManifestError::Invalid(e.to_string()))
+        let mut m: Self =
+            serde_json::from_slice(&bytes).map_err(|e| ManifestError::Invalid(e.to_string()))?;
+        m.config_digest = config_digest(&bytes);
+        Ok(m)
     }
 
     /// Path to the stateless layer-0 IR (embed + dense + RMSNorm).
@@ -162,5 +188,36 @@ impl Manifest {
         } else {
             self.exported_layers.clone()
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const M2: &str = r#"{"arch": "minimax_m2", "num_layers": 3, "dense_layers": [],
+        "num_experts": 8, "top_k": 2, "hidden_size": 128, "num_kv_heads": 2,
+        "qk_head_dim": 32, "v_head_dim": 32, "vocab_size": 256, "eos_token_ids": [200020],
+        "partial_rotary_dim": 16, "exported_layers": [0, 1, 2]}"#;
+
+    #[test]
+    fn load_digests_the_untyped_fields_too() {
+        let dir = tempfile::tempdir().unwrap();
+        let load = |text: &str| {
+            std::fs::write(dir.path().join("manifest.json"), text).unwrap();
+            Manifest::load(dir.path()).unwrap().config_digest
+        };
+        let fresh = load(M2);
+        assert_ne!(fresh, 0);
+        assert_ne!(
+            fresh,
+            load(&M2.replace("\"partial_rotary_dim\": 16", "\"partial_rotary_dim\": 32")),
+            "a stale export with another rotary dim must not share the digest"
+        );
+        assert_eq!(
+            fresh,
+            load(&M2.replace("[0, 1, 2]", "[1]")),
+            "exported_layers may differ per rank"
+        );
     }
 }

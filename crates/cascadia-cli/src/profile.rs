@@ -345,7 +345,7 @@ pub fn probe_device(device: &str, args: &ProfileDevicesArgs) -> DeviceResult {
     let mut warmup_s: Option<f64> = None;
     for i in 0..args.warmup {
         let t = Instant::now();
-        match pipe.generate(&args.prompt, &cfg) {
+        match pipe.generate(&args.prompt, &[], &cfg) {
             Ok(_) => {
                 if i + 1 == args.warmup {
                     warmup_s = Some(t.elapsed().as_secs_f64());
@@ -371,7 +371,7 @@ pub fn probe_device(device: &str, args: &ProfileDevicesArgs) -> DeviceResult {
     let mut last_output: Option<String> = None;
     for _ in 0..args.runs {
         let t = Instant::now();
-        match pipe.generate(&args.prompt, &cfg) {
+        match pipe.generate(&args.prompt, &[], &cfg) {
             Ok(r) => {
                 runs_s.push(t.elapsed().as_secs_f64());
                 last_output = Some(r.text);

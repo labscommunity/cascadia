@@ -1280,8 +1280,12 @@ pub fn prepare_resume(
         return Ok(None);
     };
     let vocab = resume_vocab_bound(tokenizer);
-    cascadia_types::validate_resume_ids(r, Some(vocab))
-        .map_err(|e| format!("invalid resume prefix: {e}"))?;
+    cascadia_types::validate_resume_ids(r, Some(vocab)).map_err(|e| {
+        format!(
+            "{}invalid resume prefix: {e}",
+            cascadia_engine::CLIENT_ERROR_PREFIX
+        )
+    })?;
     cascadia_types::append_resume_ids(prompt_ids_i64, Some(r));
     let generated_u32: Vec<u32> = r.iter().map(|&i| i as u32).collect();
     let prefix_text = tokenizer
@@ -1551,10 +1555,9 @@ pub struct SparseMoEEngine {
     /// the per-rank `GET(E)` serves from it. Unlike `kv_offers` (short-lived NEGOTIATE→GET correlation
     /// on the head), these must survive across turns — a forced move can pull a prefix captured many
     /// turns earlier. Bounded by `kv_prefix_cache.capacity()`; eviction is oldest-arbitrary.
-    // Tenant carried as a VALUE, key stays epoch-only: partner-KEYING would file every legacy
-    // (v1-frame) capture under a local namespace and turn the certified multi-stage cross-chain
-    // warm pull cold. `""` = untagged (legacy frame or tenant-less turn) — served to any partner;
-    // a non-empty tenant confines the entry (H.1a).
+    // Tenant carried as a VALUE, key stays epoch-only (the head's RESTORE names only the epoch).
+    // Every entry is served only to the tenant it was stashed under: `""` (a v1 frame, i.e. a
+    // tenant-less turn) only to `""` (H.1a).
     #[cfg(feature = "kv_coord")]
     pub(crate) kv_capture:
         std::collections::HashMap<u64, (String, Vec<i32>, crate::kv_prefix_cache::KvSnapshot)>,
@@ -1670,6 +1673,7 @@ impl Engine for SparseMoEEngine {
     }
 
     fn submit(&mut self, task: GenerationTask) -> EngineResult<()> {
+        cascadia_engine::refuse_media(&task, "sparse-moe")?;
         if self.rank != 0 {
             return Err(EngineError::InvalidConfig(
                 "only rank 0 accepts tasks; worker ranks drive themselves from upstream frames"
@@ -1844,7 +1848,13 @@ impl SparseMoEEngine {
                 let id = task.task_id.clone();
                 return vec![(
                     id.clone(),
-                    Chunk::error(id, format!("invalid resume prefix: {e}")),
+                    Chunk::error(
+                        id,
+                        format!(
+                            "{}invalid resume prefix: {e}",
+                            cascadia_engine::CLIENT_ERROR_PREFIX
+                        ),
+                    ),
                 )];
             }
         }
@@ -5039,6 +5049,7 @@ impl Engine for OvMoeEngine {
     }
 
     fn submit(&mut self, task: GenerationTask) -> EngineResult<()> {
+        cascadia_engine::refuse_media(&task, "sparse-moe (ov)")?;
         if self.rank != 0 {
             return Err(EngineError::InvalidConfig(
                 "only rank 0 accepts tasks; worker ranks drive themselves from upstream frames"
@@ -5155,10 +5166,9 @@ impl cascadia_engine::KvCoordination for OvMoeEngine {
         let (prefix, snap) = if let Some(off) = self.kv_offers.take(partner, expected_epoch) {
             off
         } else if let Some((cap_ns, tokens, snap)) = self.kv_capture.get(&expected_epoch) {
-            // Tagged captures are confined to their tenant; untagged ("" — legacy v1 frames and
-            // tenant-less turns) serve any partner, keeping the certified cross-chain pull
-            // unchanged. See `SparseMoEEngine::export`.
-            if !cap_ns.is_empty() && cap_ns != partner {
+            // Served only to the tenant it was stashed under, untagged ("") only to "". See
+            // `SparseMoeKvHolder::export`.
+            if cap_ns != partner {
                 tracing::info!(target: "cascadia::kv", event = "kv_serve_ns_mismatch",
                     epoch = expected_epoch);
                 return None;
@@ -5685,6 +5695,23 @@ struct PipeActive {
     generated: Vec<u32>,
     emitted: usize,
     hit_context_cap: bool,
+}
+
+/// The staged shells have no forced-prefix path: silently ignoring a resumed
+/// task's ids would regenerate from scratch and the caller would splice that
+/// after the client's already-received prefix as if it were the resumed tail.
+/// Every admission path declines with this sentinel FIRST chunk instead, so
+/// the caller excludes this peer and re-routes.
+fn pipeline_resume_decline(task: &GenerationTask) -> Option<(TaskId, Chunk)> {
+    task.resume_ids()?;
+    let id = task.task_id.clone();
+    Some((
+        id.clone(),
+        Chunk::error(
+            id,
+            "resume_unsupported: pipeline engine has no forced-prefix path".to_string(),
+        ),
+    ))
 }
 
 impl<R: StagedRunner> PipelineEngine<R> {
@@ -6216,6 +6243,9 @@ impl<R: StagedRunner> PipelineEngine<R> {
         g: usize,
         down: &Arc<TokioMutex<ActivationClient>>,
     ) -> Result<usize, (TaskId, Chunk)> {
+        if let Some(decline) = pipeline_resume_decline(&task) {
+            return Err(decline);
+        }
         let started = Instant::now();
         let Some(tok) = self.tokenizer.as_ref() else {
             let e = Chunk::error(task.task_id.clone(), "engine has no tokenizer".to_string());
@@ -6736,6 +6766,9 @@ impl<R: StagedRunner> PipelineEngine<R> {
     /// terminal chunk is returned instead.
     #[allow(clippy::result_large_err)]
     fn admit_stream(&mut self, task: GenerationTask) -> Result<(), (TaskId, Chunk)> {
+        if let Some(decline) = pipeline_resume_decline(&task) {
+            return Err(decline);
+        }
         let started = Instant::now();
         let Some(tok) = self.tokenizer.as_ref() else {
             let e = Chunk::error(task.task_id.clone(), "engine has no tokenizer".to_string());
@@ -6882,6 +6915,9 @@ impl<R: StagedRunner> PipelineEngine<R> {
             Some(t) => t,
             None => return Vec::new(),
         };
+        if let Some(decline) = pipeline_resume_decline(&task) {
+            return vec![decline];
+        }
         let Some(tok) = self.tokenizer.as_ref() else {
             warn!(task = %task.task_id, "dsv4 engine has no tokenizer");
             let e = Chunk::error(task.task_id.clone(), "engine has no tokenizer".to_string());
@@ -7084,20 +7120,9 @@ impl<R: StagedRunner> PipelineEngine<R> {
             Some(t) => t,
             None => return Some(Vec::new()),
         };
-        // No forced-prefix path here: silently ignoring the ids would regenerate
-        // from scratch and the caller would splice that after the client's
-        // already-received prefix as if it were the resumed tail. Decline with the
-        // sentinel first chunk so the caller excludes this peer and re-routes —
-        // same shape as the MiniMax single-stage decline above.
-        if task.resume_ids().is_some() {
-            let id = task.task_id.clone();
-            return Some(vec![(
-                id.clone(),
-                Chunk::error(
-                    id,
-                    "resume_unsupported: pipeline engine has no forced-prefix path".to_string(),
-                ),
-            )]);
+        // Same shape as the MiniMax single-stage decline above.
+        if let Some(decline) = pipeline_resume_decline(&task) {
+            return Some(vec![decline]);
         }
         let id = task.task_id.clone();
         let Some(downstream) = self.transport.downstream.clone() else {
@@ -8258,6 +8283,7 @@ impl<R: StagedRunner> Engine for PipelineEngine<R> {
     }
 
     fn submit(&mut self, task: GenerationTask) -> EngineResult<()> {
+        cascadia_engine::refuse_media(&task, "sparse-moe (pipeline)")?;
         if self.rank != 0 {
             return Err(EngineError::InvalidConfig(
                 "only rank 0 accepts tasks; worker ranks drive themselves from upstream frames"
@@ -8532,6 +8558,79 @@ mod tests {
         assert!(
             reason.starts_with("resume_unsupported:"),
             "sentinel must PREFIX the reason (callers match with starts_with): {reason}"
+        );
+    }
+
+    /// The other three admission paths (single-stage, multi-stream,
+    /// multi-stream pipeline) used to admit a resumed task and regenerate it.
+    /// Each must decline with the same sentinel, before any tokenizer, runner
+    /// or transport work (the stub engine has none of them).
+    #[test]
+    fn pipeline_engine_declines_seeded_task_on_every_admission_path() {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let new_eng = || {
+            PipelineEngine::new(
+                StubRunner,
+                None,
+                StageTransport {
+                    upstream: None,
+                    downstream: None,
+                },
+                rt.handle().clone(),
+                0,
+                2,
+                None,
+            )
+        };
+        let seeded = || {
+            let mut t = GenerationTask::new("t", "hi").with_max_tokens(4);
+            t.resume_token_ids = Some(vec![3]);
+            t
+        };
+        let assert_decline = |path: &str, (id, chunk): (TaskId, Chunk)| {
+            assert_eq!(id, "t", "{path}");
+            let reason = chunk.error.as_deref().unwrap_or_default();
+            assert!(
+                reason.starts_with("resume_unsupported:"),
+                "{path} must decline a resumed task, got {chunk:?}"
+            );
+        };
+
+        let mut eng = new_eng();
+        eng.pending.push_back(seeded());
+        let mut chunks = eng.step_single_stage();
+        assert_eq!(chunks.len(), 1, "step_single_stage: one terminal chunk");
+        assert_decline("step_single_stage", chunks.remove(0));
+
+        let mut eng = new_eng();
+        assert_decline(
+            "admit_stream",
+            eng.admit_stream(seeded()).expect_err("must decline"),
+        );
+
+        let mut eng = new_eng();
+        let down = Arc::new(TokioMutex::new(ActivationClient::new("127.0.0.1", 1)));
+        assert_decline(
+            "admit_stream_pipeline",
+            eng.admit_stream_pipeline(seeded(), 0, &down)
+                .expect_err("must decline"),
+        );
+
+        // An empty resume list is wire-legal "not resuming" and is NOT declined.
+        let mut eng = new_eng();
+        let mut t = GenerationTask::new("t", "hi").with_max_tokens(4);
+        t.resume_token_ids = Some(Vec::new());
+        let err = eng.admit_stream(t).expect_err("no tokenizer in the stub");
+        assert!(
+            !err.1
+                .error
+                .as_deref()
+                .unwrap_or_default()
+                .starts_with("resume_unsupported:"),
+            "Some([]) must not be declined"
         );
     }
 
