@@ -454,30 +454,27 @@ fn floats(what: &str, a: &NpArray<'_>) -> Result<Vec<f32>, RequestError> {
 const INPUT_KEYS: &str = "state, task, images, and optional noise and the RTC inputs";
 
 /// One number from a 0-d or one-element array (`np.int64(3)` arrives as `int64 []`).
+/// Only integer and float32/64 kinds; the bytes are read at their own width.
 fn scalar(what: &str, a: &NpArray<'_>) -> Result<f64, RequestError> {
     let bad = || refuse(format!("{what} must be a single number"));
-    let Some((kind, size)) = np_dtype(a.dtype) else {
-        return bad();
-    };
-    if a.data.len() as u64 != size {
+    if !matches!(a.shape.as_slice(), [] | [1]) {
         return bad();
     }
-    let mut b = [0u8; 8];
-    b[..size as usize].copy_from_slice(a.data);
-    let x = match (kind, size) {
-        ('i', 1) => i8::from_le_bytes([b[0]]) as f64,
-        ('i', 2) => i16::from_le_bytes([b[0], b[1]]) as f64,
-        ('i', 4) => i32::from_le_bytes([b[0], b[1], b[2], b[3]]) as f64,
-        ('i', 8) => i64::from_le_bytes(b) as f64,
-        ('u', 1) => b[0] as f64,
-        ('u', 2) => u16::from_le_bytes([b[0], b[1]]) as f64,
-        ('u', 4) => u32::from_le_bytes([b[0], b[1], b[2], b[3]]) as f64,
-        ('u', 8) => u64::from_le_bytes(b) as f64,
-        ('f', 4) => f32::from_le_bytes([b[0], b[1], b[2], b[3]]) as f64,
-        ('f', 8) => f64::from_le_bytes(b),
+    let d = a.data;
+    let x = match np_dtype(a.dtype) {
+        Some(('i', 1)) => d.try_into().map(i8::from_le_bytes).map(f64::from),
+        Some(('i', 2)) => d.try_into().map(i16::from_le_bytes).map(f64::from),
+        Some(('i', 4)) => d.try_into().map(i32::from_le_bytes).map(f64::from),
+        Some(('i', 8)) => d.try_into().map(i64::from_le_bytes).map(|v| v as f64),
+        Some(('u', 1)) => d.try_into().map(u8::from_le_bytes).map(f64::from),
+        Some(('u', 2)) => d.try_into().map(u16::from_le_bytes).map(f64::from),
+        Some(('u', 4)) => d.try_into().map(u32::from_le_bytes).map(f64::from),
+        Some(('u', 8)) => d.try_into().map(u64::from_le_bytes).map(|v| v as f64),
+        Some(('f', 4)) => d.try_into().map(f32::from_le_bytes).map(f64::from),
+        Some(('f', 8)) => d.try_into().map(f64::from_le_bytes),
         _ => return bad(),
     };
-    Ok(x)
+    x.map_or_else(|_| bad(), Ok)
 }
 
 /// A non-negative integer from an integer-typed scalar.
@@ -557,6 +554,11 @@ fn observation(
                     ));
                 }
                 left = Some(floats(name, &a)?);
+            }
+            ("inference_delay" | "execution_horizon" | "max_guidance_weight", Some(_))
+                if spec.rtc_chunk_size.is_none() =>
+            {
+                return refuse("this package takes no RTC inputs; export it with RTC enabled")
             }
             ("inference_delay", Some(a)) => delay = Some(scalar_uint(name, &a)?),
             ("execution_horizon", Some(a)) => horizon = Some(scalar_uint(name, &a)?),

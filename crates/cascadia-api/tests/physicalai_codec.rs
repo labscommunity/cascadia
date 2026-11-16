@@ -151,6 +151,38 @@ fn rtc_refusals() {
     );
     let e = err(req().input("execution_horizon", scalar("int64", &2i64.to_le_bytes())));
     assert!(e.contains("more than half the chunk"), "{e}");
+    // Peer-chosen dtypes and sizes are refused, never read past the scalar.
+    for (dtype, bytes) in [
+        ("complex128", 16),
+        ("complex64", 8),
+        ("float16", 2),
+        ("bool", 1),
+    ] {
+        let e = err(req().input("max_guidance_weight", scalar(dtype, &vec![1; bytes])));
+        assert!(
+            e.contains("max_guidance_weight must be a single number"),
+            "{dtype}: {e}"
+        );
+        let e = err(req().input("inference_delay", scalar(dtype, &vec![1; bytes])));
+        assert!(e.contains("inference_delay must be"), "{dtype}: {e}");
+    }
+    let two = val(|b| mp::np(b, "int64", &[2], &[0; 16]));
+    let e = err(req().input("execution_horizon", two));
+    assert!(
+        e.contains("execution_horizon must be a single number"),
+        "{e}"
+    );
+    // A package without RTC refuses the scalars before reading them.
+    let e = decode_predict(
+        &good()
+            .input("max_guidance_weight", scalar("complex128", &[1; 16]))
+            .pack(),
+        &spec(),
+        max,
+    )
+    .unwrap_err()
+    .0;
+    assert!(e.contains("takes no RTC inputs"), "{e}");
 }
 
 #[test]
