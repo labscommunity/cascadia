@@ -247,7 +247,8 @@ pub enum EngineKind {
     #[value(name = "sycl-llama")]
     SyclLlama,
     /// Robot policy (VLA) engine: serves a `policy_package` (SmolVLA, pi0.5, pi0, X-VLA, EVO1,
-    /// VLA-JEPA, XR0) over an openpi-compatible WebSocket. `cascadia run` only.
+    /// VLA-JEPA, XR0, GR00T N1.7, MolmoAct2) over an openpi-compatible WebSocket. `cascadia run`
+    /// only.
     #[value(name = "ov-policy")]
     OvPolicy,
 }
@@ -1671,7 +1672,7 @@ fn cmd_engines() -> Result<()> {
     println!("  gemma4         Gemma 4 multi-stage (per-layer-type attn, KV-sharing, PLI, sliding window); gemma4_cached_v1.x shards");
     println!("  sparse-moe     sparse mixture-of-experts on CPU: Kimi K2.6 (AVX-512 int4 GEMM), MiniMax-M2 (OV-IR shells), GLM-5 / DeepSeek-V4 / Inkling (Rust shells + int4 mmap experts, N-rank pipeline)");
     println!("  sycl-llama     external llama.cpp SYCL server (GGUF, spawned subprocess); bin via --llama-bin / CASCADIA_LLAMA_BIN / PATH; --elastic = GGML_STREAM_WEIGHTS device-side streaming (needs a streaming build, scripts/build-llama-stream.sh)");
-    println!("  ov-policy      robot policy (VLA): SmolVLA / pi0.5 policy_package on GPU or CPU, openpi-compatible WebSocket; `cascadia run` only");
+    println!("  ov-policy      robot policy (VLA): SmolVLA / pi0.5 / pi0 / X-VLA / EVO1 / VLA-JEPA / XR0 / GR00T N1.7 / MolmoAct2 policy_package on GPU or CPU, openpi-compatible WebSocket; `cascadia run` only");
     println!("  qwen35         Qwen3.5-family staged chain (GatedDeltaNet; 3.5/3.6 MoE or 3.8 dense); qwen3_5* IR-surgery shards (alias: qwen36-moe)");
     Ok(())
 }

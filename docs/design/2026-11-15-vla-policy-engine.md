@@ -90,20 +90,28 @@ v1:
   for π0; CPU f32 is about 5.6 s a call and 26 GB.
 - VLA-JEPA (`lerobot/VLA-JEPA-LIBERO`, Qwen3-VL-2B with all four flow steps in one graph) on the Arc
   140V: GPU f16 about 99 ms a call and within 8.2e-4 of PyTorch f32, GPU f32 about 610 ms, CPU f32
-  about 3 s, no gripper flips. The GPU f16 default holds; LIBERO success is not yet measured.
+  about 3 s, no gripper flips. The GPU f16 default holds: LIBERO `libero_spatial` 29/30 at GPU f16,
+  as PyTorch through the same client.
 - GR00T N1.7 (`nvidia/GR00T-N1.7-LIBERO`, `libero_spatial`; Cosmos-Reason2-2B with a 4-step flow
-  head in one graph) on the Arc 140V: GPU f16 about 160 ms for a 16-step chunk, within 7.4e-3
-  (normalized) of PyTorch f32, no NaN, about 7 GB; CPU f32 about 3 s, within 3.3e-3 as served.
+  head in one graph) on the Arc 140V, the IR alone through OpenVINO's Python API on random frames:
+  GPU f16 about 160 ms for a 16-step chunk, within 7.4e-3 (normalized) of PyTorch f32, no NaN,
+  about 7 GB; CPU f32 about 3 s, within 3.3e-3 in served units. Through the engine (whole call,
+  pre- and postprocessing included) see the tier table.
   OpenVINO matches Intel's PyTorch export wrapper to 3.4e-6; the wrapper itself is 4.7e-3 to
-  7.1e-3 off NVIDIA's model, a gap not yet traced. At `--precision f32` the GPU compile fails
-  (`CL_INVALID_EVENT`), a load error as for π0. One package per embodiment and camera count.
+  7.1e-3 off NVIDIA's model, a gap not yet traced; it costs no task success: LIBERO
+  `libero_spatial` 27/30 at GPU f16 against 26/30 for NVIDIA's PyTorch model on the same
+  episodes. At `--precision f32` the GPU compile fails (`CL_INVALID_EVENT`), a load error as for
+  π0. One package per embodiment and camera count.
   NVIDIA's licence notice (the package's `NOTICE`) is served as the metadata's `attribution`.
 - MolmoAct2 (`allenai/MolmoAct2-LIBERO`, 5.4B, 10 flow steps from zeros in one graph) on the Arc
-  140V: GPU f16 about 0.92 s for a 10-step chunk, within 1e-3 (normalized) of PyTorch f32, no NaN,
-  about 10 GB; at `--precision f32` the GPU compile fails (`CL_INVALID_EVENT`), a load error as for
-  π0. The x86 CPU at f32 is within 1e-3 of PyTorch; OpenVINO 2026.4.1's ARM CPU plugin computes the
-  graph wrong (the IR alone is 0.61 off PyTorch on PyTorch's own inputs on macOS), so MolmoAct2 on
-  an ARM CPU is refused at load, before the compile (use an x86 CPU or the GPU). Its noise is
+  140V, the IR alone through OpenVINO's Python API: GPU f16 about 0.92 s for a 10-step chunk, within
+  1e-3 (normalized) of PyTorch f32, no NaN, about 10 GB (through the engine see the tier table);
+  at `--precision f32` the GPU compile fails (`CL_INVALID_EVENT`), a load error as for π0. LIBERO
+  `libero_spatial` 28/30 at GPU f16 against 27/30 for Intel's PyTorch at f32 on the same
+  episodes. The x86 CPU at f32 is within 1e-3 of PyTorch (about 35 s a call on a Core Ultra 7);
+  OpenVINO 2026.4.1's ARM CPU plugin computes the graph wrong (the IR alone is 0.61 off PyTorch on
+  PyTorch's own inputs on macOS), so MolmoAct2 on an ARM CPU
+  is refused at load, before the compile (use an x86 CPU or the GPU). Its noise is
   `constant`: the graph starts from zeros, so calls are deterministic. The weights' licence is unstated on the model card (the code is Apache-2.0).
 - A single-box metadata endpoint and WebSocket, served by `cascadia run --engine ov-policy`.
 - `cascadia export-policy`: LeRobot checkpoints (Hugging Face) to a `policy_package`.
@@ -112,13 +120,38 @@ Tiers: a kind is **supported** once it has PyTorch parity, Windows CPU and GPU r
 success at f16; until then it is **experimental** (served, with metadata, docs and CLI, but not
 promised).
 
-| Kind | Tier |
-|---|---|
-| `gr00t_n1d7` | experimental until LIBERO (parity on random frames only) |
-| `molmoact2` | experimental until LIBERO (parity on one LIBERO frame pair) |
+LIBERO success is measured the same way for every kind: `libero_spatial`, 10 tasks × 3 episodes
+(init states 0–2), seed 7, through `tools/vla_libero_client.py`. The kind passes when its GPU f16
+success lies inside the 95% (Wilson) interval of the same checkpoint in PyTorch, served through the
+same client on the same episodes. Thirty episodes separate only large gaps, so this bar catches a
+broken port, not a few points. Windows runs are on a Core Ultra 7 258V with the Arc 140V; "engine"
+means the whole call through `cascadia run` or `policy_openvino`, pre- and postprocessing
+included, and differences are against PyTorch f32 unless stated.
 
-Not in v1: π0-FAST and other policies until each export is checked; NPU; multi-stage
-sharding; per-robot key mappings for existing openpi clients; server-side image resize; routing
+| Kind | Ours, GPU f16 | PyTorch, same episodes | Build | Windows CPU and GPU | Tier |
+|---|---|---|---|---|---|
+| `smolvla` | 23/30 | 19/30 (LeRobot, CPU f32; LeRobot's own `lerobot-eval` 23/30) | `6ef2a88e9` | engine: GPU f16 ~250 ms, within 9.5e-4 of the reference; CPU f32 1.8 s, ~1e-6 | supported |
+| `pi05` | 28/30 (Intel's `pi05-libero-fp16-ov`) | 29/30 (LeRobot, CPU f32) | `125dd23d0` | engine: GPU f16 ~620 ms, within 1.03e-3 of CPU f32 on the same box (our export) | supported |
+| `pi0` | 15/30 | 19/30 (LeRobot, CPU f32) | `125dd23d0` | engine: GPU f16 only (f32 does not compile); CPU f32 11.3 s, within 1.8e-3 | supported, at the low edge of the interval (0.46–0.78): 8 episodes only PyTorch solved, 4 only ours |
+| `xvla` | 26/30 | 25/30 (LeRobot, CPU f32) | `125dd23d0` | engine: GPU f16 position within 4.9e-3, rotation 1.1°, one gripper near its threshold; CPU f32 5.9 s, within 2.9e-4 | supported |
+| `vlajepa` | 29/30 | 29/30 (LeRobot, CPU f32) | `125dd23d0` | engine: GPU f16 ~107 ms (the LIBERO server); CPU f32 3.0 s within 1.65e-4 through OpenVINO's Python API, the engine's CPU path within 1.65e-4 on macOS | supported |
+| `evo1` | 28/30 | 28/30 (LeRobot, CPU f32) | `125dd23d0` | engine: GPU f16 ~330 ms, within 6.4e-4; CPU f32 6.1 s, within 3.6e-4 | supported |
+| `gr00t_n1d7` | 27/30 | 26/30 (NVIDIA's model, CPU bf16) | `125dd23d0` | engine at `7a6b19e5a`: GPU f16 ~240 ms, within 4.8e-3; CPU f32 3.5–4.3 s, within 3.3e-3 | supported |
+| `xr0` | 27/30 | 27/30 (Intel's, CPU f32) | `125dd23d0` | engine: GPU f16 ~231 ms (the LIBERO server), within 3.2e-3 through OpenVINO's Python API; CPU f32 5.6 s within 8.3e-4 through the Python API | supported |
+| `molmoact2` | 28/30 | 27/30 (Intel's, CPU f32) | `8da6f67c2` | engine at `7a6b19e5a`: GPU f16 ~990 ms, within 4.0e-4; CPU f32 35 s, within 3.6e-4 | supported |
+
+Every v1 kind meets the rule; π0 only just. No run had an error frame or a non-finite action. For
+VLA-JEPA and XR0 the Windows CPU run is the package through OpenVINO's Python API, not the engine.
+The `gr00t_n1d7` and `molmoact2` engine runs were repeated at `7a6b19e5a`, after RTC and the
+package digest landed, and gave the same differences as at their LIBERO builds.
+
+Not in v1: π0-FAST, which no exporter can produce as a package: physical-ai-studio (`8f132416`
+and main of 2026-11-16) wraps it as a LeRobot alias whose only export backend is Torch, so
+`to_openvino` raises `NotImplementedError`; and LeRobot's π0-FAST decodes its action tokens one at
+a time with a KV cache, stopping at EOS, then turns them into actions with a BPE decode and an
+inverse DCT on the host, which the single-pass runner cannot run. Other policies until each export
+is checked; NPU; multi-stage sharding; per-robot key mappings for existing openpi clients;
+server-side image resize; routing
 across machines. Real-time chunking (RTC) is served for packages exported with it (see "Real-time
 chunking"), SmolVLA and π0.5 first.
 
@@ -793,7 +826,7 @@ What runs where, as shipped. Items marked **not shipped** are planned and not in
   accuracy run is also the end-to-end interoperability test. It runs episodes of one suite against
   our `input`-mode exports and Intel's published packages, at `--precision f16` and `f32` on the
   GPU. Speed and parity do not show that a robot succeeds at a task; this does. Where the simulator
-  runs is open question 2.
+  runs is open question 2. Run for every kind (2026-11-15 and 16); the results are the tier table.
 - **RTC (by hand).** `policy_openvino`'s RTC tests take SmolVLA and π0.5 LIBERO exported with and
   without RTC from one checkpoint, the RTC export's float32 twin, and raw inputs with Intel's
   PyTorch outputs for them (`CASCADIA_POLICY_PACKAGE_<M>_RTC`, `_NORTC`, `_RTC_F32`,
@@ -810,22 +843,24 @@ What runs where, as shipped. Items marked **not shipped** are planned and not in
 
 ## Open questions
 
-1. **GPU precision (decided 2026-11-15, final call after LIBERO).** Measured on an Arc 140V
-   with our SmolVLA noise package and a real, padded prompt, five input draws against CPU f32:
+1. **GPU precision (decided 2026-11-16 after LIBERO: f16 stays the default).** Measured on an
+   Arc 140V with our SmolVLA noise package and a real, padded prompt, five input draws against CPU
+   f32:
 
    | GPU mode | worst max abs (normalized) | mean abs | NaN | p50 latency |
    |---|---|---|---|---|
    | default f16 | 0.009 – 0.122 | 0.0013 – 0.0021 | 0 | 143 ms |
    | `INFERENCE_PRECISION_HINT=f32` | ≤ 3.2e-4 | ~1e-6 | 0 | 346 ms |
 
-   The engine defaults to the GPU's f16 and takes `--precision f16|f32`. The LIBERO accuracy run
-   compares task success at both precisions: if f16 succeeds as often as f32, f16 stays the default;
-   otherwise the default becomes f32. CPU is always f32, because bf16 compute is off by up to 0.66
+   The engine defaults to the GPU's f16 and takes `--precision f16|f32`. LIBERO compared task
+   success at both: SmolVLA 23/30 at f16 and at f32 (one episode differs each way), X-VLA 26/30 at
+   f16 against 27/30 at f32 (one episode) with f32 4.6 times slower. f16 succeeds as often, so it
+   stays the default. CPU is always f32, because bf16 compute is off by up to 0.66
    (step 0).
-2. **Where the LIBERO simulator runs.** Plan: the simulator on a Linux x86 machine (MuJoCo with CPU
-   rendering), the engine on an AI PC's GPU (the f16-versus-f32 comparison needs the GPU), joined
+2. **Where the LIBERO simulator runs (settled).** The simulator on a Linux x86 machine (MuJoCo with
+   CPU rendering), the engine on an AI PC's GPU (the f16-versus-f32 comparison needs the GPU), joined
    by an SSH tunnel. The added network delay doesn't affect an accuracy run,
-   since the simulator waits for each reply. To be confirmed before the run.
+   since the simulator waits for each reply. Every LIBERO run in the tier table ran this way.
 3. **DROID statistics.** openpi publishes DROID norm stats with its checkpoints, but in its own
    format. Can the exporter take them through `--stats`?
 4. **GPU memory.** When an LLM engine and a policy share one box: out of scope for v1 (one engine
