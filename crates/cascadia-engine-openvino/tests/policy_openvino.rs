@@ -2659,8 +2659,13 @@ fn rtc_reference(model: &str, test: &str) -> Option<Vec<u8>> {
     Some(std::fs::read(&path).unwrap_or_else(|e| panic!("{}: {e}", path.display())))
 }
 
-/// Gate 1: guidance 0 (no RTC fields, or the fields with weight 0) is
-/// bit-exact to the package exported without RTC, on CPU f32.
+/// Gate 1: guidance off is the plain chunk. Inside the RTC package, a call
+/// with the fields at `max_guidance_weight` 0 (and a real leftover) is
+/// bit-identical to a call without them, so the guidance contributes exactly
+/// nothing. Against the package Intel's exporter makes without RTC the chunk
+/// agrees within 1e-4: that export traces to a differently folded graph
+/// (SmolVLA: 67,583 ops against 42,757), so the two compile to different
+/// kernels and are not bit-identical even on CPU f32.
 fn rtc_guidance_zero_is_the_plain_chunk(model: &str) {
     let test = format!(
         "{}_rtc_guidance_zero_is_the_plain_chunk",
@@ -2692,22 +2697,24 @@ fn rtc_guidance_zero_is_the_plain_chunk(model: &str) {
     on.rtc = Some(fields);
     let on = rtc.infer(&on).unwrap();
     let bits = |v: &[f32]| v.iter().map(|x| x.to_bits()).collect::<Vec<_>>();
+    let cross = max_abs_diff(&off.actions, &want.actions);
     eprintln!(
-        "{model} cpu: no fields {:.1} ms, weight 0 {:.1} ms, plain package {:.1} ms; \
-         guidance on moves the chunk by {} (max abs)",
+        "{model} cpu: weight 0 vs no fields bit-identical: {}; vs the plain package {cross:.2e} \
+         (max abs); guidance on moves the chunk by {:.4}; {:.1} / {:.1} / {:.1} ms",
+        bits(&zero.actions) == bits(&off.actions),
+        max_abs_diff(&on.actions, &off.actions),
         off.infer_ms,
         zero.infer_ms,
         want.infer_ms,
-        max_abs_diff(&on.actions, &want.actions)
     );
-    assert_eq!(bits(&off.actions), bits(&want.actions), "no RTC fields");
     assert_eq!(
         bits(&zero.actions),
-        bits(&want.actions),
+        bits(&off.actions),
         "max_guidance_weight 0"
     );
+    assert!(cross <= 1e-4, "no RTC fields vs the plain package: {cross}");
     assert!(
-        max_abs_diff(&on.actions, &want.actions) > 1e-3,
+        max_abs_diff(&on.actions, &off.actions) > 1e-3,
         "guidance had no effect"
     );
 }

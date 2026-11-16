@@ -308,9 +308,12 @@ weights `w` from `inference_delay` and `execution_horizon`, and `v_t -= min(c·r
   space the server returned). Any call can go to any server, so replay and failover need nothing
   more. The metadata states `rtc_chunk_size` (T) for an RTC package and null otherwise.
 - **Off by default.** A call without the RTC fields feeds a zero leftover and
-  `max_guidance_weight` 0, which makes the graph's correction exactly zero: the chunk is
-  bit-identical to the same export without RTC (gate 1 below). So robots that do not send the
-  fields, and packages exported without RTC, behave as before.
+  `max_guidance_weight` 0, which makes the graph's correction exactly zero: a call with the fields
+  at weight 0 is bit-identical to one without them. Against the package Intel's exporter makes
+  from the same checkpoint without RTC the chunk is not bit-identical: the RTC trace folds to a
+  smaller graph (SmolVLA: 42,757 IR ops against 67,583; 63 `Cos` against 492), so the two compile
+  to different kernels. They agree within 1.1e-5 on CPU f32, and the RTC package matches PyTorch within
+  1e-6. Robots that do not send the fields, and packages exported without RTC, behave as before.
 - **Checks** (physicalai's `_validate_rtc_inputs`): `1 <= execution_horizon <= T / 2`,
   `0 <= inference_delay <= execution_horizon`, `max_guidance_weight` finite and non-negative,
   the leftover `T × D` finite values. A package without RTC refuses the fields rather than
