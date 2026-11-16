@@ -395,6 +395,7 @@ Limits, all checked before work is queued:
 | `attribution` | the package's `NOTICE` file, else the manifest's `metadata.attribution`, else `policy.source.attribution`; omitted when there is none (GR00T's NVIDIA Open Model License notice) |
 | `resize` | the image step: `center` (`pi05`, `pi0`, `gr00t_image`) or `top_left` (`smolvla_resize`), bilinear, pad 0 before scaling; `stretch` (`vla_jepa_inputs`, `xr0`, `molmoact2`, `smolvla_resize` with `"resize": "stretch"`), no padding |
 | `rtc_chunk_size` | T when the IR has the RTC port group, else null |
+| `manifest_sha256`, `package_sha256`, `precision` | the load, as in "Metadata identity" |
 | `device`, `model`, `prompt_max_bytes` | the server |
 
 `model` is the package directory name unless the embedder sets `OvPolicyOptions.model_id`; then
@@ -551,10 +552,43 @@ counted) before the next call, and the bridge warns once when the upstream is sl
 client's budget. `reset` closes the upstream connection, so a new episode starts on a fresh one.
 
 **Metadata identity.** So a bridge can answer the handshake and a client can tell whether two
-servers serve the same policy, `PolicySpec` carries `manifest_sha256` and `precision` (`f16` or
-`f32`, as compiled), and the socket metadata adds `policy_name`, `chunk_size` and `rtc_chunk_size`
-(null). The socket metadata bytes hold no timing, so two loads of one package at one precision send
-identical bytes; the slowest warmup call appears only in `GET /v1/policy/metadata` as `warmup_ms`.
+servers serve the same policy, `PolicySpec` carries `manifest_sha256`, `package_sha256` and
+`precision` (`f16` or `f32`, as compiled), and the socket metadata adds `policy_name`, `chunk_size`
+and `rtc_chunk_size` (null). The socket metadata bytes hold no timing, so two loads of one package
+at one precision send identical bytes; the slowest warmup call appears only in
+`GET /v1/policy/metadata` as `warmup_ms`.
+
+- `manifest_sha256` is the SHA-256 of `manifest.json` alone, as Intel's handshake defines it. Two
+  packages whose manifests are byte-identical but whose other files differ (an int8 and an f16
+  weights file under one manifest) share it, so it is not enough to tell two servers apart.
+- `package_sha256` (`cascadia_engine_openvino::policy::package_sha256`) covers every file in the
+  package directory: `sha256sum` of the `sha256sum` listing (`<hex>  <path>`) of every file, by
+  `/`-separated path relative to the package, sorted bytewise, so it can be checked by hand with
+  `cd <pkg> && find . -type f | sed 's|^\./||' | LC_ALL=C sort | tr '\n' '\0' | xargs -0 sha256sum
+  | sha256sum` (for a package without symlinks). A copied package has the same digest; any added,
+  removed, renamed or changed file changes it. A symlink to a file counts as that file's content
+  under the link's path, wherever it points, because a Hub snapshot is made of links into its blob
+  store (see `confine_artifact`). A symlink to a directory, a dangling symlink, any other non-file,
+  and a name `sha256sum` would escape (not UTF-8, `\` or a newline) refuse the load, naming the
+  entry. Nothing is ignored, OS metadata files (`.DS_Store`, `Thumbs.db`) included: an extra file
+  can only make two equal packages look different, which refuses a failover, never the reverse. The
+  one exception is `OvPolicyOptions.cache_dir` when it lies inside the package: the compile cache
+  never changes outputs and is written after the digest is taken. It is computed at load, before
+  the compile, reading every file once. The key is left out of
+  the metadata when empty, so a spec built without a package (the mock engine, tests) sends the
+  bytes it sent before; a loaded package now sends one more key, so its socket metadata bytes, and
+  any hash of them, change once with this release. That is the point: the old bytes were the same
+  for packages that compute different actions.
+- `OvPolicyEngine::engine_build()` names the engine that computes the actions:
+  `cascadia-ov-policy/<crate version>+<git sha> openvino/<runtime build>`, where the sha is the
+  commit the crate was built from (`unknown` outside a git checkout) and the runtime build is
+  `ov::get_version().buildNumber` of the OpenVINO runtime actually loaded, not the one compiled
+  against. It has no time or host in it, so two builds of one commit on one runtime give the same
+  string, and `engine_build(runtime)` gives it for any runtime string. It is not in the metadata
+  bytes. A build from a modified working tree reports its `HEAD` commit.
+- Two servers compute the same actions for a request when `package_sha256`, `precision`, `device`
+  and `engine_build` agree; a client that fails a session over from one server to another should
+  require all four (the socket metadata carries the first three).
 
 ## Code layout
 

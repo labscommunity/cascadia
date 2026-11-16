@@ -143,6 +143,13 @@ pub struct PolicySpec {
     /// The precision the model was compiled at (`f16` or `f32`).
     #[serde(default)]
     pub precision: String,
+    /// SHA-256 (lowercase hex) over every file in the package, the
+    /// manifest's and any other (`package_sha256` in the OpenVINO engine), so
+    /// packages that differ only in a file the manifest does not name (int8
+    /// and f16 weights) advertise different metadata. Empty when unknown, and
+    /// then left out of the metadata.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub package_sha256: String,
     /// How the server may resize a frame of another size to `height x width`:
     /// this package's own preprocessor resize, ported exactly. `None`: a client
     /// must send `height x width`.
@@ -185,6 +192,7 @@ mod tests {
             attribution: None,
             manifest_sha256: String::new(),
             precision: String::new(),
+            package_sha256: String::new(),
             server_resize: None,
             rtc_chunk_size: None,
         };

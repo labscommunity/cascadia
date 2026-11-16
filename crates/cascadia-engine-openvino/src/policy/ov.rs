@@ -41,6 +41,7 @@ impl Default for OvPolicyOptions {
 
 pub struct OvPolicyEngine {
     pipeline: PolicyPipeline,
+    engine_build: String,
 }
 
 impl OvPolicyEngine {
@@ -50,6 +51,14 @@ impl OvPolicyEngine {
     /// the plugin cannot say, or after `close`.
     pub fn gpu_memory_bytes(&self) -> Option<u64> {
         self.pipeline.gpu_memory_bytes()
+    }
+
+    /// The engine that computes this package's actions: this engine's version
+    /// and commit and the OpenVINO runtime loaded ([`super::engine_build`]).
+    /// With the spec's `package_sha256` and `precision` it says whether two
+    /// servers compute the same actions.
+    pub fn engine_build(&self) -> &str {
+        &self.engine_build
     }
 
     /// Load, compile and check a package directory. Nothing is served from a
@@ -75,6 +84,13 @@ impl OvPolicyEngine {
 
         let model = served_model(dir, opts.model_id.as_deref())?;
         let manifest = PolicyManifest::load(dir, opts.manifest)?;
+        // Before the compile can write a cache, which is not the package.
+        let package_sha256 =
+            super::package::package_sha256_skipping(dir, opts.cache_dir.as_deref())
+                .map_err(|e| EngineError::InvalidConfig(format!("{}: {e}", dir.display())))?;
+        let runtime = cascadia_ov_genai_shim::ov_version()
+            .map_err(|e| EngineError::Backend(format!("reading the OpenVINO version: {e}")))?;
+        let engine_build = super::package::engine_build(&runtime.runtime_core);
         let (device, mut config) = compile_config(&opts.device, opts.precision)?;
         if let Some(cache) = &opts.cache_dir {
             config = config.with("CACHE_DIR", utf8(cache)?);
@@ -118,8 +134,11 @@ impl OvPolicyEngine {
             has_random_uniform,
             Box::new(tokenizer),
         )?;
-        pipeline.set_identity(manifest_sha256, precision);
-        Ok(Self { pipeline })
+        pipeline.set_identity(manifest_sha256, package_sha256, precision);
+        Ok(Self {
+            pipeline,
+            engine_build,
+        })
     }
 }
 

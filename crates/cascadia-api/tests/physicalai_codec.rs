@@ -36,6 +36,7 @@ fn spec() -> PolicySpec {
         attribution: None,
         manifest_sha256: "ab".repeat(32),
         precision: "f32".into(),
+        package_sha256: String::new(),
         server_resize: Some(cascadia_types::ServerResize::Letterbox),
         rtc_chunk_size: None,
     }

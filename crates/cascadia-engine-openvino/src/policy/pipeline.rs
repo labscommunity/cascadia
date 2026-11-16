@@ -1897,8 +1897,14 @@ impl PolicyPipeline {
 
 impl PolicyPipeline {
     /// Record which package bytes and precision this pipeline serves.
-    pub fn set_identity(&mut self, manifest_sha256: String, precision: &str) {
+    pub fn set_identity(
+        &mut self,
+        manifest_sha256: String,
+        package_sha256: String,
+        precision: &str,
+    ) {
         self.spec.manifest_sha256 = manifest_sha256;
+        self.spec.package_sha256 = package_sha256;
         self.spec.precision = precision.to_string();
     }
 

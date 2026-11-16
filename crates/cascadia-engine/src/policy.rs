@@ -318,6 +318,7 @@ mod tests {
             attribution: None,
             manifest_sha256: String::new(),
             precision: String::new(),
+            package_sha256: String::new(),
             server_resize: None,
             rtc_chunk_size: None,
         }

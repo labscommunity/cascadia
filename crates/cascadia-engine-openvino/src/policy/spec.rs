@@ -258,6 +258,7 @@ pub fn derive_spec(
         attribution: m.attribution.clone(),
         manifest_sha256: String::new(),
         precision: String::new(),
+        package_sha256: String::new(),
         server_resize: ms.server_resize,
         rtc_chunk_size,
     };

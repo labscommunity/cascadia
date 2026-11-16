@@ -28,6 +28,7 @@ fn spec() -> PolicySpec {
         attribution: None,
         manifest_sha256: String::new(),
         precision: String::new(),
+        package_sha256: String::new(),
         server_resize: None,
         rtc_chunk_size: None,
     }
@@ -433,6 +434,17 @@ fn socket_metadata_is_the_same_on_every_load() {
     let mut other = s.clone();
     other.manifest_sha256 = "ef".repeat(32);
     assert_ne!(first, encode_metadata_for(&other, &load(Some(180))));
+    // Same manifest, different weights file: the package digest tells them apart.
+    let mut weights = s.clone();
+    weights.package_sha256 = "01".repeat(32);
+    let with_digest = encode_metadata_for(&weights, &load(Some(180)));
+    assert_ne!(first, with_digest);
+    let mut int8 = weights.clone();
+    int8.package_sha256 = "02".repeat(32);
+    assert_ne!(with_digest, encode_metadata_for(&int8, &load(Some(180))));
+    assert_eq!(decode_metadata(&with_digest).unwrap().0, weights);
+    // Without a digest the key is absent, so those bytes are as before.
+    assert!(!first.windows(14).any(|w| w == b"package_sha256"));
     let (back, id) = decode_metadata(&first).unwrap();
     assert_eq!(back, s);
     assert_eq!(id.policy_name, "smolvla");
@@ -462,6 +474,7 @@ fn non_rtc_metadata_bytes_are_unchanged_in_both_map_modes() {
         attribution: None,
         manifest_sha256: "ab".repeat(32),
         precision: "f16".into(),
+        package_sha256: String::new(),
         server_resize: Some(cascadia_types::ServerResize::Letterbox),
         rtc_chunk_size: None,
     };
