@@ -277,6 +277,7 @@ def test_manifest_pins_the_keys_the_engine_reads():
     assert m["layer_types"] == _layer_types(64)
     assert m["source"] == "Qwen3.8-27B-int4-ov"
     assert m["last_logits_only"] is True
+    assert "final_hidden_output" not in m  # written only when true: chat manifests match main byte for byte
     assert m["stages"] == []
 
 

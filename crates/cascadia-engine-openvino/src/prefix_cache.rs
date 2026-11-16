@@ -102,6 +102,69 @@ pub(crate) fn kv_seq_from_framed_blob(blob: &[u8]) -> Option<usize> {
     kv_seq_from_parts(&unframe_blobs(blob)?)
 }
 
+/// Exact snapshot size model `(fixed, per_token)` read from one snapshot's per-stage
+/// `get_state_blob` parts (same layout as [`kv_seq_from_blob`]): a snapshot at `len` tokens is
+/// `fixed + per_token × len` bytes. Each attention KV state (rank ≥ 3, not `conv`/`ssm`) holds
+/// `nb / shape[2]` bytes per token at its own precision; everything else (recurrent state,
+/// names, shapes, counts) is fixed. One blob at any depth is enough, so the engine's warmup
+/// state gives the slope before the first request (P4-CE-1). `None` when a part does not parse
+/// exactly, a KV state's bytes are not a whole multiple of its depth, or no KV state is found.
+pub(crate) fn state_size_model(parts: &[Vec<u8>]) -> Option<(usize, usize)> {
+    fn u32_at(b: &[u8], p: usize) -> Option<u32> {
+        Some(u32::from_le_bytes(
+            b.get(p..p.checked_add(4)?)?.try_into().ok()?,
+        ))
+    }
+    fn u64_at(b: &[u8], p: usize) -> Option<u64> {
+        Some(u64::from_le_bytes(
+            b.get(p..p.checked_add(8)?)?.try_into().ok()?,
+        ))
+    }
+    let (mut fixed, mut per_token, mut kv_states) = (0usize, 0usize, 0usize);
+    for blob in parts {
+        let mut p = 0usize;
+        let count = u32_at(blob, p)?;
+        p += 4;
+        let mut kv_bytes = 0usize;
+        for _ in 0..count {
+            let name_len = u32_at(blob, p)? as usize;
+            let name_at = p.checked_add(4)?;
+            let name = blob.get(name_at..name_at.checked_add(name_len)?)?;
+            let n = String::from_utf8_lossy(name);
+            let recurrent = n.contains("conv") || n.contains("ssm");
+            p = name_at.checked_add(name_len)?;
+            let rank = *blob.get(p.checked_add(1)?)? as usize;
+            p = p.checked_add(2)?;
+            let mut seq = 0usize;
+            for i in 0..rank {
+                let d = u64_at(blob, p)? as usize;
+                p = p.checked_add(8)?;
+                if i == 2 {
+                    seq = d;
+                }
+            }
+            let nb = u64_at(blob, p)? as usize;
+            p = p.checked_add(8)?.checked_add(nb)?;
+            if p > blob.len() {
+                return None;
+            }
+            if rank >= 3 && !recurrent {
+                if seq == 0 || !nb.is_multiple_of(seq) {
+                    return None;
+                }
+                per_token = per_token.checked_add(nb / seq)?;
+                kv_bytes = kv_bytes.checked_add(nb)?;
+                kv_states += 1;
+            }
+        }
+        if p != blob.len() {
+            return None;
+        }
+        fixed = fixed.checked_add(blob.len() - kv_bytes)?;
+    }
+    (kv_states > 0).then_some((fixed, per_token))
+}
+
 /// Frame N opaque per-stage blobs into one: `u32 count | (u32 len | bytes)×count`. A rank that holds
 /// several local stages (qwen36 `stages`, dist-spec target+draft) snapshots each and ships the bundle
 /// as a single opaque blob — `OvKvCache` and the wire treat it as one payload. The u32 length is a
@@ -161,8 +224,9 @@ pub(crate) fn unframe_blobs(b: &[u8]) -> Option<Vec<Vec<u8>>> {
 /// box gets 8 GiB of it.
 pub const DEFAULT_PREFIX_CACHE_BYTES: usize = 16 << 30;
 
-/// Snapshots shorter than this are not worth a `get_state_blob` copy.
-pub const MIN_PREFIX_TOKENS: usize = 16;
+/// Snapshots shorter than this are not worth a `get_state_blob` copy (shared with the API, which
+/// never counts a reuse discount below it).
+pub use cascadia_types::MIN_PREFIX_TOKENS;
 
 struct Entry {
     tokens: Vec<u32>,
@@ -190,6 +254,12 @@ pub struct PrefixCache {
     /// The over-budget refusal has been reported once; the condition holds for
     /// every later turn, so warning again would bury the line.
     warned: bool,
+    /// Shortest and longest key length `insert` has seen, with their snapshot
+    /// bytes: the measured size model behind [`Self::estimated_bytes`].
+    size_obs: Option<((usize, usize), (usize, usize))>,
+    /// Lower bound on snapshot bytes seeded at load, `(fixed, per_token)`: see
+    /// [`Self::seed_floor`].
+    floor: Option<(usize, usize)>,
 }
 
 impl PrefixCache {
@@ -203,6 +273,49 @@ impl PrefixCache {
             misses: 0,
             refused_len: None,
             warned: false,
+            size_obs: None,
+            floor: None,
+        }
+    }
+
+    /// Seed a lower bound on snapshot bytes, `fixed + per_token × len`, known before any snapshot
+    /// is taken (the engine derives it from the tree's config.json at load, P3-CE-1). With it,
+    /// [`Self::estimated_bytes`] is never unknown, so a snapshot that can never fit is refused
+    /// before the first request's prefill. A lower bound never refuses a snapshot that fits.
+    pub fn seed_floor(&mut self, fixed: usize, per_token: usize) {
+        self.floor = Some((fixed, per_token));
+    }
+
+    /// Record a measured snapshot size without caching anything (the engine's warmup state, so
+    /// the size model starts from a real blob). No entry, no [`Self::worth_copying`] cut-off.
+    pub fn observe(&mut self, len: usize, bytes: usize) {
+        let obs = (len, bytes);
+        self.size_obs = Some(match self.size_obs {
+            None => (obs, obs),
+            Some((lo, hi)) => (
+                if obs.0 < lo.0 { obs } else { lo },
+                if obs.0 >= hi.0 { obs } else { hi },
+            ),
+        });
+    }
+
+    /// Record a measured snapshot's per-stage parts as the size model, without caching anything
+    /// (the engine's warmup state, P4-CE-1). When the parts parse ([`state_size_model`]) the
+    /// model's line is recorded exactly, as the points `(0, fixed)` and `(1, fixed + per_token)`,
+    /// and returned; otherwise the total is recorded at the parts' KV depth (else one token), a
+    /// single point that only bounds longer keys from below.
+    pub fn observe_state(&mut self, parts: &[Vec<u8>]) -> Option<(usize, usize)> {
+        match state_size_model(parts) {
+            Some((fixed, per_token)) => {
+                self.observe(0, fixed);
+                self.observe(1, fixed.saturating_add(per_token));
+                Some((fixed, per_token))
+            }
+            None => {
+                let len = kv_seq_from_parts(parts).unwrap_or(1);
+                self.observe(len, parts_bytes(parts));
+                None
+            }
         }
     }
 
@@ -252,6 +365,37 @@ impl PrefixCache {
         self.refused_len.is_none_or(|r| len < r)
     }
 
+    /// Estimated snapshot bytes for a `len`-token key, from the snapshots
+    /// `insert` (and [`Self::observe`]) measured: a fixed (DeltaNet) part plus KV
+    /// linear in the key, fitted through the shortest and longest key seen. With
+    /// one length measured, a key at least that long is at least that large
+    /// (monotone). Never below the seeded floor ([`Self::seed_floor`]); `None`
+    /// only when neither a measurement nor a floor bounds it.
+    pub fn estimated_bytes(&self, len: usize) -> Option<usize> {
+        let measured = self.size_obs.and_then(|((l1, b1), (l2, b2))| {
+            if l2 > l1 && b2 >= b1 {
+                let per_token = (b2 - b1) as f64 / (l2 - l1) as f64;
+                Some((b1 as f64 + per_token * (len as f64 - l1 as f64)).max(0.0) as usize)
+            } else {
+                (len >= l2).then_some(b2)
+            }
+        });
+        let floor = self
+            .floor
+            .map(|(fixed, per)| fixed.saturating_add(per.saturating_mul(len)));
+        measured.max(floor)
+    }
+
+    /// Can the cache structurally hold a snapshot at `len` tokens: enabled,
+    /// at least [`MIN_PREFIX_TOKENS`], under the measured over-budget
+    /// threshold ([`Self::worth_copying`]) and an estimated size within the
+    /// budget ([`Self::estimated_bytes`]; unknown counts as fitting, which the
+    /// engine's load-time floor rules out, P3-CE-1). Says
+    /// nothing about eviction: a snapshot that fits can still be evicted later.
+    pub fn can_hold(&self, len: usize) -> bool {
+        self.worth_copying(len) && self.accepts(len, self.estimated_bytes(len).unwrap_or(0))
+    }
+
     /// Cache the per-stage `parts` under `tokens`, replacing an entry with the
     /// same key and evicting least-recently-used entries until it fits. A
     /// snapshot larger than the whole budget (or a key shorter than
@@ -261,6 +405,7 @@ impl PrefixCache {
     /// not pay the same copy again.
     pub fn insert(&mut self, tokens: Vec<u32>, parts: Vec<Vec<u8>>) -> bool {
         let bytes = parts_bytes(&parts);
+        self.observe(tokens.len(), bytes);
         if self.enabled() && bytes > self.budget {
             self.refused_len = Some(
                 self.refused_len
@@ -446,6 +591,66 @@ pub fn plan_snapshots(
         .collect()
 }
 
+/// A lower bound on a snapshot's bytes from the tree's config.json (`text_config` when nested),
+/// `(fixed, per_token)`: the linear-attention layers' recurrent state
+/// (`linear_num_value_heads × linear_key_head_dim × linear_value_head_dim` each) and the
+/// full-attention layers' K and V (`2 × num_key_value_heads × head_dim` per token each), at half
+/// a byte per element, the smallest OpenVINO state precision (u4 KV). Conv state and framing are
+/// left out. Which layers are which comes from `layer_types`, else `full_attention_interval`
+/// over `num_hidden_layers`. `None` when a dimension is missing.
+pub fn config_state_floor(cfg: &serde_json::Value) -> Option<(usize, usize)> {
+    let c = if cfg.get("text_config").is_some() {
+        &cfg["text_config"]
+    } else {
+        cfg
+    };
+    let dim = |k: &str| c[k].as_u64().map(|v| v as usize);
+    let (full, linear) = match c["layer_types"].as_array() {
+        Some(types) => {
+            let count = |t: &str| types.iter().filter(|x| x.as_str() == Some(t)).count();
+            (count("full_attention"), count("linear_attention"))
+        }
+        None => {
+            let (n, every) = (dim("num_hidden_layers")?, dim("full_attention_interval")?);
+            if every == 0 {
+                return None;
+            }
+            (n / every, n - n / every)
+        }
+    };
+    let fixed = linear
+        .checked_mul(dim("linear_num_value_heads")?)?
+        .checked_mul(dim("linear_key_head_dim")?)?
+        .checked_mul(dim("linear_value_head_dim")?)?
+        / 2;
+    let per_token = full
+        .checked_mul(2)?
+        .checked_mul(dim("num_key_value_heads")?)?
+        .checked_mul(dim("head_dim")?)?
+        / 2;
+    Some((fixed, per_token))
+}
+
+/// Which decision `boundaries` (the request's shared prefix, `cache_prefix`)
+/// this pass snapshots: every one past the restored prefix that the cache can
+/// hold ([`PrefixCache::can_hold`]) and does not already hold. Unlike
+/// [`plan_snapshots`] there is no refresh rule: a request whose later passes
+/// were admitted on the shared-prefix discount must find this exact key, even
+/// when the pass restored a shorter entry (another request's state that this
+/// one extends) and the chat rule would judge the copy not worth it.
+pub fn plan_decision_snapshots(
+    prompt: &[u32],
+    boundaries: &[usize],
+    warm_prefix: usize,
+    cache: &PrefixCache,
+) -> Vec<usize> {
+    boundaries
+        .iter()
+        .copied()
+        .filter(|&b| b > warm_prefix && cache.can_hold(b) && !cache.contains(&prompt[..b]))
+        .collect()
+}
+
 /// End of the next prefill span starting at `idx`: `chunk` tokens, clamped
 /// to the prompt length and to the first snapshot position past `idx` so a
 /// span ends exactly on it (the chain state is captured right after that
@@ -620,6 +825,231 @@ mod tests {
         assert_eq!(
             plan_snapshots(&p, &[31, 1500], 0, &c, &costs, bytes),
             vec![1500]
+        );
+    }
+
+    #[test]
+    fn a_decision_prefix_is_snapshotted_whatever_the_refresh_rule() {
+        // P2-CE-1: request A cached its Kev state (key 40); request B's state extends it (its
+        // cache_prefix is 60). B's first pass restores A's entry, so the chat refresh rule sees a
+        // 20-token tail against a 1.2 GB copy and skips the boundary. A decision boundary is
+        // taken anyway: B's later passes must find it.
+        let p = key(200, 0);
+        let mut c = PrefixCache::new(1 << 20);
+        assert!(c.insert(p[..40].to_vec(), blob(10)));
+        let costs = measured_costs();
+        let bytes = 1_200_000_000;
+        assert!(
+            plan_snapshots(&p, &[60], 40, &c, &costs, bytes).is_empty(),
+            "chat behaviour unchanged"
+        );
+        assert_eq!(plan_decision_snapshots(&p, &[60], 40, &c), vec![60]);
+        assert_eq!(plan_decision_snapshots(&p, &[60], 0, &c), vec![60], "cold");
+        // Not past the restored prefix, or already cached: nothing to copy.
+        assert!(plan_decision_snapshots(&p, &[60], 60, &c).is_empty());
+        assert!(c.insert(p[..60].to_vec(), blob(10)));
+        assert!(plan_decision_snapshots(&p, &[60], 40, &c).is_empty());
+        // B's later passes then restore B's own (longer) entry, not A's.
+        assert_eq!(c.longest_prefix(&p[..61]).unwrap().1, 60);
+        // A boundary the cache cannot hold is not copied at all.
+        let mut tiny = PrefixCache::new(1 << 20);
+        assert!(plan_decision_snapshots(&p, &[MIN_PREFIX_TOKENS - 1], 0, &tiny).is_empty());
+        assert!(!tiny.insert(key(40, 0), blob((1 << 20) + 1)));
+        assert!(plan_decision_snapshots(&p, &[60], 0, &tiny).is_empty());
+    }
+
+    #[test]
+    fn can_hold_is_the_structural_check_before_any_prefill() {
+        // Disabled, or a key too short to store: never.
+        assert!(!PrefixCache::new(0).can_hold(1000));
+        let mut c = PrefixCache::new(1000);
+        assert!(!c.can_hold(MIN_PREFIX_TOKENS - 1));
+        assert!(c.can_hold(MIN_PREFIX_TOKENS));
+        // Nothing measured or seeded: the size is unknown, so the snapshot is attempted. The
+        // engine seeds a floor at load, so this only holds for a bare cache.
+        assert_eq!(c.estimated_bytes(10_000), None);
+        assert!(c.can_hold(10_000));
+        // One snapshot measured: a longer key is at least as large (monotone).
+        assert!(c.insert(key(100, 0), blob(300)));
+        assert_eq!(c.estimated_bytes(100), Some(300));
+        assert_eq!(c.estimated_bytes(500), Some(300));
+        assert_eq!(c.estimated_bytes(50), None);
+        // Two lengths measured: fixed state + per-token KV, extrapolated.
+        assert!(c.insert(key(200, 0), blob(500)));
+        assert_eq!(c.estimated_bytes(300), Some(700));
+        assert_eq!(c.estimated_bytes(150), Some(400));
+        assert!(c.can_hold(450), "100 + 2 * 450 = 1000 fits");
+        assert!(!c.can_hold(500), "100 + 2 * 500 = 1100 cannot ever fit");
+        // A measured refusal stays authoritative.
+        assert!(!c.insert(key(300, 0), blob(1001)));
+        assert!(!c.can_hold(300) && c.can_hold(299));
+    }
+
+    #[test]
+    fn a_seeded_size_floor_refuses_before_any_snapshot_was_measured() {
+        // P3-CE-1: on a fresh server nothing has been measured. The floor seeded at load (the
+        // config lower bound, or the warmup's measured blob) must make a snapshot that can never
+        // fit refuse up front, not count as fitting.
+        let mut c = PrefixCache::new(1 << 20);
+        assert!(c.can_hold(9001), "unseeded: unknown");
+        c.seed_floor(25 << 20, 0);
+        assert_eq!(c.estimated_bytes(MIN_PREFIX_TOKENS), Some(25 << 20));
+        assert!(!c.can_hold(MIN_PREFIX_TOKENS) && !c.can_hold(9001));
+        // Fixed bytes plus a per-token term.
+        let mut c = PrefixCache::new(1000);
+        c.seed_floor(100, 2);
+        assert_eq!(c.estimated_bytes(450), Some(1000));
+        assert!(c.can_hold(450) && !c.can_hold(451));
+        // A measured observation recorded without caching anything: no entry, no refusal.
+        c.observe(1, 350);
+        assert!(c.is_empty() && c.live_bytes() == 0 && c.worth_copying(1_000_000));
+        assert_eq!(
+            c.estimated_bytes(100),
+            Some(350),
+            "measured above the floor"
+        );
+        assert_eq!(
+            c.estimated_bytes(400),
+            Some(900),
+            "the floor still bounds it from below"
+        );
+        assert!(!c.can_hold(451));
+        // The measured line through (1, 350) and a real snapshot extrapolates above the floor.
+        assert!(c.insert(key(101, 0), blob(600)));
+        assert_eq!(c.estimated_bytes(201), Some(850));
+        assert!(c.can_hold(250), "350 + 2.5 * 249 fits");
+        assert!(
+            !c.can_hold(300),
+            "350 + 2.5 * 299 > 1000, though the floor alone is 700"
+        );
+    }
+
+    /// A `get_state_blob` blob in the shim's layout: `(name, dtype, shape, element bytes)` per state.
+    fn state_blob(states: &[(&str, &[u64], u64)]) -> Vec<u8> {
+        let mut b = (states.len() as u32).to_le_bytes().to_vec();
+        for (name, shape, elem) in states {
+            b.extend_from_slice(&(name.len() as u32).to_le_bytes());
+            b.extend_from_slice(name.as_bytes());
+            b.push(1); // dtype tag; the size model reads only nb
+            b.push(shape.len() as u8);
+            for d in *shape {
+                b.extend_from_slice(&d.to_le_bytes());
+            }
+            let nb = shape.iter().product::<u64>() * elem;
+            b.extend_from_slice(&nb.to_le_bytes());
+            b.extend(std::iter::repeat_n(0u8, nb as usize));
+        }
+        b
+    }
+
+    /// A small hybrid stage at `seq` tokens: recurrent conv/ssm state (fixed) and f32 KV.
+    fn hybrid_stage(seq: u64) -> Vec<u8> {
+        state_blob(&[
+            ("layer0.conv_state", &[1, 48, 4], 4),
+            ("layer0.ssm_state", &[1, 4, 8, 8], 4),
+            ("layer3.key_cache", &[1, 2, seq, 16], 4),
+            ("layer3.value_cache", &[1, 2, seq, 16], 4),
+            ("layer7.key_cache", &[1, 2, seq, 16], 2),
+            ("layer7.value_cache", &[1, 2, seq, 16], 2),
+        ])
+    }
+
+    #[test]
+    fn the_state_size_model_read_from_one_blob_predicts_every_length() {
+        // P4-CE-1: the warmup blob alone gives the exact per-token slope (each KV state's bytes
+        // over its sequence depth) and the fixed part (recurrent state plus framing), so the size
+        // estimate is exact from the first request, not a lower bound.
+        let warm = vec![hybrid_stage(1), hybrid_stage(1)];
+        let (fixed, per_token) = state_size_model(&warm).unwrap();
+        assert_eq!(per_token, 2 * (2 * 2 * 16 * 4 + 2 * 2 * 16 * 2));
+        for seq in [1u64, 3, 17, 1000] {
+            let at = hybrid_stage(seq).len() * 2;
+            assert_eq!(fixed + per_token * seq as usize, at, "seq {seq}");
+        }
+        // Read at any depth, the model is the same.
+        assert_eq!(
+            state_size_model(&[hybrid_stage(5), hybrid_stage(5)]),
+            Some((fixed, per_token))
+        );
+        // No KV state, or an unparseable blob: no model (the caller falls back).
+        let recurrent_only = state_blob(&[("layer0.ssm_state", &[1, 4, 8, 8], 4)]);
+        assert_eq!(state_size_model(&[recurrent_only]), None);
+        assert_eq!(state_size_model(&[vec![1, 2, 3]]), None);
+        assert_eq!(state_size_model(&[]), None);
+        let mut torn = hybrid_stage(1);
+        torn.pop();
+        assert_eq!(state_size_model(&[torn]), None);
+        let mut trailing = hybrid_stage(1);
+        trailing.push(0);
+        assert_eq!(state_size_model(&[trailing]), None);
+    }
+
+    #[test]
+    fn the_warmup_blob_makes_the_estimate_exact_from_the_first_request() {
+        // P4-CE-1 trace, scaled down: the config floor (half a byte per element) admits a key
+        // whose real snapshot is over the budget; the warmup blob's size model refuses it before
+        // any prefill, and still admits one that fits.
+        let warm = vec![hybrid_stage(1)];
+        let (fixed, per_token) = state_size_model(&warm).unwrap();
+        let real = |len: usize| fixed + per_token * len;
+        let budget = real(400);
+        let mut c = PrefixCache::new(budget);
+        c.seed_floor(fixed / 8, per_token / 8);
+        assert!(c.can_hold(1000), "the floor alone admits a 1000-token key");
+        assert_eq!(c.observe_state(&warm), Some((fixed, per_token)));
+        assert!(c.is_empty() && c.worth_copying(1_000_000));
+        assert_eq!(c.estimated_bytes(1000), Some(real(1000)));
+        assert!(c.can_hold(400) && !c.can_hold(401) && !c.can_hold(1000));
+        // A real snapshot later keeps the line exact.
+        assert!(c.insert(key(300, 0), vec![vec![0; real(300)]]));
+        assert_eq!(c.estimated_bytes(401), Some(real(401)));
+        // No KV state in the blob: its total is recorded as the one-token point, as before.
+        let mut c = PrefixCache::new(budget);
+        let recurrent_only = vec![state_blob(&[("layer0.ssm_state", &[1, 4, 8, 8], 4)])];
+        assert_eq!(c.observe_state(&recurrent_only), None);
+        assert_eq!(c.estimated_bytes(1), Some(recurrent_only[0].len()));
+    }
+
+    #[test]
+    fn config_state_floor_is_a_lower_bound_from_the_model_dims() {
+        // Kev-9B (Qwen3.5-9B text config): 24 linear-attention layers of 32 x 128 x 128 recurrent
+        // state, 8 full-attention layers of 4 KV heads x 256, at half a byte per element (u4, the
+        // smallest OpenVINO state precision).
+        let mut types = Vec::new();
+        for i in 0..32 {
+            types.push(if (i + 1) % 4 == 0 {
+                "full_attention"
+            } else {
+                "linear_attention"
+            });
+        }
+        let dims = serde_json::json!({
+            "linear_num_value_heads": 32, "linear_key_head_dim": 128,
+            "linear_value_head_dim": 128, "num_key_value_heads": 4, "head_dim": 256,
+            "num_hidden_layers": 32,
+        });
+        let mut listed = dims.clone();
+        listed["layer_types"] = serde_json::json!(types);
+        let floor = Some((24 * 32 * 128 * 128 / 2, 8 * 2 * 4 * 256 / 2));
+        assert_eq!(config_state_floor(&listed), floor);
+        // Nested under text_config, as the multimodal config ships it.
+        assert_eq!(
+            config_state_floor(&serde_json::json!({ "text_config": listed })),
+            floor
+        );
+        // No layer_types: full_attention_interval says which layers are full.
+        let mut interval = dims.clone();
+        interval["full_attention_interval"] = serde_json::json!(4);
+        assert_eq!(config_state_floor(&interval), floor);
+        // Missing dims: no bound.
+        assert_eq!(
+            config_state_floor(&serde_json::json!({"vocab_size": 10})),
+            None
+        );
+        assert_eq!(
+            config_state_floor(&dims),
+            None,
+            "which layers are linear is unknown"
         );
     }
 
