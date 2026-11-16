@@ -475,6 +475,42 @@ fn check_ov_devices(r: &mut Report) {
     }
 }
 
+/// `--engine ov-policy` tokenizes prompts with the `openvino_tokenizers` extension, which must sit
+/// beside the loaded OpenVINO core or under `INTEL_OPENVINO_DIR`. `None` on a stub build.
+fn tokenizers_extension_check(
+    openvino: bool,
+    found: impl FnOnce() -> Result<std::path::PathBuf, String>,
+) -> Option<(Level, String, Vec<String>)> {
+    if !openvino {
+        return None; // check_ov_devices already says this is a stub build
+    }
+    Some(match found() {
+        Ok(path) => (Level::Ok, path.display().to_string(), Vec::new()),
+        Err(e) => (
+            Level::Warn,
+            "not found — `--engine ov-policy` cannot tokenize prompts".into(),
+            vec![
+                e,
+                "It ships beside the OpenVINO core library (a release bundle's lib/, or the \
+                 SDK's runtime libraries); point INTEL_OPENVINO_DIR at an SDK that has it."
+                    .into(),
+            ],
+        ),
+    })
+}
+
+fn check_tokenizers_extension(r: &mut Report) {
+    let found = || cascadia_ov_genai_shim::find_tokenizers_extension().map_err(|e| e.to_string());
+    if let Some((level, detail, notes)) =
+        tokenizers_extension_check(cfg!(feature = "openvino"), found)
+    {
+        r.line(level, "OpenVINO tokenizers extension", &detail);
+        for n in notes {
+            r.note(&n);
+        }
+    }
+}
+
 pub fn cmd_doctor(args: DoctorArgs) -> Result<()> {
     println!("cascadia doctor — environment + hardware self-check\n");
 
@@ -488,6 +524,7 @@ pub fn cmd_doctor(args: DoctorArgs) -> Result<()> {
     check_openvino_env(&mut r);
     check_ov_version(&mut r);
     check_ov_devices(&mut r);
+    check_tokenizers_extension(&mut r);
 
     println!("\nsycl-llama:");
     check_sycl_llama(&mut r);
@@ -531,6 +568,31 @@ mod tests {
 
     fn sh() -> &'static std::path::Path {
         std::path::Path::new("/bin/sh")
+    }
+
+    #[test]
+    fn tokenizers_extension_check_lines() {
+        assert!(tokenizers_extension_check(false, || unreachable!()).is_none());
+
+        let (level, detail, notes) =
+            tokenizers_extension_check(true, || Ok("/opt/ov/lib/libopenvino_tokenizers.so".into()))
+                .unwrap();
+        assert!(level == Level::Ok);
+        assert_eq!(detail, "/opt/ov/lib/libopenvino_tokenizers.so");
+        assert!(notes.is_empty());
+
+        let (level, detail, notes) = tokenizers_extension_check(true, || {
+            Err("not found; tried: /x/libopenvino_tokenizers.so".into())
+        })
+        .unwrap();
+        assert!(level == Level::Warn);
+        assert!(detail.contains("--engine ov-policy"), "{detail}");
+        let notes = notes.join("\n");
+        assert!(
+            notes.contains("tried: /x/libopenvino_tokenizers.so"),
+            "{notes}"
+        );
+        assert!(notes.contains("INTEL_OPENVINO_DIR"), "{notes}");
     }
 
     /// A child that writes past the ~64 KiB pipe buffer must not deadlock
