@@ -1,0 +1,32 @@
+# Inputs of the `cascadia export-policy` environment. Not a package: `lock.sh` compiles this into
+# the hashed requirements.txt that the CLI embeds and installs with `uv pip sync`.
+[project]
+name = "cascadia-export-policy-env"
+version = "0"
+requires-python = ">=3.12,<3.13"
+dependencies = [
+  "physicalai-train[pi05,smolvla]",
+  "physicalai",
+  "openvino==2026.4.1",
+  "openvino-tokenizers==2026.4.1.0",
+  "torch==2.11.0",
+  "torchvision",
+]
+
+[tool.uv]
+# physical-ai-studio 8f132416 names an older runtime (8381d43) in its own sources; uv refuses two
+# URLs for one package, so the runtime the engine is ported from (e3dd944) is an override.
+override-dependencies = [
+  "physicalai @ git+https://github.com/openvinotoolkit/physicalai@e3dd9445a188f99c30afd92077b22a927c16b2bb",
+]
+
+[tool.uv.sources]
+physicalai-train = { git = "https://github.com/open-edge-platform/physical-ai-studio", rev = "8f1324161ece2b24f2d38765b6e943ed1961258c", subdirectory = "library" }
+physicalai = { git = "https://github.com/openvinotoolkit/physicalai", rev = "e3dd9445a188f99c30afd92077b22a927c16b2bb" }
+torch = { index = "pytorch-cpu" }
+torchvision = { index = "pytorch-cpu" }
+
+[[tool.uv.index]]
+name = "pytorch-cpu"
+url = "https://download.pytorch.org/whl/cpu"
+explicit = true

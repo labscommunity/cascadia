@@ -31,12 +31,14 @@ use tracing_subscriber::EnvFilter;
 
 pub mod discover;
 pub mod doctor;
+pub mod export_policy;
 pub mod placement;
 pub mod profile;
 pub mod profile_stage;
 pub mod run_placement;
 use discover::{cmd_discover, DiscoverArgs};
 use doctor::{cmd_doctor, DoctorArgs};
+use export_policy::{cmd_export_policy, ExportPolicyArgs};
 use placement::{cmd_place, PlaceArgs};
 use profile::{cmd_profile_devices, ProfileDevicesArgs};
 use profile_stage::{cmd_profile_per_stage, PerStageArgs};
@@ -184,6 +186,10 @@ pub enum Command {
     /// to the text-surgery path (`tools/gemma4_surgery/export_gemma4_text.py`),
     /// while safetensors gemma-4 still uses the torch `export_gemma4.py`.
     Shard(ShardArgs),
+    /// Export a LeRobot SmolVLA or π0.5 checkpoint to a `policy_package` for
+    /// `--engine ov-policy`, in a uv environment of its own. See
+    /// `cascadia export-policy --help`.
+    ExportPolicy(ExportPolicyArgs),
     /// Profile available OV devices on this host against a single
     /// model. Writes `device_profile.json`. See `cascadia
     /// profile-devices --help`. Step 1 of issue #41 (three-tier
@@ -1305,6 +1311,7 @@ pub async fn run(cli: Cli) -> Result<()> {
         Command::Worker(args) => cmd_worker(args).await,
         Command::Discover(args) => cmd_discover(args).await,
         Command::Shard(args) => cmd_shard(args).await,
+        Command::ExportPolicy(args) => cmd_export_policy(args),
         Command::ProfileDevices(args) => cmd_profile_devices(args),
         Command::ProfileStages(args) => cmd_profile_per_stage(args),
         Command::Place(args) => cmd_place(args),
