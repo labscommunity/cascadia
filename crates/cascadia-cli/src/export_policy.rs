@@ -345,6 +345,19 @@ fn gib(bytes: u64) -> String {
     format!("{:.1} GiB", bytes as f64 / GIB as f64)
 }
 
+/// A host torch 2.11 publishes no CPU wheels for (an Intel Mac, Windows on ARM): the export
+/// environment cannot install there.
+pub(crate) fn platform_refusal(os: &str, arch: &str) -> Option<String> {
+    match (os, arch) {
+        ("linux", "x86_64" | "aarch64") | ("windows", "x86_64") | ("macos", "aarch64") => None,
+        _ => Some(format!(
+            "export-policy does not run on {os} {arch}: the PyTorch release it needs (torch \
+             2.11) has no wheels for it. Export on Linux, Windows x86-64 or an Apple-silicon Mac \
+             and copy the package over."
+        )),
+    }
+}
+
 /// The first host-level reason to refuse, in the design's order.
 pub(crate) fn host_refusal(f: &HostFacts) -> Option<String> {
     if f.uv.is_none() {
@@ -365,8 +378,8 @@ pub(crate) fn host_refusal(f: &HostFacts) -> Option<String> {
         Some(v) if v < MIN_UV => {
             return Some(format!(
                 "uv {}.{}.{} is too old: export-policy needs uv {}.{}.{} or newer, which checks \
-                 the hashes of build dependencies and ships Python {PYTHON_VERSION}. Run \
-                 `uv self update` (or reinstall uv: {}).",
+                 the hashes of build dependencies and ships Python {PYTHON_VERSION}. Update uv \
+                 (e.g. `uv self update`, or reinstall with: {}).",
                 v.0,
                 v.1,
                 v.2,
@@ -584,6 +597,9 @@ fn print_terms(p: &Preflight) {
 
 /// Runs the export against `host`; every refusal comes before `prepare_export`.
 pub(crate) fn run_export(args: &ExportPolicyArgs, host: &mut dyn ExportHost) -> Result<()> {
+    if let Some(why) = platform_refusal(std::env::consts::OS, std::env::consts::ARCH) {
+        return Err(anyhow!(why));
+    }
     if let Some(why) = host_refusal(&host.facts()) {
         return Err(anyhow!(why));
     }
@@ -1503,13 +1519,67 @@ mod tests {
     }
 
     #[test]
+    fn refuses_a_platform_without_torch_wheels() {
+        for (os, arch) in [
+            ("macos", "x86_64"),
+            ("windows", "aarch64"),
+            ("freebsd", "x86_64"),
+        ] {
+            let msg = platform_refusal(os, arch).unwrap();
+            assert!(msg.contains(os) && msg.contains("torch 2.11"), "{msg}");
+        }
+        for (os, arch) in [
+            ("linux", "x86_64"),
+            ("linux", "aarch64"),
+            ("windows", "x86_64"),
+            ("macos", "aarch64"),
+        ] {
+            assert_eq!(platform_refusal(os, arch), None, "{os} {arch}");
+        }
+    }
+
+    /// Builds the real export environment with the CLI's own code (needs uv, git and the network):
+    /// `CASCADIA_EXPORT_ENV_ROOT=<dir> cargo test -p cascadia-cli real_export_env_sync --
+    /// --ignored --nocapture`.
+    #[test]
+    #[ignore = "installs the export environment from the network"]
+    fn real_export_env_sync() {
+        let root = PathBuf::from(
+            std::env::var_os("CASCADIA_EXPORT_ENV_ROOT").expect("set CASCADIA_EXPORT_ENV_ROOT"),
+        );
+        let host = UvHost {
+            uv: find_on_path("uv").expect("uv on PATH"),
+            root: root.clone(),
+            work: tempfile::tempdir().unwrap(),
+            preflight_python: None,
+            export_python: None,
+        };
+        let python = host
+            .ensure_env("env", REQUIREMENTS, Some(BUILD_CONSTRAINTS))
+            .unwrap();
+        let id = requirements_id(&format!(
+            "{PYTHON_VERSION}\n{REQUIREMENTS}\n{BUILD_CONSTRAINTS}"
+        ));
+        let argv = sync_args(
+            &python,
+            &root.join(format!("env-{id}.txt")),
+            Some(&root.join(format!("env-{id}-build.txt"))),
+        );
+        println!(
+            "uv --no-config {}",
+            argv.join(std::ffi::OsStr::new(" ")).to_string_lossy()
+        );
+        println!("export env python: {}", python.display());
+    }
+
+    #[test]
     fn refuses_an_old_or_unreadable_uv() {
         let f = HostFacts {
             uv_version: Some((0, 10, 4)),
             ..roomy()
         };
         let msg = host_refusal(&f).unwrap();
-        for want in ["0.10.4", "0.13.6", "uv self update"] {
+        for want in ["0.10.4", "0.13.6", "uv self update", "reinstall with"] {
             assert!(msg.contains(want), "missing {want:?} in {msg}");
         }
         let f = HostFacts {

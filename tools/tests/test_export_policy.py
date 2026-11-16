@@ -14,6 +14,7 @@ if _DIR not in sys.path:
     sys.path.insert(0, _DIR)
 
 import export_policy as ep  # noqa: E402
+import index_guard as ig  # noqa: E402
 
 
 def _normalizer(features, norm=("MEAN_STD", "MEAN_STD"), state_file="pre_step.safetensors"):
@@ -210,6 +211,63 @@ class LoadStats(unittest.TestCase):
         ):
             with self.assertRaisesRegex(ValueError, msg):
                 ep.load_stats(self._write(bad))
+
+
+LOCK = """torchcodec==0.11.1 ; sys_platform == 'darwin' \\
+    --hash=sha256:%s
+    # via lerobot
+physicalai @ git+https://example.invalid/physicalai@abc
+torch==2.11.0+cpu ; sys_platform != 'darwin' \\
+    --hash=sha256:%s
+""" % ("a" * 64, "c" * 64)
+
+
+class IndexGuard(unittest.TestCase):
+    def test_parse_lock(self):
+        pins, hashes = ig.parse_lock(LOCK)
+        self.assertEqual(pins, [("torchcodec", "0.11.1"), ("torch", "2.11.0+cpu")])
+        self.assertEqual(hashes, {"torchcodec": {"a" * 64}, "torch": {"c" * 64}})
+
+    def test_local_version_shadow_is_flagged(self):
+        pins, hashes = ig.parse_lock(LOCK)
+        html = '<a href="/whl/cpu/torchcodec-0.11.1%%2Bcpu-cp312-cp312-win_amd64.whl#sha256=%s">' % (
+            "b" * 64
+        )
+        links = {"torchcodec": ig.wheel_links(html)}
+        self.assertEqual(links["torchcodec"][0][0], "torchcodec-0.11.1+cpu-cp312-cp312-win_amd64.whl")
+        found = ig.shadows(pins, hashes, links)
+        self.assertEqual(len(found), 1)
+        self.assertIn("torchcodec==0.11.1", found[0])
+        hashes["torchcodec"].add("b" * 64)
+        self.assertEqual(ig.shadows(pins, hashes, links), [])
+
+    def test_unreachable_wheels_are_ignored(self):
+        pins, hashes = ig.parse_lock(LOCK)
+        links = {
+            "torchcodec": [
+                ("torchcodec-0.11.1+cpu-cp310-cp310-win_amd64.whl", "d" * 64),
+                ("torchcodec-0.11.2+cpu-cp312-cp312-win_amd64.whl", "d" * 64),
+                ("torchcodec-0.11.10-cp312-cp312-win_amd64.whl", "d" * 64),
+            ],
+            # a local pin matches only itself
+            "torch": [("torch-2.11.0-cp312-cp312-macosx_11_0_arm64.whl", "d" * 64)],
+        }
+        self.assertEqual(ig.shadows(pins, hashes, links), [])
+
+    def test_python_tags(self):
+        for name, ok in (
+            ("x-1-cp312-cp312-win_amd64.whl", True),
+            ("x-1-py3-none-any.whl", True),
+            ("x-1-cp39-abi3-manylinux_2_17_x86_64.whl", True),
+            ("x-1-cp313-abi3-manylinux_2_17_x86_64.whl", False),
+            ("x-1-cp311-cp311-win_amd64.whl", False),
+        ):
+            self.assertEqual(ig.cp312_compatible(name), ok, name)
+
+    def test_committed_lock_takes_torchcodec_cpu_from_the_torch_index(self):
+        with open(os.path.join(_DIR, "requirements.txt"), encoding="utf-8") as f:
+            pins, _ = ig.parse_lock(f.read())
+        self.assertIn(("torchcodec", "0.11.1+cpu"), pins)
 
 
 if __name__ == "__main__":

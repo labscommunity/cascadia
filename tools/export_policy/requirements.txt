@@ -2598,7 +2598,7 @@ toml==0.10.2 \
     --hash=sha256:806143ae5bfb6a3c6e736a764057db0e6a0e05e338b5630894a5f779cabb4f9b \
     --hash=sha256:b3bda1d108d5dd99f4a20d24d9c348e91c4db7ab1b749200bded2f839ccbe68f
     # via draccus
-torch==2.11.0 ; sys_platform == 'darwin' \
+torch==2.11.0 ; platform_machine == 'arm64' and sys_platform == 'darwin' \
     --hash=sha256:072a0d6e4865e8b0dc0dbfe6ebed68fae235124222835ef03e5814d414d8c012 \
     --hash=sha256:23ec7789017da9d95b6d543d790814785e6f30905c5443efa8257d1490d73f79 \
     --hash=sha256:43b35116802c85fb88d99f4a396b8bd4472bfca1dd82e69499e5a4f9b8b4e252 \
@@ -2615,7 +2615,7 @@ torch==2.11.0 ; sys_platform == 'darwin' \
     #   pytorch-lightning
     #   torchmetrics
     #   torchvision
-torch==2.11.0+cpu ; sys_platform != 'darwin' \
+torch==2.11.0+cpu ; platform_machine != 'arm64' or sys_platform != 'darwin' \
     --hash=sha256:1abeaa46fa7532ed35ed79146f4de5d7a9d4b30462c98052ea4ddfe781ea3eca \
     --hash=sha256:2db3ae5404e32cb42b5fcbd94f13607761eaec0cf1687fde95095289d1e26cfb \
     --hash=sha256:3d8a7789e61dbf11f8922672c43354614b9b0debd40899c0a94f1ad9e0bd6bd9 \
@@ -2653,7 +2653,7 @@ torch==2.11.0+cpu ; sys_platform != 'darwin' \
     #   pytorch-lightning
     #   torchmetrics
     #   torchvision
-torchcodec==0.11.1 ; (platform_machine == 'arm64' and sys_platform == 'darwin') or (platform_machine == 'AMD64' and sys_platform == 'linux') or (platform_machine == 'aarch64' and sys_platform == 'linux') or (platform_machine == 'arm64' and sys_platform == 'linux') or (platform_machine == 'x86_64' and sys_platform == 'linux') or sys_platform == 'win32' \
+torchcodec==0.11.1 ; (platform_machine == 'arm64' and sys_platform == 'darwin') or (platform_machine == 'AMD64' and sys_platform == 'linux') or (platform_machine == 'aarch64' and sys_platform == 'linux') or (platform_machine == 'arm64' and sys_platform == 'linux') \
     --hash=sha256:170a3efea64f0cd2c21cee0a233a9e13c67a704b5c5e7ef9aeda31e747ac6885 \
     --hash=sha256:30e8fb461c4551c53b51bc19ab01e7a8c118aa89aa59e7ab110548c6b9ad01ae \
     --hash=sha256:35d7e07394306fbd621e452c336df9b38e89c9487e23b502ce1b7cc5fb5642db \
@@ -2674,14 +2674,30 @@ torchcodec==0.11.1 ; (platform_machine == 'arm64' and sys_platform == 'darwin') 
     --hash=sha256:db66ddce36a6fa35f30fbe1d78b57289fcb53f8f43c1c85923edbe339540c665 \
     --hash=sha256:dd17e1cb3b8c6cdd2f6a522d8822031b169fb10b7ff465d0de748df9af4ea930 \
     --hash=sha256:f1aee486a84247fcaa67870ac5005aa8d382a9839e91e476fa71b5b3d9fda9b7
-    # via lerobot
+    # via
+    #   cascadia-export-policy-env (pyproject.toml)
+    #   lerobot
+torchcodec==0.11.1+cpu ; (platform_machine == 'x86_64' and sys_platform == 'linux') or sys_platform == 'win32' \
+    --hash=sha256:1d4e4a267987bd5f7ff6a75dacbec1630fbec18d68ffbb35c76a36a2309ffd08 \
+    --hash=sha256:55eeff5f1e52bac8172218a46c3581715c8811b4e7d78880e54cf8c64df79e8d \
+    --hash=sha256:608a0e3d35d6b5cc46fdeb7d91e6471f06fc3ae4fa35b9adb5c6f8e2e28232d1 \
+    --hash=sha256:710d16a68bfeabfb89696b563fa400fd6ba95fcebd6ffa808650d5a206d64154 \
+    --hash=sha256:8065cd219360c6516d626409f03466d12aa5a5127fbcd941dd60c0d9587d8f12 \
+    --hash=sha256:97e145b365681bbd6b5013fe5cf148363e928f7f515eff3a3a904d74e545c85c \
+    --hash=sha256:9f299dfc1195a5c8876c33e9b13ff0724b3ba71d8173c023247a7b548e27c670 \
+    --hash=sha256:c6ee02d636e697c4793efc9c3f21c9439aa60c85089804f9ddd26a6dcb981396 \
+    --hash=sha256:cbfefa2850b7171210e1cc7873619bce3688762d8378f124baa7adf66d6ed6fa \
+    --hash=sha256:cf69490a04b1683dbe5a1d44ac64ef1a9e0c5767c46569cbad362b5d754d9905
+    # via
+    #   cascadia-export-policy-env (pyproject.toml)
+    #   lerobot
 torchmetrics==1.9.0 \
     --hash=sha256:a488609948600df52d3db4fcdab02e62aab2a85ef34da67037dc3e65b8512faa \
     --hash=sha256:bfdcbff3dd1d96b3374bb2496eb39f23c4b28b8a845b6a18c313688e0d2d9ca1
     # via
     #   lightning
     #   pytorch-lightning
-torchvision==0.26.0 ; sys_platform == 'darwin' \
+torchvision==0.26.0 ; platform_machine == 'arm64' and sys_platform == 'darwin' \
     --hash=sha256:358fc4726d0c08615b6d83b3149854f11efb2a564ed1acb6fce882e151412d23 \
     --hash=sha256:55bd6ad4ae77be01ba67a410b05b51f53b0d0ee45f146eb6a0dfb9007e70ab3c \
     --hash=sha256:5d63dd43162691258b1b3529b9041bac7d54caa37eae0925f997108268cbf7c4 \
@@ -2692,7 +2708,7 @@ torchvision==0.26.0 ; sys_platform == 'darwin' \
     # via
     #   cascadia-export-policy-env (pyproject.toml)
     #   lerobot
-torchvision==0.26.0+cpu ; sys_platform != 'darwin' \
+torchvision==0.26.0+cpu ; platform_machine != 'arm64' or sys_platform != 'darwin' \
     --hash=sha256:050aaf28cff9c2981ec72dc3f9b4ef77bcf9c9c99330ce426cb06c5bb9e6e726 \
     --hash=sha256:16c4f11eda096dc377e82238c8ebb26c7013622c0f1b2c4dcf85fc70f96c0ea7 \
     --hash=sha256:17f0b542331fc94230b4214c6d123f038af7330fd81019608c0d2402f3bc3079 \

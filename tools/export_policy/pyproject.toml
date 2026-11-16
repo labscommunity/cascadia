@@ -11,6 +11,8 @@ dependencies = [
   "openvino-tokenizers==2026.4.1.0",
   "torch==2.11.0",
   "torchvision",
+  # lerobot's dependency, here only so the source below applies to it.
+  "torchcodec ; (platform_machine == 'arm64' and sys_platform == 'darwin') or (platform_machine == 'AMD64' and sys_platform == 'linux') or (platform_machine == 'aarch64' and sys_platform == 'linux') or (platform_machine == 'arm64' and sys_platform == 'linux') or (platform_machine == 'x86_64' and sys_platform == 'linux') or sys_platform == 'win32'",
 ]
 
 [tool.uv]
@@ -25,6 +27,9 @@ physicalai-train = { git = "https://github.com/open-edge-platform/physical-ai-st
 physicalai = { git = "https://github.com/openvinotoolkit/physicalai", rev = "e3dd9445a188f99c30afd92077b22a927c16b2bb" }
 torch = { index = "pytorch-cpu" }
 torchvision = { index = "pytorch-cpu" }
+# The torch index carries torchcodec as `+cpu` only for these; `==` also matches that local version,
+# so a PyPI pin would lose to it at sync and fail its hash check (index_guard.py catches this).
+torchcodec = { index = "pytorch-cpu", marker = "sys_platform == 'win32' or (sys_platform == 'linux' and platform_machine == 'x86_64')" }
 
 [[tool.uv.index]]
 name = "pytorch-cpu"
