@@ -484,6 +484,7 @@ dependencies = [
  "crc32fast",
  "futures",
  "half",
+ "libc",
  "serde",
  "serde_json",
  "sha2",

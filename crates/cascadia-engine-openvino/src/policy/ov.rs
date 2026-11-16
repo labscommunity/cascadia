@@ -25,6 +25,11 @@ pub struct OvPolicyOptions {
     /// OpenVINO `CACHE_DIR` for the policy compile, so a restart loads the
     /// compiled model from there. The cache never changes outputs.
     pub cache_dir: Option<PathBuf>,
+    /// Top-level file names left out of `PolicySpec.package_sha256`: files a
+    /// deployer writes next to the package that never reach the engine (see
+    /// [`super::package_sha256_with`]). Naming a file the engine reads is a
+    /// load error.
+    pub digest_ignore: Vec<String>,
 }
 
 impl Default for OvPolicyOptions {
@@ -35,6 +40,7 @@ impl Default for OvPolicyOptions {
             manifest: LoadOptions::default(),
             model_id: None,
             cache_dir: None,
+            digest_ignore: Vec::new(),
         }
     }
 }
@@ -84,10 +90,6 @@ impl OvPolicyEngine {
 
         let model = served_model(dir, opts.model_id.as_deref())?;
         let manifest = PolicyManifest::load(dir, opts.manifest)?;
-        // Before the compile can write a cache, which is not the package.
-        let package_sha256 =
-            super::package::package_sha256_skipping(dir, opts.cache_dir.as_deref())
-                .map_err(|e| EngineError::InvalidConfig(format!("{}: {e}", dir.display())))?;
         let runtime = cascadia_ov_genai_shim::ov_version()
             .map_err(|e| EngineError::Backend(format!("reading the OpenVINO version: {e}")))?;
         let engine_build = super::package::engine_build(&runtime.runtime_core);
@@ -97,6 +99,11 @@ impl OvPolicyEngine {
         }
         // Before the compile, which for MolmoAct2 on CPU takes about 20 GB.
         super::pipeline::refuse_known_bad_device(manifest.policy, &device, std::env::consts::ARCH)?;
+        refuse_ignoring_engine_files(&opts.digest_ignore, &manifest)?;
+        // After the cheap refusals, before the compile can write a cache.
+        let package_sha256 =
+            super::package::digest(dir, &opts.digest_ignore, opts.cache_dir.as_deref())
+                .map_err(|e| super::package::digest_error(dir, e))?;
         let xml = dir.join(&manifest.model_artifact);
         let rt = Runtime::compile_inspected(utf8(&xml)?, &device, None, &config)
             .map_err(|e| compile_failed(&xml, &device, opts.precision, map_ov_err(e)))?;
@@ -157,6 +164,34 @@ impl PolicyEngine for OvPolicyEngine {
 
     fn close(&mut self) {
         self.pipeline.close();
+    }
+}
+
+/// Refuse a digest-ignore name the engine itself reads: the manifest, the
+/// licence notice, or a top-level model or tokenizer IR and its weights.
+#[cfg_attr(not(feature = "openvino"), allow(dead_code))]
+fn refuse_ignoring_engine_files(
+    ignore: &[String],
+    manifest: &super::manifest::PolicyManifest,
+) -> EngineResult<()> {
+    let mut read = vec!["manifest.json".to_string(), "NOTICE".to_string()];
+    for xml in [
+        manifest.model_artifact.as_str(),
+        manifest.tokenizer_artifact(),
+    ] {
+        read.push(xml.to_string());
+        read.push(
+            Path::new(xml)
+                .with_extension("bin")
+                .to_string_lossy()
+                .into_owned(),
+        );
+    }
+    match ignore.iter().find(|n| read.contains(n)) {
+        Some(n) => Err(EngineError::InvalidConfig(format!(
+            "digest_ignore names {n:?}, which the engine reads; it must stay in the package identity"
+        ))),
+        None => Ok(()),
     }
 }
 
@@ -223,6 +258,29 @@ pub use native::OvTokenizer;
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_digest_ignore_name_the_engine_reads_is_refused() {
+        let m = super::super::manifest::PolicyManifest::parse(
+            include_str!("../../tests/fixtures/policy/intel-smolvla-libero-manifest.json"),
+            LoadOptions::default(),
+        )
+        .unwrap();
+        let bin = Path::new(&m.model_artifact)
+            .with_extension("bin")
+            .to_string_lossy()
+            .into_owned();
+        for read in [
+            "manifest.json",
+            "NOTICE",
+            m.model_artifact.as_str(),
+            bin.as_str(),
+        ] {
+            let e = refuse_ignoring_engine_files(&[read.to_string()], &m).unwrap_err();
+            assert!(matches!(e, EngineError::InvalidConfig(_)), "{read}");
+        }
+        refuse_ignoring_engine_files(&[".staging-sha256".into()], &m).unwrap();
+    }
 
     #[test]
     fn the_served_model_is_the_model_id_else_the_directory_name() {

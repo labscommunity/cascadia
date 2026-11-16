@@ -19,6 +19,6 @@ pub mod xr0;
 pub use cameras::{images_tensor, CameraLayout, CameraPlan};
 pub use manifest::{LoadOptions, PolicyKind, PolicyManifest};
 pub use ov::{OvPolicyEngine, OvPolicyOptions};
-pub use package::{engine_build, package_sha256};
+pub use package::{engine_build, engine_build_is_known, package_sha256, package_sha256_with};
 pub use pipeline::{compile_config, PolicyPipeline, Precision};
 pub use spec::{derive_spec, IrFacts, ManifestSpec, ServerFacts};

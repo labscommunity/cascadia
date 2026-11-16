@@ -4,9 +4,11 @@
 
 use std::path::{Path, PathBuf};
 
+use cascadia_engine::EngineError;
 use sha2::{Digest, Sha256};
 
-/// The commit the engine was built from (`unknown` outside a git checkout).
+/// The commit the engine was built from: `CASCADIA_GIT_SHA` at build time,
+/// else the git checkout's `HEAD`, else `unknown`.
 const GIT_SHA: &str = env!("CASCADIA_GIT_SHA");
 
 /// SHA-256 (lowercase hex) over every file under `dir`, so two packages that
@@ -21,24 +23,86 @@ const GIT_SHA: &str = env!("CASCADIA_GIT_SHA");
 /// Nothing is ignored, OS metadata files included: an extra file can only
 /// refuse a match, never make two different packages match.
 pub fn package_sha256(dir: &Path) -> std::io::Result<String> {
-    package_sha256_skipping(dir, None)
+    package_sha256_with(dir, &[])
 }
 
-/// [`package_sha256`] without the directory `skip` (the OpenVINO compile
-/// cache, which never changes outputs) when it lies inside `dir`.
-pub(crate) fn package_sha256_skipping(dir: &Path, skip: Option<&Path>) -> std::io::Result<String> {
+/// [`package_sha256`] without the top-level files named in `ignore`: files a
+/// deployer writes next to the package that never reach the engine (a staging
+/// checksum, say). Each is an exact file name, no glob and no path; the same
+/// name in a subdirectory, or a directory of that name, still counts. A name
+/// with a separator, a glob character, `.` or `..` is refused (`InvalidInput`).
+pub fn package_sha256_with(dir: &Path, ignore: &[String]) -> std::io::Result<String> {
+    digest(dir, ignore, None)
+}
+
+/// [`package_sha256_with`], also without the directory `skip` (the OpenVINO
+/// compile cache, which never changes outputs) when it lies inside `dir`.
+pub(crate) fn digest(
+    dir: &Path,
+    ignore: &[String],
+    skip: Option<&Path>,
+) -> std::io::Result<String> {
+    if let Some(bad) = ignore.iter().find(|n| {
+        n.is_empty() || *n == "." || *n == ".." || n.contains(['/', '\\', '*', '?', '[', '\0'])
+    }) {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            format!("digest ignore entry {bad:?} is not a plain file name"),
+        ));
+    }
     let skip = skip.and_then(|p| p.canonicalize().ok());
     let mut files = Vec::new();
-    walk(dir, "", skip.as_deref(), &mut files)?;
+    walk(dir, "", ignore, skip.as_deref(), &mut files)?;
     files.sort_unstable_by(|a, b| a.0.cmp(&b.0));
     let mut listing = Sha256::new();
     for (rel, path) in files {
-        let mut h = Sha256::new();
-        let mut f = std::fs::File::open(&path).map_err(|e| at(&rel, e))?;
-        std::io::copy(&mut f, &mut h).map_err(|e| at(&rel, e))?;
-        listing.update(format!("{}  {rel}\n", hex(&h.finalize())));
+        listing.update(format!("{}  {rel}\n", hash_file(&rel, &path)?));
     }
     Ok(hex(&listing.finalize()))
+}
+
+/// A digest failure as a load error: a deliberate refusal (an entry the
+/// identity cannot cover, a bad ignore name) is the package's or the
+/// caller's fault and stays one; any other I/O error (a file shared or
+/// replaced mid-walk, an interrupted read) may pass, so it is retryable.
+#[cfg_attr(not(feature = "openvino"), allow(dead_code))]
+pub(crate) fn digest_error(dir: &Path, e: std::io::Error) -> EngineError {
+    let msg = format!("{}: {e}", dir.display());
+    match e.kind() {
+        std::io::ErrorKind::InvalidData | std::io::ErrorKind::InvalidInput => {
+            EngineError::InvalidConfig(msg)
+        }
+        _ => EngineError::Backend(msg),
+    }
+}
+
+/// SHA-256 of one file, read in 1 MiB blocks. Opened without blocking where
+/// the platform allows and checked on the open handle, so an entry swapped
+/// for a FIFO after the walk is refused instead of waited on.
+fn hash_file(rel: &str, path: &Path) -> std::io::Result<String> {
+    use std::io::Read;
+    let mut opts = std::fs::OpenOptions::new();
+    opts.read(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        opts.custom_flags(libc::O_NONBLOCK);
+    }
+    let mut f = opts.open(path).map_err(|e| at(rel, e))?;
+    if !f.metadata().map_err(|e| at(rel, e))?.is_file() {
+        return Err(refuse(rel, "is not a regular file"));
+    }
+    let mut h = Sha256::new();
+    let mut buf = vec![0u8; 1 << 20];
+    loop {
+        match f.read(&mut buf) {
+            Ok(0) => break,
+            Ok(n) => h.update(&buf[..n]),
+            Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
+            Err(e) => return Err(at(rel, e)),
+        }
+    }
+    Ok(hex(&h.finalize()))
 }
 
 fn hex(b: &[u8]) -> String {
@@ -59,6 +123,7 @@ fn refuse(rel: &str, why: &str) -> std::io::Error {
 fn walk(
     dir: &Path,
     prefix: &str,
+    ignore: &[String],
     skip: Option<&Path>,
     out: &mut Vec<(String, PathBuf)>,
 ) -> std::io::Result<()> {
@@ -81,11 +146,14 @@ fn walk(
         }
         let path = entry.path();
         let kind = entry.file_type().map_err(|e| at(&rel, e))?;
+        if prefix.is_empty() && !kind.is_dir() && ignore.contains(&rel) {
+            continue;
+        }
         if kind.is_dir() {
             if skip.is_some() && path.canonicalize().ok().as_deref() == skip {
                 continue;
             }
-            walk(&path, &format!("{rel}/"), skip, out)?;
+            walk(&path, &format!("{rel}/"), ignore, skip, out)?;
         } else if kind.is_file() {
             out.push((rel, path));
         } else if kind.is_symlink() {
@@ -111,6 +179,20 @@ pub fn engine_build(openvino_runtime: &str) -> String {
         "cascadia-ov-policy/{}+{GIT_SHA} openvino/{openvino_runtime}",
         env!("CARGO_PKG_VERSION")
     )
+}
+
+/// Whether an [`engine_build`] string names a known commit and runtime. One
+/// that does not (`+unknown`, a build outside git without `CASCADIA_GIT_SHA`)
+/// must never match another, itself included: it cannot tell two engines apart.
+pub fn engine_build_is_known(build: &str) -> bool {
+    let Some(rest) = build.strip_prefix("cascadia-ov-policy/") else {
+        return false;
+    };
+    let Some((engine, runtime)) = rest.split_once(" openvino/") else {
+        return false;
+    };
+    let sha = engine.split_once('+').map_or("", |(_, sha)| sha);
+    !sha.is_empty() && sha != "unknown" && !runtime.is_empty()
 }
 
 #[cfg(test)]
@@ -205,10 +287,7 @@ mod tests {
         let before = package_sha256(&a).unwrap();
         fs::create_dir_all(a.join("ov-cache")).unwrap();
         fs::write(a.join("ov-cache/123.blob"), b"compiled").unwrap();
-        assert_eq!(
-            before,
-            package_sha256_skipping(&a, Some(&a.join("ov-cache"))).unwrap()
-        );
+        assert_eq!(before, digest(&a, &[], Some(&a.join("ov-cache"))).unwrap());
         assert_ne!(before, package_sha256(&a).unwrap());
     }
 
@@ -249,6 +328,122 @@ mod tests {
         symlink(t.path().join("gone"), real.join("dangling")).unwrap();
         let e = package_sha256(&real).unwrap_err().to_string();
         assert!(e.contains("dangling"), "{e}");
+    }
+
+    #[test]
+    fn an_ignored_top_level_file_does_not_count() {
+        let t = tempfile::tempdir().unwrap();
+        let a = package(t.path(), "a", b"w");
+        let b = package(t.path(), "b", b"w");
+        fs::write(b.join(".staging-sha256"), b"bookkeeping").unwrap();
+        let ignore = [".staging-sha256".to_string()];
+        assert_eq!(
+            package_sha256_with(&a, &ignore).unwrap(),
+            package_sha256_with(&b, &ignore).unwrap()
+        );
+        assert_eq!(
+            package_sha256(&a).unwrap(),
+            package_sha256_with(&b, &ignore).unwrap()
+        );
+        assert_ne!(package_sha256(&a).unwrap(), package_sha256(&b).unwrap());
+        // Only at the top: the same name in a subdirectory still counts.
+        fs::write(b.join("ir/.staging-sha256"), b"bookkeeping").unwrap();
+        assert_ne!(
+            package_sha256(&a).unwrap(),
+            package_sha256_with(&b, &ignore).unwrap()
+        );
+    }
+
+    #[test]
+    fn ignore_entries_are_plain_names() {
+        let t = tempfile::tempdir().unwrap();
+        let a = package(t.path(), "a", b"w");
+        for bad in ["", ".", "..", "ir/policy.bin", "a\\b", "*.json"] {
+            let e = package_sha256_with(&a, &[bad.to_string()]).unwrap_err();
+            assert_eq!(e.kind(), std::io::ErrorKind::InvalidInput, "{bad:?}: {e}");
+        }
+    }
+
+    #[test]
+    fn refusals_are_config_errors_and_io_failures_are_retryable() {
+        use cascadia_engine::EngineError;
+        let dir = Path::new("pkg");
+        let refusal = refuse("x", "is a dangling symlink");
+        assert!(matches!(
+            digest_error(dir, refusal),
+            EngineError::InvalidConfig(_)
+        ));
+        let bad_ignore = std::io::Error::new(std::io::ErrorKind::InvalidInput, "bad name");
+        assert!(matches!(
+            digest_error(dir, bad_ignore),
+            EngineError::InvalidConfig(_)
+        ));
+        for kind in [
+            std::io::ErrorKind::NotFound,
+            std::io::ErrorKind::Interrupted,
+            std::io::ErrorKind::PermissionDenied,
+            std::io::ErrorKind::Other,
+        ] {
+            let e = at(
+                "ir/policy.bin",
+                std::io::Error::new(kind, "sharing violation"),
+            );
+            assert!(
+                matches!(digest_error(dir, e), EngineError::Backend(_)),
+                "{kind:?}"
+            );
+        }
+        // A real refusal from a walk.
+        #[cfg(unix)]
+        {
+            let t = tempfile::tempdir().unwrap();
+            let a = package(t.path(), "a", b"w");
+            std::os::unix::fs::symlink(t.path().join("gone"), a.join("x")).unwrap();
+            let e = package_sha256(&a).unwrap_err();
+            assert!(matches!(digest_error(&a, e), EngineError::InvalidConfig(_)));
+        }
+    }
+
+    /// A file swapped for a FIFO after the walk is refused, not waited on.
+    #[cfg(unix)]
+    #[test]
+    fn a_fifo_is_refused_without_blocking() {
+        let t = tempfile::tempdir().unwrap();
+        let fifo = t.path().join("fifo");
+        let ok = std::process::Command::new("mkfifo")
+            .arg(&fifo)
+            .status()
+            .unwrap();
+        assert!(ok.success());
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let _ = tx.send(hash_file("fifo", &fifo).map_err(|e| e.kind()));
+        });
+        let res = rx
+            .recv_timeout(std::time::Duration::from_secs(5))
+            .expect("hashing a FIFO blocked");
+        assert_eq!(res.unwrap_err(), std::io::ErrorKind::InvalidData);
+    }
+
+    #[test]
+    fn an_unknown_commit_never_matches() {
+        assert!(engine_build_is_known(
+            "cascadia-ov-policy/0.2.7+02f48c2969d9a14bbdb5f09b2997dd1c9612dcd2 openvino/2026.4.1-1"
+        ));
+        assert!(!engine_build_is_known(
+            "cascadia-ov-policy/0.2.7+unknown openvino/2026.4.1-1"
+        ));
+        assert!(!engine_build_is_known(
+            "cascadia-ov-policy/0.2.7+abc openvino/"
+        ));
+        assert!(!engine_build_is_known(
+            "cascadia-ov-policy/0.2.7 openvino/2026.4.1-1"
+        ));
+        assert!(!engine_build_is_known(""));
+        assert_eq!(
+            engine_build_is_known(&engine_build("2026.4.1-1")),
+            GIT_SHA != "unknown"
+        );
     }
 
     #[test]

@@ -1,5 +1,7 @@
 //! `CASCADIA_GIT_SHA`: the commit this crate is built from, for
-//! `policy::engine_build`; `unknown` outside a git checkout.
+//! `policy::engine_build`. The build environment's `CASCADIA_GIT_SHA` wins
+//! (a container build without `.git`), then the git checkout's `HEAD`, else
+//! `unknown`.
 
 use std::process::Command;
 
@@ -14,7 +16,14 @@ fn git(args: &[&str]) -> Option<String> {
 }
 
 fn main() {
-    let sha = git(&["rev-parse", "HEAD"]).unwrap_or_else(|| "unknown".into());
+    // A container or tarball build has no .git: pass the commit in.
+    println!("cargo:rerun-if-env-changed=CASCADIA_GIT_SHA");
+    let sha = std::env::var("CASCADIA_GIT_SHA")
+        .ok()
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+        .or_else(|| git(&["rev-parse", "HEAD"]))
+        .unwrap_or_else(|| "unknown".into());
     println!("cargo:rustc-env=CASCADIA_GIT_SHA={sha}");
     // Rebuild on a new commit or checkout, not only when this crate changes.
     let mut watched = vec!["HEAD".to_string(), "packed-refs".to_string()];

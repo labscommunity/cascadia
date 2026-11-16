@@ -576,11 +576,21 @@ at one precision send identical bytes; the slowest warmup call appears only in
   under the link's path, wherever it points, because a Hub snapshot is made of links into its blob
   store (see `confine_artifact`). A symlink to a directory, a dangling symlink, any other non-file,
   and a name `sha256sum` would escape (not UTF-8, `\` or a newline) refuse the load, naming the
-  entry. Nothing is ignored, OS metadata files (`.DS_Store`, `Thumbs.db`) included: an extra file
-  can only make two equal packages look different, which refuses a failover, never the reverse. The
-  one exception is `OvPolicyOptions.cache_dir` when it lies inside the package: the compile cache
-  never changes outputs and is written after the digest is taken. It is computed at load, before
-  the compile, reading every file once. The key is left out of
+  entry. Each file is opened without blocking (unix) and checked to be a regular file on the open
+  handle, so an entry swapped for a FIFO after the walk is refused instead of waited on. Nothing is
+  ignored by default, OS metadata files (`.DS_Store`, `Thumbs.db`) included: an extra file can only
+  make two equal packages look different, which refuses a failover, never the reverse. Two
+  exceptions. `OvPolicyOptions.cache_dir`, when it lies inside the package: the compile cache never
+  changes outputs and is written after the digest is taken. And `OvPolicyOptions.digest_ignore`
+  (`package_sha256_with(dir, ignore)`), empty by default: exact top-level file names, no globs and
+  no paths, for files a deployer writes next to the package that never reach the engine (a staging
+  checksum, say), so two nodes staged by one deployer with the same files still match. The same
+  name in a subdirectory still counts, and naming a file the engine reads (`manifest.json`,
+  `NOTICE`, a top-level model or tokenizer IR or its `.bin`) is a load error. The digest is taken
+  at load after the cheap refusals (device, manifest) and before the compile, reading every file
+  once in 1 MiB blocks. A refusal (an entry above, a bad ignore name) is a configuration error; any
+  other I/O error while hashing (a file shared or replaced mid-walk, an interrupted read) is a
+  backend error, which a caller may retry. The key is left out of
   the metadata when empty, so a spec built without a package (the mock engine, tests) sends the
   bytes it sent before; a loaded package now sends one more key, so its socket metadata bytes, and
   any hash of them, change once with this release. That is the point: the old bytes were the same
@@ -589,12 +599,17 @@ at one precision send identical bytes; the slowest warmup call appears only in
   `cascadia-ov-policy/<crate version>+<git sha> openvino/<runtime build>`, where the sha is the
   commit the crate was built from (`unknown` outside a git checkout) and the runtime build is
   `ov::get_version().buildNumber` of the OpenVINO runtime actually loaded, not the one compiled
-  against. It has no time or host in it, so two builds of one commit on one runtime give the same
+  against. The sha is the build environment's `CASCADIA_GIT_SHA` when set (pass it as a build
+  argument in a container or tarball build, which has no `.git`), else the checkout's `HEAD`, else
+  `unknown`. It has no time or host in it, so two builds of one commit on one runtime give the same
   string, and `engine_build(runtime)` gives it for any runtime string. It is not in the metadata
-  bytes. A build from a modified working tree reports its `HEAD` commit.
+  bytes. A build from a modified working tree reports its `HEAD` commit. An `engine_build` with
+  `+unknown` (or otherwise not of this form) never matches anything, itself included, since it
+  cannot tell two engines apart; `engine_build_is_known(&str)` applies that rule.
 - Two servers compute the same actions for a request when `package_sha256`, `precision`, `device`
-  and `engine_build` agree; a client that fails a session over from one server to another should
-  require all four (the socket metadata carries the first three).
+  and `engine_build` agree and `engine_build_is_known` holds; a client that fails a session over
+  from one server to another should require all of that (the socket metadata carries the first
+  three).
 
 ## Code layout
 
