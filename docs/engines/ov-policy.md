@@ -17,10 +17,19 @@ runner `SinglePass`, artifact `openvino`), the policy IR (`.xml` + `.bin`) and t
 The engine executes the manifest's pre- and postprocessing steps exactly; anything it does not know
 is refused at load with an error, never guessed.
 
-Policy kinds: `smolvla`, `pi05`, `pi0`, `xvla`, `evo1`, `vlajepa`, `xr0`, `gr00t_n1d7` and
-`molmoact2`. Intel publishes some packages (for example `OpenVINO/smolvla-libero-fp16-ov` and
-`OpenVINO/pi05-libero-fp16-ov` on Hugging Face); the others come from exporting a LeRobot
-checkpoint (see the design doc's "Exporter" section).
+The engine loads nine policy kinds. Where a package for each comes from:
+
+| Kind | Package source |
+|---|---|
+| `smolvla`, `pi05` | Intel publishes LIBERO packages on Hugging Face (`OpenVINO/smolvla-libero-fp16-ov`, `OpenVINO/pi05-libero-fp16-ov`); `cascadia export-policy <hf-model-id> --out <dir>` exports a LeRobot checkpoint of either kind (design doc, "Exporter"). |
+| `gr00t_n1d7` | Intel's edge-ai-suites single-IR exporter, run on NVIDIA's checkpoint. |
+| `molmoact2` | Intel's exporter in physical-ai-studio. |
+| `pi0`, `xvla`, `evo1`, `vlajepa`, `xr0` | Exported by hand with Intel's physicalai-train exporter, patched or with LeRobot modules per kind. |
+
+`cascadia export-policy` handles only `smolvla` and `pi05`. For the other seven kinds no exporter
+ships with Cascadia yet. The design doc's Scope section and
+[the policy fixtures README](../../crates/cascadia-engine-openvino/tests/fixtures/policy/README.md)
+record how each package was made: which exporter, which revision, which patches.
 
 **Tiers.** A kind is *supported* once it has PyTorch parity, Windows CPU and GPU runs and LIBERO
 task success at f16; until then it is *experimental*: served, with metadata, docs and CLI, but not
@@ -129,7 +138,9 @@ cascadia policy-bridge --zenoh 127.0.0.1:7447 \
   certificate.
 - `--name` sets the slot name; it defaults to the upstream's policy name.
 
-One bridge serves one physicalai client. It ships in the same builds as `--zenoh`.
+One bridge serves one physicalai client. It ships in the same builds as `--zenoh`. Its loopback
+port has no authentication: any process on the same host can call the remote policy through it,
+with the bridge's token. Run it only on a host you trust, such as the robot's own machine.
 
 ## Real-time chunking (RTC)
 

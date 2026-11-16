@@ -192,8 +192,9 @@ jobs:
   zenoh:
     # `zenoh` is off by default, so the `test` job never compiles the physicalai
     # front end (`run --zenoh`, `policy-bridge`) or runs its tests. The release
-    # bundles ship it, so Windows compiles it here too rather than first at tag
-    # time; its tests run on Linux (the zenoh tree has no OpenVINO dependency).
+    # bundles ship it, so Windows compiles the binary with it here too (stub
+    # engines, so the CLI's `--zenoh` serve path and `policy-bridge` are
+    # covered) rather than first at tag time; its tests run on Linux.
     name: zenoh feature (${{ matrix.os }})
     runs-on: ${{ matrix.os }}
     timeout-minutes: 30
@@ -231,7 +232,9 @@ jobs:
 
       - name: Check (Windows, --features zenoh)
         if: runner.os == 'Windows'
-        run: cargo check -p cascadia-api --all-targets --features zenoh
+        run: >
+          cargo check -p cascadia -p cascadia-api -p cascadia-cli --all-targets
+          --features cascadia/zenoh,cascadia-api/zenoh,cascadia-cli/zenoh
 
   # Pre-flight the Linux release compile: the openvino C++ shim (gemv_offload.cpp)
   # is only built with --features openvino on ubuntu-22.04 + g++-12 + OV SDK.

@@ -69,7 +69,10 @@ authentication and no TLS**, like the chat API. So:
 
 To serve a robot over a network, keep the server on loopback and put an
 authenticated TLS hop in front, or use `cascadia policy-bridge
---token-file` against a gateway that checks the token. See
+--token-file` against a gateway that checks the token. The bridge's own
+port is loopback and unauthenticated: any process on the bridge's host can
+call the remote policy through it, with the bridge's token. Run the bridge
+only on a host you trust, such as the robot's own machine. See
 [docs/engines/ov-policy.md](docs/engines/ov-policy.md#security).
 
 ## Deploying beyond a trusted LAN
