@@ -32,6 +32,26 @@ pub struct Observation {
     /// Flow-matching start noise, row-major `[1, *noise_shape]`; only for
     /// [`NoiseMode::Input`] packages.
     pub noise: Option<Vec<f32>>,
+    /// Real-time chunking guidance; only for packages with
+    /// [`PolicySpec::rtc_chunk_size`]. `None` serves the plain chunk.
+    #[serde(default)]
+    pub rtc: Option<RtcInputs>,
+}
+
+/// Real-time chunking (Black et al., arXiv 2506.07339): the new chunk is
+/// denoised toward the part of the previous one the robot has not executed.
+/// The client keeps the action queue, so the server stays stateless.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct RtcInputs {
+    /// The previous chunk's unexecuted actions as the server returned them,
+    /// zero-padded at the end to `[rtc_chunk_size, D]`, row-major.
+    pub prev_chunk_left_over: Vec<f32>,
+    /// Actions the robot executes while this call runs.
+    pub inference_delay: u32,
+    /// Upper bound on the guidance weight; 0 turns guidance off.
+    pub max_guidance_weight: f32,
+    /// Actions of the leftover the new chunk is pulled toward, at most half the chunk.
+    pub execution_horizon: u32,
 }
 
 /// One policy call's output: `actions` is row-major `[steps, dim]`.
@@ -128,6 +148,10 @@ pub struct PolicySpec {
     /// must send `height x width`.
     #[serde(default)]
     pub server_resize: Option<ServerResize>,
+    /// `T` of the `prev_chunk_left_over` a request may send, for a package
+    /// exported with real-time chunking; `None` otherwise.
+    #[serde(default)]
+    pub rtc_chunk_size: Option<usize>,
 }
 
 #[cfg(test)]
@@ -162,6 +186,7 @@ mod tests {
             manifest_sha256: String::new(),
             precision: String::new(),
             server_resize: None,
+            rtc_chunk_size: None,
         };
         let v = serde_json::to_value(&spec).unwrap();
         assert_eq!(v["noise"], "in_graph_random");
@@ -169,6 +194,7 @@ mod tests {
         assert_eq!(v["chunk"], serde_json::json!([10, 7]));
         assert!(v["noise_shape"].is_null());
         assert!(v.get("attribution").is_none());
+        assert!(v["rtc_chunk_size"].is_null());
         assert_eq!(serde_json::from_value::<PolicySpec>(v).unwrap(), spec);
     }
 

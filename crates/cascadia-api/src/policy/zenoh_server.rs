@@ -596,6 +596,7 @@ mod tests {
             manifest_sha256: "ab".repeat(32),
             precision: "f32".into(),
             server_resize: Some(cascadia_types::ServerResize::Letterbox),
+            rtc_chunk_size: None,
         }
     }
 

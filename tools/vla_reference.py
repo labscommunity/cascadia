@@ -41,6 +41,17 @@ def cases():
         "prompt": "pick up the cube",
         "seed": np.int64(7),
     }
+    # Real-time chunking: the leftover [T, D] and the three scalars, as numpy
+    # scalars (`__npgeneric__`) and plain Python numbers.
+    yield "request-rtc.msgpack", {
+        "images": frames(),
+        "state": np.array([0.5, -1.0, 2.25], dtype=np.float32),
+        "prompt": "pick up the cube",
+        "prev_chunk_left_over": np.array([[0.25, -0.5, 1.0], [0.0, 0.0, 0.0]], dtype=np.float32),
+        "inference_delay": np.int64(1),
+        "max_guidance_weight": np.float32(5.0),
+        "execution_horizon": 1,
+    }
     yield "reply.msgpack", {
         "actions": np.array([[0.5, -1.25, 3.0], [0.001, 2.0, -0.0]], dtype=np.float32),
         "server_timing": {"infer_ms": 12.5},

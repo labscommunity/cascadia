@@ -23,6 +23,8 @@ from physicalai.inference.preprocessors.smolvla import ResizeSmolVLA
 from physicalai.inference.preprocessors.vla_jepa import _area_weights, _resize
 from physicalai.inference.preprocessors.xr0 import _resize_image
 from physicalai.inference.remote import _protocol as p
+from physicalai.runtime.execution.rtc import RTCExecution
+from physicalai.runtime.execution.rtc_queue import RTCActionQueue
 from physicalai.transport import derive_port
 
 # The test spec: cameras "image" and "wrist" at 16x16, state 3, chunk [2, 3], noise [1, 2, 3].
@@ -31,6 +33,8 @@ SERVER_ID = "0123456789abcdef0123456789abcdef"
 MANIFEST_SHA256 = "ab" * 32
 # max_payload_bytes for the test spec: 2*16*16*3 + 3*8 + 2*3*4 + 64 + 65536.
 MAX_REQUEST_BYTES = 67184
+# The same spec as an RTC package: plus the leftover, 2*3*4.
+MAX_REQUEST_BYTES_RTC = MAX_REQUEST_BYTES + 24
 
 
 def frame(invert=False):
@@ -66,7 +70,26 @@ def cases():
         "image_codecs": ["jpeg", "raw"],
         "max_request_bytes": MAX_REQUEST_BYTES,
     })
+    yield "metadata-rtc.msgpack", p.encode_message({
+        "protocol_version": 1,
+        "server_id": SERVER_ID,
+        "name": "cell1",
+        "policy": {"name": "smolvla", "manifest_sha256": MANIFEST_SHA256, "backend": "openvino", "device": "CPU"},
+        "chunk_size": 2,
+        "rtc": {"supported": True, "chunk_size": 2},
+        "image_codecs": ["jpeg", "raw"],
+        "max_request_bytes": MAX_REQUEST_BYTES_RTC,
+    })
     yield "predict-raw.msgpack", predict(inputs(), "raw")
+    # The RTC inputs exactly as physicalai's RTCExecution injects them: one action of the
+    # previous chunk executed, the rest padded to [1, T, D], numpy scalars for the rest.
+    queue = RTCActionQueue()
+    prev = np.array([[0.25, -0.5, 1.0], [0.75, 0.5, -1.0]], dtype=np.float32)
+    queue.merge(prev, prev)
+    queue.pop()
+    rtc = RTCExecution(chunk_size=2, execution_horizon=1, max_guidance_weight=5.0)
+    rtc._rtc_queue, rtc._chunk_size = queue, 2
+    yield "predict-rtc.msgpack", predict(rtc._inject_rtc_inputs(inputs()), "raw", seq=7)
     yield "predict-jpeg.msgpack", predict(inputs(), "jpeg")
     # Unbatched frames, float64 state, and noise for an input-mode package.
     values = inputs()

@@ -6,6 +6,7 @@ use cascadia_types::{NoiseMode, PolicySpec, ResizeConvention, ServerResize};
 
 use super::cameras::{CameraLayout, CameraPlan};
 use super::manifest::{ImageStep, PolicyManifest, PostStep, PreStep, StatsStep};
+use super::pipeline::PREV_CHUNK_LEFT_OVER;
 
 /// Facts only the compiled model can give.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -21,6 +22,8 @@ pub struct IrFacts {
     pub noise: NoiseMode,
     /// Dims of the `noise` input after its batch of 1; `Some` exactly when the model has one.
     pub noise_shape: Option<Vec<usize>>,
+    /// The model has the real-time chunking port group, its leftover `[1, *action_shape]`.
+    pub rtc: bool,
 }
 
 /// Facts the server decides.
@@ -213,6 +216,30 @@ pub fn derive_spec(
     }
     // The trimmer only shortens (action_chunk_trimmer.py: `shape[1] > n`).
     let steps = ms.n_action_steps.map_or(ir_steps, |n| n.min(ir_steps));
+    let rtc_chunk_size = if ir.rtc {
+        // The client resends what it has not executed of the chunk it was
+        // served, so the served chunk must be the model's, row for row.
+        if [steps, dim] != ir.action_shape {
+            return refuse(format!(
+                "an RTC package must serve the whole chunk; it serves [{steps}, {dim}] of \
+                 the model's {:?}",
+                ir.action_shape
+            ));
+        }
+        if !m
+            .normalize()
+            .any(|s| s.stats_for(PREV_CHUNK_LEFT_OVER).is_some())
+        {
+            return refuse(
+                "the model takes RTC inputs, but the manifest has no normalize stats for \
+                 prev_chunk_left_over",
+            );
+        }
+        check_len(&mut m.normalize(), PREV_CHUNK_LEFT_OVER, ir_dim)?;
+        Some(ir_steps)
+    } else {
+        None
+    };
     let spec = PolicySpec {
         model: server.model,
         device: server.device,
@@ -229,6 +256,7 @@ pub fn derive_spec(
         manifest_sha256: String::new(),
         precision: String::new(),
         server_resize: ms.server_resize,
+        rtc_chunk_size,
     };
     if let Err(EngineError::InvalidConfig(m)) = cascadia_engine::payload_cap(&spec) {
         return refuse(m);
@@ -260,6 +288,7 @@ mod tests {
             action_shape: [30, 20],
             noise: NoiseMode::Input,
             noise_shape: Some(vec![30, 20]),
+            rtc: false,
         }
     }
 
@@ -321,6 +350,7 @@ mod tests {
             action_shape: [50, 7],
             noise: NoiseMode::InGraphRandom,
             noise_shape: None,
+            rtc: false,
         }
     }
 
@@ -388,6 +418,7 @@ mod tests {
             action_shape: [30, 32],
             noise: NoiseMode::Input,
             noise_shape: Some(vec![30, 32]),
+            rtc: false,
         };
         let (spec, layout) = derive_spec(&m, &ir, server()).unwrap();
         assert_eq!(spec.cameras, vec!["base", "wrist_left"]);
@@ -423,6 +454,7 @@ mod tests {
             action_shape: [50, 7],
             noise: NoiseMode::Input,
             noise_shape: Some(vec![50, 7]),
+            rtc: false,
         };
         let (spec, _) = derive_spec(&m, &ir, server()).unwrap();
         assert_eq!(spec.cameras, vec!["image", "image2"]);
@@ -449,6 +481,7 @@ mod tests {
             action_shape: [7, 7],
             noise: NoiseMode::Input,
             noise_shape: Some(vec![7, 7]),
+            rtc: false,
         };
         let (spec, layout) = derive_spec(&m, &ir, server()).unwrap();
         assert_eq!(spec.cameras, vec!["image", "image2"]);
@@ -522,6 +555,7 @@ mod tests {
             action_shape: [50, 7],
             noise: NoiseMode::Constant,
             noise_shape: None,
+            rtc: false,
         };
         let (spec, _) = derive_spec(&m, &ir, server()).unwrap();
         assert_eq!(spec.cameras, vec!["camera_0", "camera_1"]);
@@ -538,6 +572,7 @@ mod tests {
             action_shape: [50, 7],
             noise: NoiseMode::Input,
             noise_shape: Some(vec![50, 32]),
+            rtc: false,
         }
     }
 

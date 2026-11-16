@@ -2,13 +2,15 @@
 //! (`tools/vla_reference.py msgpack`), and every decoding refusal.
 
 use cascadia_api::policy::{
-    check_reply, decode_request, encode_metadata, encode_reply, max_payload_bytes, metadata_json,
+    check_reply, decode_request, encode_metadata, encode_reply, encode_request, max_payload_bytes,
+    metadata_json,
 };
-use cascadia_types::{ActionChunk, NoiseMode, PolicySpec, ResizeConvention};
+use cascadia_types::{ActionChunk, NoiseMode, PolicySpec, ResizeConvention, RtcInputs};
 
 const REQUEST: &[u8] = include_bytes!("fixtures/policy/request.msgpack");
 const REQUEST_F8: &[u8] = include_bytes!("fixtures/policy/request-f8-state.msgpack");
 const REPLY: &[u8] = include_bytes!("fixtures/policy/reply.msgpack");
+const REQUEST_RTC: &[u8] = include_bytes!("fixtures/policy/request-rtc.msgpack");
 
 fn spec() -> PolicySpec {
     PolicySpec {
@@ -27,6 +29,15 @@ fn spec() -> PolicySpec {
         manifest_sha256: String::new(),
         precision: String::new(),
         server_resize: None,
+        rtc_chunk_size: None,
+    }
+}
+
+/// [`spec`] for an RTC package: leftover `[2, 3]`, so a horizon of at most 1.
+fn rtc_spec() -> PolicySpec {
+    PolicySpec {
+        rtc_chunk_size: Some(2),
+        ..spec()
     }
 }
 
@@ -71,6 +82,9 @@ mod mp {
     }
 }
 
+/// `(dtype, shape, data)` of one array.
+type Array = (&'static str, Vec<u64>, Vec<u8>);
+
 /// Request parts, each overridable, packed in openpi's layout.
 struct Req {
     images: Vec<(&'static str, &'static str, Vec<u64>, Vec<u8>)>,
@@ -78,6 +92,8 @@ struct Req {
     prompt: Option<String>,
     noise: Option<(&'static str, Vec<u64>, Vec<u8>)>,
     extra: Option<&'static str>,
+    /// Leftover, inference_delay (`None`: left out), max_guidance_weight, execution_horizon.
+    rtc: Option<(Array, Option<u64>, f64, u64)>,
 }
 
 fn f32s(v: &[f32]) -> Vec<u8> {
@@ -95,6 +111,7 @@ impl Req {
             prompt: Some("pick up the cube".into()),
             noise: Some(("<f4", vec![1, 2, 3], f32s(&[0.0; 6]))),
             extra: None,
+            rtc: None,
         }
     }
 
@@ -103,7 +120,8 @@ impl Req {
         let n = 2
             + self.prompt.is_some() as u8
             + self.noise.is_some() as u8
-            + self.extra.is_some() as u8;
+            + self.extra.is_some() as u8
+            + self.rtc.as_ref().map_or(0, |r| 3 + r.1.is_some() as u8);
         mp::map(&mut b, n);
         mp::str(&mut b, "images");
         mp::map(&mut b, self.images.len() as u8);
@@ -124,6 +142,19 @@ impl Req {
         if let Some(k) = self.extra {
             mp::str(&mut b, k);
             b.push(0xc0);
+        }
+        if let Some(((dtype, shape, data), delay, weight, horizon)) = &self.rtc {
+            mp::str(&mut b, "prev_chunk_left_over");
+            mp::ndarray(&mut b, dtype, shape, data);
+            if let Some(d) = delay {
+                mp::str(&mut b, "inference_delay");
+                mp::uint(&mut b, *d);
+            }
+            mp::str(&mut b, "max_guidance_weight");
+            b.push(0xcb);
+            b.extend(weight.to_be_bytes());
+            mp::str(&mut b, "execution_horizon");
+            mp::uint(&mut b, *horizon);
         }
         b
     }
@@ -153,6 +184,62 @@ fn decodes_f8_state_and_numpy_scalar_seed() {
     assert_eq!(obs.state, vec![0.5, -1.0, 2.25]);
     assert_eq!(obs.seed, Some(7));
     assert_eq!(obs.noise, None);
+}
+
+#[test]
+fn decodes_openpi_client_rtc_fields() {
+    let obs = decode_request(REQUEST_RTC, &rtc_spec()).unwrap();
+    assert_eq!(
+        obs.rtc,
+        Some(RtcInputs {
+            prev_chunk_left_over: vec![0.25, -0.5, 1.0, 0.0, 0.0, 0.0],
+            inference_delay: 1,
+            max_guidance_weight: 5.0,
+            execution_horizon: 1,
+        })
+    );
+    assert_eq!(obs.noise, None);
+    // A package exported without RTC refuses them rather than ignoring them.
+    let e = decode_request(REQUEST_RTC, &spec()).unwrap_err().0;
+    assert!(e.contains("takes no RTC inputs"), "{e}");
+    // Without the fields an RTC package serves the plain chunk.
+    assert_eq!(decode_request(REQUEST, &rtc_spec()).unwrap().rtc, None);
+}
+
+#[test]
+fn rtc_fields_round_trip_and_take_a_batch_of_one() {
+    let mut obs = decode_request(REQUEST_RTC, &rtc_spec()).unwrap();
+    obs.noise = Some(vec![0.5; 6]);
+    let back = decode_request(&encode_request(&obs, &rtc_spec()), &rtc_spec()).unwrap();
+    assert_eq!(back, obs);
+    // physicalai's runtime sends the leftover as [1, T, D].
+    let rtc = |left: Array, delay: Option<u64>| {
+        let mut r = Req::good();
+        r.rtc = Some((left, delay, 2.5, 1));
+        r
+    };
+    let left = || ("<f4", vec![1, 2, 3], f32s(&[1.0; 6]));
+    let o = decode_request(&rtc(left(), Some(0)).pack(), &rtc_spec()).unwrap();
+    assert_eq!(o.rtc.unwrap().prev_chunk_left_over, vec![1.0; 6]);
+    let e = rtc(("<f4", vec![3, 3], f32s(&[1.0; 9])), Some(0)).err(&rtc_spec());
+    assert!(
+        e.contains("prev_chunk_left_over has shape [3, 3]; expected [2, 3]"),
+        "{e}"
+    );
+    let e = rtc(("<f8", vec![2, 3], vec![0; 48]), Some(0)).err(&rtc_spec());
+    assert!(
+        e.contains("prev_chunk_left_over has dtype <f8; expected <f4"),
+        "{e}"
+    );
+    // All four or none.
+    let e = rtc(left(), None).err(&rtc_spec());
+    assert!(e.contains("RTC needs all of"), "{e}");
+    // The ranges are the engine's.
+    let mut r = rtc(left(), Some(2));
+    r.rtc.as_mut().unwrap().3 = 1;
+    assert!(r
+        .err(&rtc_spec())
+        .contains("inference_delay <= execution_horizon"));
 }
 
 #[test]
@@ -314,9 +401,9 @@ fn metadata_has_every_spec_field() {
     assert_eq!(json["noise_shape"], serde_json::json!([2, 3]));
     assert_eq!(json["resize"], "top_left");
     let packed = encode_metadata(&s);
-    // A map16 of the 14 spec fields (`attribution` omitted when absent) plus
-    // policy_name, chunk_size and rtc_chunk_size; keys are msgpack str, as
-    // Python dicts pack.
+    // A map16 of the 15 spec fields (`attribution` omitted when absent, and
+    // `rtc_chunk_size` among them) plus policy_name and chunk_size; keys are
+    // msgpack str, as Python dicts pack.
     assert_eq!(packed[..3], [0xde, 0, 17]);
     assert_eq!(json["manifest_sha256"], "");
     assert_eq!(json["precision"], "");
@@ -357,6 +444,10 @@ fn max_payload_bytes_follows_the_formula() {
     let s = spec();
     // 2 * 4*4*3 + 3 * 8 + 6 * 4 + 64 + 64 KiB.
     assert_eq!(max_payload_bytes(&s), 96 + 24 + 24 + 64 + 65536);
+    // An RTC package's leftover, [2, 3] f32.
+    assert_eq!(max_payload_bytes(&rtc_spec()), max_payload_bytes(&s) + 24);
+    let json: serde_json::Value = serde_json::from_str(&metadata_json(&rtc_spec())).unwrap();
+    assert_eq!(json["rtc_chunk_size"], 2);
     let mut big = spec();
     big.height = 2048;
     big.width = 2048;

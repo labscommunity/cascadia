@@ -62,6 +62,9 @@ pub struct FeatureStats {
     pub mask: Option<Vec<bool>>,
 }
 
+/// The RTC leftover's key; a `normalize` step holds the action stats under it.
+const RTC_LEFTOVER: &str = "prev_chunk_left_over";
+
 /// A `normalize` or `denormalize` step, holding only the features it applies to.
 #[derive(Clone, Debug, PartialEq)]
 pub struct StatsStep {
@@ -1660,7 +1663,7 @@ fn pre_step(v: &Value) -> EngineResult<PreStep> {
     let (name, params) = component(v, ctx)?;
     let ctx = format!("{ctx}: {name}");
     Ok(match name {
-        "normalize" => PreStep::Normalize(stats_step(params, &ctx, "state")?),
+        "normalize" => PreStep::Normalize(stats_step(params, &ctx, "state", &[RTC_LEFTOVER])?),
         "pi05" => PreStep::Pi05(pi05_step(params, &ctx)?),
         "pi0" => PreStep::Pi0(pi05_step(params, &ctx)?),
         "smolvla_resize" => {
@@ -1981,7 +1984,7 @@ fn post_step(v: &Value) -> EngineResult<PostStep> {
     let (name, params) = component(v, ctx)?;
     let ctx = format!("{ctx}: {name}");
     Ok(match name {
-        "denormalize" => PostStep::Denormalize(stats_step(params, &ctx, "action")?),
+        "denormalize" => PostStep::Denormalize(stats_step(params, &ctx, "action", &[])?),
         "action_chunk_trimmer" => {
             let p: TrimmerParams = typed(params, &ctx)?;
             if p.n_action_steps < 1 {
@@ -2111,9 +2114,15 @@ fn check_shape(s: Option<&[usize]>, ctx: &str) -> EngineResult<()> {
 /// Parse a stats step, keeping only the features it transforms.
 ///
 /// Intel applies a stats entry to the input of the same key and skips keys
-/// absent from the inputs; `target` is the one key this engine transforms
-/// (`state` before the model, `action` after it).
-fn stats_step(params: Map<String, Value>, ctx: &str, target: &str) -> EngineResult<StatsStep> {
+/// absent from the inputs; `target` is the key this engine always transforms
+/// (`state` before the model, `action` after it), `also` keys it transforms
+/// when a call carries them (the RTC leftover).
+fn stats_step(
+    params: Map<String, Value>,
+    ctx: &str,
+    target: &str,
+    also: &[&str],
+) -> EngineResult<StatsStep> {
     let p: StatsParams = typed(params, ctx)?;
     let mode = match p.mode.as_str() {
         "mean_std" => NormMode::MeanStd,
@@ -2166,7 +2175,7 @@ fn stats_step(params: Map<String, Value>, ctx: &str, target: &str) -> EngineResu
         let Some(entry) = stats.get(&key) else {
             continue;
         };
-        if key != target {
+        if key != target && !also.contains(&key.as_str()) {
             // A key the engine never holds is skipped, as Intel does; one it
             // holds but does not transform here would be silently wrong.
             if key == "images" || key.starts_with("images.") || key == "task" || key == "noise" {
@@ -2179,7 +2188,7 @@ fn stats_step(params: Map<String, Value>, ctx: &str, target: &str) -> EngineResu
             feature_stats(entry, mode, bounds, &format!("{ctx}[{key}]"))?,
         ));
     }
-    if mode != NormMode::Identity && features.is_empty() {
+    if mode != NormMode::Identity && features.iter().all(|(k, _)| k != target) {
         return refuse(format!("{ctx}: no stats for {target:?}"));
     }
     if let Some(n) = pad_to {

@@ -118,8 +118,9 @@ promised).
 | `molmoact2` | experimental until LIBERO (parity on one LIBERO frame pair) |
 
 Not in v1: π0-FAST and other policies until each export is checked; NPU; multi-stage
-sharding; per-robot key mappings for existing openpi clients; real-time chunking (RTC) server side;
-server-side image resize; routing across machines.
+sharding; per-robot key mappings for existing openpi clients; server-side image resize; routing
+across machines. Real-time chunking (RTC) is served for packages exported with it (see "Real-time
+chunking"), SmolVLA and π0.5 first.
 
 ## The package contract
 
@@ -280,6 +281,41 @@ keeps only the compiled model afterwards), and reports the mode in the metadata:
 Intel's fix is `physical-ai-studio` `374d2cb9` (2026-11-11, unreleased): exports take `noise` as an
 input. The exporter produces `input`-mode packages only.
 
+### Real-time chunking (RTC)
+
+RTC lets a robot keep executing while the next chunk is computed: the new chunk is denoised as an
+inpainting problem pinned to the part of the previous chunk the robot has not executed yet (Black
+et al., arXiv 2506.07339). The engine uses the identity-Jacobian guidance both shipping
+implementations use (LeRobot `policies/rtc`, physical-ai-studio `mixins/rtc.py`), and it is not
+the engine's code: Intel's exporter traces it into the single-pass graph when the policy is
+exported with `rtc_enabled` (physical-ai-studio `8f132416`, SmolVLA and π0.5). Each denoising step
+then adds a few elementwise ops: `x1 = x_t - t·v_t`, `err = (leftover - x1) · w`, with the prefix
+weights `w` from `inference_delay` and `execution_horizon`, and `v_t -= min(c·r, β) · err`, where
+`β` is `max_guidance_weight`.
+
+- **Ports.** Such a graph has four more inputs: `prev_chunk_left_over` f32 `[1, T, D]` (the served
+  chunk's shape), `inference_delay` i64, `max_guidance_weight` f32 and `execution_horizon` i64
+  (scalars). The engine binds all four or none; any other subset, a leftover that is not the
+  action output's shape, or another scalar shape is a load error. Only the `ImageSlots` layout
+  takes them.
+- **Package.** An RTC package serves the whole chunk (no `action_chunk_trimmer`, no
+  shape-changing postprocessor), since the client resends what it has not executed of that very
+  chunk; anything else is a load error. Its `normalize` step carries the action statistics under
+  `prev_chunk_left_over`, and the engine normalizes the leftover with them before the graph, as
+  physicalai's runtime does; a package without them is refused.
+- **Stateless server.** The client keeps the action queue and sends the leftover on every call, as
+  physicalai's `RTCExecution` does (the leftover zero-padded at the end to `[T, D]`, in the action
+  space the server returned). Any call can go to any server, so replay and failover need nothing
+  more. The metadata states `rtc_chunk_size` (T) for an RTC package and null otherwise.
+- **Off by default.** A call without the RTC fields feeds a zero leftover and
+  `max_guidance_weight` 0, which makes the graph's correction exactly zero: the chunk is
+  bit-identical to the same export without RTC (gate 1 below). So robots that do not send the
+  fields, and packages exported without RTC, behave as before.
+- **Checks** (physicalai's `_validate_rtc_inputs`): `1 <= execution_horizon <= T / 2`,
+  `0 <= inference_delay <= execution_horizon`, `max_guidance_weight` finite and non-negative,
+  the leftover `T × D` finite values. A package without RTC refuses the fields rather than
+  ignoring them.
+
 ## Serving
 
 `cascadia run --engine ov-policy --model <dir>` takes its own path in `cmd_run`, before
@@ -297,7 +333,8 @@ so a browser page cannot open it. Authenticated network access is out of scope.
 
 Limits, all checked before work is queued:
 - WebSocket message cap computed from the spec: the cameras' H×W×3 bytes, state and noise
-  arrays, the prompt cap, plus 64 KiB of framing. Larger messages close the connection.
+  arrays, the RTC leftover (`T × D × 4` bytes, RTC packages only), the prompt cap, plus 64 KiB of
+  framing. Larger messages close the connection.
 - Prompt at most 1 KiB of UTF-8.
 - At most 4 concurrent connections (`--policy-max-connections`); one request in flight per
   connection, as openpi's protocol is synchronous anyway.
@@ -335,6 +372,7 @@ Limits, all checked before work is queued:
 | `noise_shape` | the IR `noise` port, `input` mode only (the decode rule and the message cap need it) |
 | `attribution` | the package's `NOTICE` file, else the manifest's `metadata.attribution`, else `policy.source.attribution`; omitted when there is none (GR00T's NVIDIA Open Model License notice) |
 | `resize` | the image step: `center` (`pi05`, `pi0`, `gr00t_image`) or `top_left` (`smolvla_resize`), bilinear, pad 0 before scaling; `stretch` (`vla_jepa_inputs`, `xr0`, `molmoact2`, `smolvla_resize` with `"resize": "stretch"`), no padding |
+| `rtc_chunk_size` | T when the IR has the RTC port group, else null |
 | `device`, `model`, `prompt_max_bytes` | the server |
 
 `model` is the package directory name unless the embedder sets `OvPolicyOptions.model_id`; then
@@ -363,7 +401,9 @@ NPU stays refused for every policy.
   the path).
 - **Metadata.** On connect the server sends the metadata as one msgpack message.
 - **Request.** One msgpack map: `images` (a map of camera name to array), `state` (array), `prompt`
-  (string), and optional `seed` (int) and `noise` (array).
+  (string), and optional `seed` (int) and `noise` (array). An RTC package also takes
+  `prev_chunk_left_over` (array), `inference_delay` (int), `max_guidance_weight` (float) and
+  `execution_horizon` (int), all four or none.
 - **Reply.** `actions` (array `[T, D]`), plus `server_timing.infer_ms`.
 - **Errors.** A text frame, as openpi does (no HTTP status on a socket).
 
@@ -379,6 +419,9 @@ no Python. Decoding rules:
   finite.
 - `noise`: only for a package in `input` mode (an error otherwise); dtype `<f4`, shape exactly
   `[1, *noise_shape]`; every value finite with |x| ≤ 10.
+- RTC fields: only for a package with `rtc_chunk_size` (an error otherwise). `prev_chunk_left_over`
+  dtype `<f4`, shape `[T, D]` or `[1, T, D]`; the scalars as plain numbers or numpy scalars; the
+  ranges in "Real-time chunking". `None` for any of them counts as absent.
 - Before anything is allocated: `len(data) == itemsize · Π shape`, computed with checked arithmetic.
   Any mismatch is an error naming the expected value.
 - Replies: if any action is non-finite (possible from f16 overflow on the GPU), the call returns an
@@ -404,16 +447,17 @@ server is the proof of wire compatibility, not the version numbers.
   listens on Intel's name-derived port (`20000 + sha256(prefix)[0..4] mod 40000`), which is what the
   client dials when it is given none.
 - Handshake: `server_id` (fresh per start), `name`, `policy` (`name`, `manifest_sha256` = SHA-256 of
-  the package's `manifest.json` bytes, `backend`, `device`), `chunk_size` (T), `rtc` (not offered:
-  `supported: false`), `image_codecs` `["jpeg", "raw"]`, `max_request_bytes` (32 MiB, physicalai's
+  the package's `manifest.json` bytes, `backend`, `device`), `chunk_size` (T), `rtc` (`supported: true` and `chunk_size` T for an RTC
+  package, else `supported: false` and null), `image_codecs` `["jpeg", "raw"]`, `max_request_bytes` (32 MiB, physicalai's
   default, since frames arrive at the camera's resolution). The client's `expected_policy` and `expected_manifest_sha256` check these.
 - Predict: `seq`, `budget_ms` (1 to 60000), `inputs` (tagged `__np__` arrays and string lists) and
   `images` (JPEG or raw RGB, `HxWx3` or `1xHxWx3`), validated in the order Intel's server does.
   The inputs then map onto the same `Observation` as a WebSocket request and pass the same
   `check_observation`: `state` `[D]` or `[1, D]` (float32 or float64), `task` a one-string list
   (the prompt), cameras as `images.<name>` with the advertised names, or a bare `images` for a
-  one-camera package (what Intel's `PolicySource` sends for one camera), and optional `noise` for
-  input-mode packages.
+  one-camera package (what Intel's `PolicySource` sends for one camera), optional `noise` for
+  input-mode packages, and for an RTC package the four inputs `RTCExecution` injects
+  (`prev_chunk_left_over` float32 `[1, T, D]`, the others 0-d numpy arrays).
 - Frames: physicalai's client sends them at the camera's native resolution (unless it is given
   `max_image_side`) and physicalai's server resizes them in the model's preprocessor, so this front
   end runs the package's own first resize, where it is ported exactly, before the observation is
@@ -532,6 +576,8 @@ machine.
   release when one carries the fix.
 - **Chunk length** comes from the checkpoint (`n_action_steps=None`); the loader's default of 50
   rejects 15-step checkpoints.
+- **`--rtc`** exports the RTC port group (SmolVLA and π0.5): the policy's `rtc_enabled` is set and
+  `n_action_steps` is the full chunk, so the package has no trimmer.
 - **Refusals before anything is downloaded:**
   - **Memory.** Less than 32 GiB of available RAM plus free swap (the main gate), or less than
     15 GiB of physical RAM as the OS reports it (a 16 GiB VM reports about 15.6). Measured: 14.3 GB

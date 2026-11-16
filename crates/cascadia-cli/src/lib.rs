@@ -4676,6 +4676,7 @@ mod tests {
             manifest_sha256: String::new(),
             precision: String::new(),
             server_resize: None,
+            rtc_chunk_size: None,
         };
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();

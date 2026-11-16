@@ -12,7 +12,7 @@ pub mod server;
 pub mod zenoh_server;
 
 use cascadia_engine::{check_observation, payload_cap, EngineError, PAYLOAD_MAX_BYTES};
-use cascadia_types::{ActionChunk, Image, NoiseMode, Observation, PolicySpec};
+use cascadia_types::{ActionChunk, Image, NoiseMode, Observation, PolicySpec, RtcInputs};
 
 use msgpack::{Val, Writer};
 
@@ -35,7 +35,15 @@ fn refuse<T>(msg: impl Into<String>) -> Result<T, RequestError> {
     Err(RequestError::new(msg))
 }
 
-const REQUEST_KEYS: &str = "images, state, prompt, and optional seed and noise";
+const REQUEST_KEYS: &str = "images, state, prompt, and optional seed, noise and the RTC fields";
+
+/// The real-time chunking fields: a request sends all four or none.
+const RTC_KEYS: [&str; 4] = [
+    "prev_chunk_left_over",
+    "inference_delay",
+    "max_guidance_weight",
+    "execution_horizon",
+];
 
 /// One `msgpack_numpy` array, borrowed from the message.
 struct NdArray<'a> {
@@ -135,6 +143,57 @@ fn seed(v: Val<'_>) -> Result<Option<u64>, RequestError> {
     }
 }
 
+/// An integer, or a numpy scalar (`__npgeneric__`) holding one.
+fn uint(what: &str, v: Val<'_>) -> Result<u32, RequestError> {
+    let n = match v {
+        Val::Map(entries) => entries
+            .into_iter()
+            .find(|(k, _)| k.key() == Some("data"))
+            .and_then(|(_, d)| d.as_u64()),
+        v => v.as_u64(),
+    };
+    n.and_then(|n| u32::try_from(n).ok()).map_or_else(
+        || refuse(format!("{what} must be a non-negative integer")),
+        Ok,
+    )
+}
+
+/// A number, or a numpy scalar holding one.
+fn number(what: &str, v: Val<'_>) -> Result<f32, RequestError> {
+    let x = match v {
+        Val::Map(entries) => entries
+            .into_iter()
+            .find(|(k, _)| k.key() == Some("data"))
+            .map(|(_, d)| d),
+        v => Some(v),
+    };
+    match x {
+        Some(Val::Float(f)) => Ok(f as f32),
+        Some(Val::UInt(u)) => Ok(u as f32),
+        Some(Val::Int(i)) => Ok(i as f32),
+        _ => refuse(format!("{what} must be a number")),
+    }
+}
+
+/// `prev_chunk_left_over`: `<f4` `[T, D]`, or `[1, T, D]` as physicalai sends it.
+fn leftover(v: Val<'_>, spec: &PolicySpec) -> Result<Vec<f32>, RequestError> {
+    const WHAT: &str = "prev_chunk_left_over";
+    let Some(t) = spec.rtc_chunk_size else {
+        return refuse("this package takes no RTC inputs; export it with RTC enabled");
+    };
+    let a = NdArray::parse(WHAT, v)?;
+    if a.dtype != "<f4" {
+        return refuse(format!("{WHAT} has dtype {}; expected <f4", a.dtype));
+    }
+    let want = [t as u64, spec.chunk[1] as u64];
+    if a.shape.len() == 3 && a.shape[0] == 1 {
+        a.expect_shape(WHAT, &[1, want[0], want[1]])?;
+    } else {
+        a.expect_shape(WHAT, &want)?;
+    }
+    a.floats(WHAT)
+}
+
 fn images(v: Val<'_>, spec: &PolicySpec) -> Result<Vec<(String, Image)>, RequestError> {
     let Val::Map(entries) = v else {
         return refuse("images must be a map of camera name to array");
@@ -173,7 +232,9 @@ fn images(v: Val<'_>, spec: &PolicySpec) -> Result<Vec<(String, Image)>, Request
 ///
 /// The map holds `images` (camera name to `|u1` `[H, W, 3]`), `state` (`<f4`
 /// or `<f8`, `[state_len]`), `prompt`, and optional `seed` and `noise` (`<f4`
-/// `[1, *noise_shape]`, input-mode packages only). Everything
+/// `[1, *noise_shape]`, input-mode packages only). An RTC package also takes
+/// `prev_chunk_left_over` (`<f4` `[rtc_chunk_size, D]`), `inference_delay`,
+/// `max_guidance_weight` and `execution_horizon`, all four or none. Everything
 /// [`check_observation`] covers is checked too, so a returned observation is
 /// ready to queue.
 pub fn decode_request(bytes: &[u8], spec: &PolicySpec) -> Result<Observation, RequestError> {
@@ -181,6 +242,7 @@ pub fn decode_request(bytes: &[u8], spec: &PolicySpec) -> Result<Observation, Re
         return refuse(format!("a request is one msgpack map of {REQUEST_KEYS}"));
     };
     let (mut imgs, mut state, mut prompt, mut sd, mut noise) = (None, None, None, None, None);
+    let (mut left, mut delay, mut weight, mut horizon) = (None, None, None, None);
     let mut seen = Vec::new();
     for (k, v) in entries {
         let Some(key) = k.key() else {
@@ -230,6 +292,11 @@ pub fn decode_request(bytes: &[u8], spec: &PolicySpec) -> Result<Observation, Re
                 a.expect_shape("noise", &want)?;
                 noise = Some(a.floats("noise")?);
             }
+            _ if RTC_KEYS.contains(&key) && v == Val::Nil => {}
+            "prev_chunk_left_over" => left = Some(leftover(v, spec)?),
+            "inference_delay" => delay = Some(uint(key, v)?),
+            "max_guidance_weight" => weight = Some(number(key, v)?),
+            "execution_horizon" => horizon = Some(uint(key, v)?),
             other => {
                 return refuse(format!(
                     "unknown key {other:?}; a request has {REQUEST_KEYS}"
@@ -246,12 +313,25 @@ pub fn decode_request(bytes: &[u8], spec: &PolicySpec) -> Result<Observation, Re
             "missing key {missing:?}; a request has {REQUEST_KEYS}"
         ));
     };
+    let rtc = match (left, delay, weight, horizon) {
+        (None, None, None, None) => None,
+        (Some(prev_chunk_left_over), Some(inference_delay), Some(w), Some(execution_horizon)) => {
+            Some(RtcInputs {
+                prev_chunk_left_over,
+                inference_delay,
+                max_guidance_weight: w,
+                execution_horizon,
+            })
+        }
+        _ => return refuse(format!("RTC needs all of {RTC_KEYS:?}, or none")),
+    };
     let obs = Observation {
         images,
         state,
         prompt,
         seed: sd,
         noise,
+        rtc,
     };
     check_observation(spec, &obs).map_err(|e| match e {
         EngineError::InvalidConfig(m) => RequestError(m),
@@ -336,14 +416,13 @@ impl PackageIdentity {
     }
 }
 
-/// The spec's fields plus `policy_name`, `chunk_size` (T) and `rtc_chunk_size`
-/// (always null: no RTC); `warmup_ms` too when `timing`.
+/// The spec's fields (`rtc_chunk_size` among them) plus `policy_name` and
+/// `chunk_size` (T); `warmup_ms` too when `timing`.
 fn metadata_value(spec: &PolicySpec, id: &PackageIdentity, timing: bool) -> serde_json::Value {
     let mut v = serde_json::to_value(spec).expect("PolicySpec serializes to JSON");
     let o = v.as_object_mut().expect("PolicySpec is an object");
     o.insert("policy_name".into(), id.policy_name.clone().into());
     o.insert("chunk_size".into(), spec.chunk[0].into());
-    o.insert("rtc_chunk_size".into(), serde_json::Value::Null);
     if timing {
         o.insert("warmup_ms".into(), id.warmup_ms.into());
     }
@@ -390,7 +469,10 @@ pub fn decode_metadata(bytes: &[u8]) -> Result<(PolicySpec, PackageIdentity), Re
 /// [`decode_request`] reads. `spec` gives the noise shape.
 pub fn encode_request(obs: &Observation, spec: &PolicySpec) -> Vec<u8> {
     let mut w = Writer::default();
-    let n = 3 + usize::from(obs.seed.is_some()) + usize::from(obs.noise.is_some());
+    let n = 3
+        + usize::from(obs.seed.is_some())
+        + usize::from(obs.noise.is_some())
+        + 4 * usize::from(obs.rtc.is_some());
     w.map(n);
     w.str("images");
     w.map(obs.images.len());
@@ -417,6 +499,18 @@ pub fn encode_request(obs: &Observation, spec: &PolicySpec) -> Vec<u8> {
         let mut shape = vec![1];
         shape.extend(spec.noise_shape.iter().flatten());
         ndarray_header(&mut w, "<f4", &shape, &f32s(noise));
+    }
+    if let Some(rtc) = &obs.rtc {
+        let t = spec.rtc_chunk_size.unwrap_or_default();
+        w.str("prev_chunk_left_over");
+        let shape = [t, spec.chunk[1]];
+        ndarray_header(&mut w, "<f4", &shape, &f32s(&rtc.prev_chunk_left_over));
+        w.str("inference_delay");
+        w.uint(rtc.inference_delay.into());
+        w.str("max_guidance_weight");
+        w.f64(rtc.max_guidance_weight.into());
+        w.str("execution_horizon");
+        w.uint(rtc.execution_horizon.into());
     }
     w.buf
 }

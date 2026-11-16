@@ -11,7 +11,8 @@
 
 use cascadia_engine::{check_observation, EngineError};
 use cascadia_types::{
-    ActionChunk, Image, NoiseMode, Observation, PolicySpec, ResizeConvention, ServerResize,
+    ActionChunk, Image, NoiseMode, Observation, PolicySpec, ResizeConvention, RtcInputs,
+    ServerResize,
 };
 use zune_jpeg::zune_core::bytestream::ZCursor;
 use zune_jpeg::zune_core::colorspace::ColorSpace;
@@ -450,19 +451,59 @@ fn floats(what: &str, a: &NpArray<'_>) -> Result<Vec<f32>, RequestError> {
     }
 }
 
-const INPUT_KEYS: &str = "state, task, images and optional noise";
+const INPUT_KEYS: &str = "state, task, images, and optional noise and the RTC inputs";
+
+/// One number from a 0-d or one-element array (`np.int64(3)` arrives as `int64 []`).
+fn scalar(what: &str, a: &NpArray<'_>) -> Result<f64, RequestError> {
+    let bad = || refuse(format!("{what} must be a single number"));
+    let Some((kind, size)) = np_dtype(a.dtype) else {
+        return bad();
+    };
+    if a.data.len() as u64 != size {
+        return bad();
+    }
+    let mut b = [0u8; 8];
+    b[..size as usize].copy_from_slice(a.data);
+    let x = match (kind, size) {
+        ('i', 1) => i8::from_le_bytes([b[0]]) as f64,
+        ('i', 2) => i16::from_le_bytes([b[0], b[1]]) as f64,
+        ('i', 4) => i32::from_le_bytes([b[0], b[1], b[2], b[3]]) as f64,
+        ('i', 8) => i64::from_le_bytes(b) as f64,
+        ('u', 1) => b[0] as f64,
+        ('u', 2) => u16::from_le_bytes([b[0], b[1]]) as f64,
+        ('u', 4) => u32::from_le_bytes([b[0], b[1], b[2], b[3]]) as f64,
+        ('u', 8) => u64::from_le_bytes(b) as f64,
+        ('f', 4) => f32::from_le_bytes([b[0], b[1], b[2], b[3]]) as f64,
+        ('f', 8) => f64::from_le_bytes(b),
+        _ => return bad(),
+    };
+    Ok(x)
+}
+
+/// A non-negative integer from an integer-typed scalar.
+fn scalar_uint(what: &str, a: &NpArray<'_>) -> Result<u32, RequestError> {
+    let int = np_dtype(a.dtype).is_some_and(|(k, _)| matches!(k, 'i' | 'u'));
+    match scalar(what, a)? {
+        x if int && x >= 0.0 && x <= f64::from(u32::MAX) => Ok(x as u32),
+        _ => refuse(format!("{what} must be a non-negative integer")),
+    }
+}
 
 /// Map physicalai's inputs onto an [`Observation`] for `spec`.
 ///
 /// `state` is `[D]` or `[1, D]`; `task` a one-string list (the prompt);
 /// cameras `images.<name>`, or a bare `images` for a one-camera package;
-/// `noise` `float32 [1, *noise_shape]`, input-mode packages only.
+/// `noise` `float32 [1, *noise_shape]`, input-mode packages only; for an RTC
+/// package `prev_chunk_left_over` `float32 [1, T, D]` (or `[T, D]`) and the
+/// scalars `inference_delay`, `max_guidance_weight`, `execution_horizon`, as
+/// physicalai's `RTCExecution` injects them, all four or none.
 fn observation(
     inputs: Map<'_>,
     images: Vec<(String, Image)>,
     spec: &PolicySpec,
 ) -> Result<Observation, RequestError> {
     let (mut state, mut prompt, mut noise) = (None, None, None);
+    let (mut left, mut delay, mut weight, mut horizon) = (None, None, None, None);
     let mut budget = u64::MAX;
     for (name, v) in inputs {
         let arr = np_array(&v, &mut budget)?;
@@ -498,7 +539,37 @@ fn observation(
                 }
                 noise = Some(floats("noise", &a)?);
             }
-            ("state" | "noise", None) => return refuse(format!("{name} must be a numeric array")),
+            ("prev_chunk_left_over", Some(a)) => {
+                let Some(t) = spec.rtc_chunk_size else {
+                    return refuse("this package takes no RTC inputs; export it with RTC enabled");
+                };
+                if !matches!(a.dtype, "float32" | "<f4") {
+                    return refuse(format!(
+                        "prev_chunk_left_over has dtype {}; expected float32",
+                        a.dtype
+                    ));
+                }
+                let (t, d) = (t as u64, spec.chunk[1] as u64);
+                if a.shape != [1, t, d] && a.shape != [t, d] {
+                    return refuse(format!(
+                        "prev_chunk_left_over has shape {:?}; expected [1, {t}, {d}]",
+                        a.shape
+                    ));
+                }
+                left = Some(floats(name, &a)?);
+            }
+            ("inference_delay", Some(a)) => delay = Some(scalar_uint(name, &a)?),
+            ("execution_horizon", Some(a)) => horizon = Some(scalar_uint(name, &a)?),
+            ("max_guidance_weight", Some(a)) => weight = Some(scalar(name, &a)? as f32),
+            (
+                "state"
+                | "noise"
+                | "prev_chunk_left_over"
+                | "inference_delay"
+                | "execution_horizon"
+                | "max_guidance_weight",
+                None,
+            ) => return refuse(format!("{name} must be a numeric array")),
             (other, _) => {
                 return refuse(format!(
                     "unknown input {other:?}; a request has {INPUT_KEYS}"
@@ -537,12 +608,30 @@ fn observation(
             "missing input \"task\"; a request has {INPUT_KEYS}"
         ));
     };
+    let rtc = match (left, delay, weight, horizon) {
+        (None, None, None, None) => None,
+        (Some(prev_chunk_left_over), Some(inference_delay), Some(w), Some(execution_horizon)) => {
+            Some(RtcInputs {
+                prev_chunk_left_over,
+                inference_delay,
+                max_guidance_weight: w,
+                execution_horizon,
+            })
+        }
+        _ => {
+            return refuse(
+                "RTC needs all of prev_chunk_left_over, inference_delay, max_guidance_weight \
+                 and execution_horizon, or none",
+            )
+        }
+    };
     let obs = Observation {
         images: cameras,
         state,
         prompt,
         seed: None,
         noise,
+        rtc,
     };
     check_observation(spec, &obs).map_err(|e| match e {
         EngineError::InvalidConfig(m) => RequestError(m),
@@ -637,7 +726,8 @@ fn write_seq(w: &mut Writer, seq: i128) {
     }
 }
 
-/// The handshake reply. `chunk_size` is the chunk's T; RTC is not offered.
+/// The handshake reply. `chunk_size` is the chunk's T; RTC is offered with
+/// its chunk size for a package exported with it.
 pub fn encode_metadata(id: &ServerIdentity, spec: &PolicySpec, max_request_bytes: u64) -> Vec<u8> {
     let mut w = Writer::default();
     w.map(8);
@@ -662,9 +752,12 @@ pub fn encode_metadata(id: &ServerIdentity, spec: &PolicySpec, max_request_bytes
     w.str("rtc");
     w.map(2);
     w.str("supported");
-    w.bool(false);
+    w.bool(spec.rtc_chunk_size.is_some());
     w.str("chunk_size");
-    w.nil();
+    match spec.rtc_chunk_size {
+        Some(t) => w.uint(t as u64),
+        None => w.nil(),
+    }
     w.str("image_codecs");
     w.array(IMAGE_CODECS.len());
     IMAGE_CODECS.iter().for_each(|c| w.str(c));

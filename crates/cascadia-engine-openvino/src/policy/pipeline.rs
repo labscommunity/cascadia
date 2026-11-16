@@ -47,6 +47,17 @@ pub const POSITION_IDS: &str = "position_ids";
 pub const TOKEN_TYPE_IDS: &str = "token_type_ids";
 pub const TOKEN_POOLING: &str = "token_pooling";
 pub const ACTION_DIM_IS_PAD: &str = "action_dim_is_pad";
+/// The real-time chunking port group (physicalai's `RTCModelMixin`); all or none.
+pub const PREV_CHUNK_LEFT_OVER: &str = "prev_chunk_left_over";
+pub const INFERENCE_DELAY: &str = "inference_delay";
+pub const MAX_GUIDANCE_WEIGHT: &str = "max_guidance_weight";
+pub const EXECUTION_HORIZON: &str = "execution_horizon";
+const RTC_PORTS: [&str; 4] = [
+    PREV_CHUNK_LEFT_OVER,
+    INFERENCE_DELAY,
+    MAX_GUIDANCE_WEIGHT,
+    EXECUTION_HORIZON,
+];
 
 /// Every warmup state value. Not zero: X-VLA's LIBERO export reads part of the
 /// state as a rotation vector and divides by its norm behind a `1e-8` guard
@@ -351,6 +362,16 @@ pub struct PortBinding {
     pub renames: Vec<(String, String)>,
     pub noise_port: String,
     pub action_port: String,
+    /// The RTC scalars' port shapes (`[]` or `[1]`), when the model has the group.
+    pub rtc: Option<RtcShapes>,
+}
+
+/// Shapes of the RTC scalar ports, as the IR declares them.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct RtcShapes {
+    pub inference_delay: Vec<usize>,
+    pub max_guidance_weight: Vec<usize>,
+    pub execution_horizon: Vec<usize>,
 }
 
 impl PortBinding {
@@ -363,6 +384,7 @@ impl PortBinding {
             renames: Vec::new(),
             noise_port: NOISE.into(),
             action_port: ACTION.into(),
+            rtc: None,
         }
     }
 
@@ -529,6 +551,7 @@ pub fn bind_molmoact2(
             action_shape,
             noise: noise_mode(&None, has_random_uniform),
             noise_shape: None,
+            rtc: false,
         },
     ))
 }
@@ -659,6 +682,7 @@ pub fn bind_gr00t(
             action_shape,
             noise,
             noise_shape,
+            rtc: false,
         },
     ))
 }
@@ -720,6 +744,7 @@ pub fn bind_xr0(
             action_shape,
             noise,
             noise_shape,
+            rtc: false,
         },
     ))
 }
@@ -780,6 +805,7 @@ pub fn bind_vla_jepa(
             action_shape,
             noise,
             noise_shape,
+            rtc: false,
         },
     ))
 }
@@ -809,6 +835,49 @@ fn noise_dims(inputs: &[PortInfo]) -> EngineResult<Option<Vec<usize>>> {
         }
         None => Ok(None),
     }
+}
+
+/// The RTC port group: none, or all four with the leftover `[1, T, D]` of the
+/// action output and the scalars as physicalai's exporter declares them.
+fn rtc_ports(inputs: &[PortInfo], action: [usize; 2]) -> EngineResult<Option<RtcShapes>> {
+    let (present, missing): (Vec<&str>, Vec<&str>) =
+        RTC_PORTS.iter().partition(|n| port(inputs, n).is_some());
+    if present.is_empty() {
+        return Ok(None);
+    }
+    if !missing.is_empty() {
+        return refuse(format!(
+            "the RTC ports come as a group: the model has {present:?} but not {missing:?}"
+        ));
+    }
+    let left = dims(inputs, PREV_CHUNK_LEFT_OVER, &[DType::F32], 3, Some(0))?;
+    if left[1..] != [Some(action[0]), Some(action[1])] {
+        let shown: Vec<String> = left
+            .iter()
+            .map(|d| d.map_or_else(|| "?".into(), |d| d.to_string()))
+            .collect();
+        return refuse(format!(
+            "prev_chunk_left_over is [{}]; the action output is [1, {}, {}]",
+            shown.join(", "),
+            action[0],
+            action[1]
+        ));
+    }
+    let scalar = |name: &str, dtype: DType| -> EngineResult<Vec<usize>> {
+        let p = port(inputs, name).expect("present");
+        let shape = match p.dims.as_slice() {
+            [] => vec![],
+            [Some(1)] => vec![1],
+            other => return refuse(format!("{name} has shape {other:?}; expected a scalar")),
+        };
+        dims(inputs, name, &[dtype], shape.len(), None)?;
+        Ok(shape)
+    };
+    Ok(Some(RtcShapes {
+        inference_delay: scalar(INFERENCE_DELAY, DType::I64)?,
+        max_guidance_weight: scalar(MAX_GUIDANCE_WEIGHT, DType::F32)?,
+        execution_horizon: scalar(EXECUTION_HORIZON, DType::I64)?,
+    }))
 }
 
 /// `[T, D]` of the `action` output.
@@ -842,7 +911,18 @@ pub fn bind_ports(
 ) -> EngineResult<(PortBinding, IrFacts)> {
     refuse_unknown_inputs(
         inputs,
-        &[STATE, NOISE, PROMPT, PROMPT_MASK, IMAGES, IMAGE_MASKS],
+        &[
+            STATE,
+            NOISE,
+            PROMPT,
+            PROMPT_MASK,
+            IMAGES,
+            IMAGE_MASKS,
+            PREV_CHUNK_LEFT_OVER,
+            INFERENCE_DELAY,
+            MAX_GUIDANCE_WEIGHT,
+            EXECUTION_HORIZON,
+        ],
     )?;
     let state = dims(inputs, STATE, &[DType::F32], 2, Some(0))?;
     let state_len = fixed(state[1], "the state length")?;
@@ -879,13 +959,16 @@ pub fn bind_ports(
     let noise_shape = noise_dims(inputs)?;
     let action_shape = action_dims(outputs)?;
     let noise = noise_mode(&noise_shape, has_random_uniform);
+    let rtc = rtc_ports(inputs, action_shape)?;
+    let mut binding = PortBinding::new(
+        PortLayout::ImageSlots,
+        noise_shape.is_some(),
+        PROMPT,
+        prompt_len,
+    );
+    binding.rtc = rtc.clone();
     Ok((
-        PortBinding::new(
-            PortLayout::ImageSlots,
-            noise_shape.is_some(),
-            PROMPT,
-            prompt_len,
-        ),
+        binding,
         IrFacts {
             image_slots,
             image_hw,
@@ -893,6 +976,7 @@ pub fn bind_ports(
             action_shape,
             noise,
             noise_shape,
+            rtc: rtc.is_some(),
         },
     ))
 }
@@ -1373,6 +1457,59 @@ impl PolicyPipeline {
         ])
     }
 
+    /// The RTC group. Without RTC inputs the guidance weight is 0, which zeroes
+    /// the graph's correction (`v_t - 0 * err`), so the chunk is the plain one.
+    fn rtc_feeds(
+        &self,
+        obs: &Observation,
+        shapes: &RtcShapes,
+    ) -> EngineResult<Vec<(String, HostTensor)>> {
+        let [steps, dim] = self.action_shape;
+        let zeros = vec![0.0; steps * dim];
+        let (left, delay, weight, horizon) = match &obs.rtc {
+            Some(r) => (
+                &r.prev_chunk_left_over,
+                r.inference_delay,
+                r.max_guidance_weight,
+                r.execution_horizon,
+            ),
+            None => (&zeros, 0, 0.0, 1),
+        };
+        // Normalized with the action stats, as physicalai's `normalize` step does.
+        let mut left: Vec<f64> = left.iter().map(|&x| f64::from(x)).collect();
+        for step in self.manifest.normalize() {
+            left = normalize(step, PREV_CHUNK_LEFT_OVER, &left)?;
+        }
+        let tensor = |shape: &[usize], data| HostTensor {
+            shape: shape.to_vec(),
+            data,
+        };
+        Ok(vec![
+            (
+                PREV_CHUNK_LEFT_OVER.into(),
+                tensor(
+                    &[1, steps, dim],
+                    TensorData::F32(left.iter().map(|&x| x as f32).collect()),
+                ),
+            ),
+            (
+                INFERENCE_DELAY.into(),
+                tensor(&shapes.inference_delay, TensorData::I64(vec![delay.into()])),
+            ),
+            (
+                MAX_GUIDANCE_WEIGHT.into(),
+                tensor(&shapes.max_guidance_weight, TensorData::F32(vec![weight])),
+            ),
+            (
+                EXECUTION_HORIZON.into(),
+                tensor(
+                    &shapes.execution_horizon,
+                    TensorData::I64(vec![horizon.into()]),
+                ),
+            ),
+        ])
+    }
+
     /// [`PortLayout::VlaJepa`] inputs, all but `noise`. The state goes in raw.
     fn vla_jepa_feeds(
         &mut self,
@@ -1667,6 +1804,9 @@ impl PolicyPipeline {
                 },
             ));
         }
+        if let Some(shapes) = &self.binding.rtc {
+            feeds.extend(self.rtc_feeds(obs, shapes)?);
+        }
 
         let model = self.model.as_mut().ok_or(EngineError::NotLoaded)?;
         for (name, t) in &feeds {
@@ -1776,6 +1916,7 @@ impl PolicyEngine for PolicyPipeline {
             prompt: String::new(),
             seed: Some(0),
             noise: None,
+            rtc: None,
         };
         (0..WARMUP_CALLS)
             .map(|_| Ok(self.run(&obs)?.infer_ms.ceil() as u32))
@@ -1804,6 +1945,8 @@ mod tests {
         include_str!("../../tests/fixtures/policy/smolvla-libero-noise-manifest.json");
     const PI0_LIBERO: &str = include_str!("../../tests/fixtures/policy/pi0-libero-manifest.json");
     const XVLA_LIBERO: &str = include_str!("../../tests/fixtures/policy/xvla-libero-manifest.json");
+    const SMOLVLA_RTC: &str =
+        include_str!("../../tests/fixtures/policy/smolvla-libero-rtc-manifest.json");
 
     #[derive(Default)]
     struct Log {
@@ -1920,6 +2063,29 @@ mod tests {
                 port(IMAGE_MASKS, DType::Bool, &[2, 1]),
             ],
             vec![port(ACTION, DType::F32, &[1, 50, 7])],
+        )
+    }
+
+    /// The real ports of our smolvla_libero RTC export: the noise export's plus
+    /// the RTC group, scalars of rank 0.
+    fn smolvla_rtc_ports() -> (Vec<PortInfo>, Vec<PortInfo>) {
+        let (mut inputs, outputs) = smolvla_ports();
+        inputs.extend([
+            port(PREV_CHUNK_LEFT_OVER, DType::F32, &[1, 50, 7]),
+            port(INFERENCE_DELAY, DType::I64, &[]),
+            port(MAX_GUIDANCE_WEIGHT, DType::F32, &[]),
+            port(EXECUTION_HORIZON, DType::I64, &[]),
+        ]);
+        (inputs, outputs)
+    }
+
+    fn smolvla_rtc() -> Rig {
+        rig_with(
+            SMOLVLA_RTC,
+            smolvla_rtc_ports(),
+            false,
+            true,
+            vec![0.5; 350],
         )
     }
 
@@ -2113,6 +2279,7 @@ mod tests {
             prompt: prompt.into(),
             seed: None,
             noise: None,
+            rtc: None,
         }
     }
 
@@ -2132,6 +2299,156 @@ mod tests {
             TensorData::F32(v) => v,
             other => panic!("not f32: {other:?}"),
         }
+    }
+
+    fn i64s(t: &HostTensor) -> &[i64] {
+        match &t.data {
+            TensorData::I64(v) => v,
+            other => panic!("not i64: {other:?}"),
+        }
+    }
+
+    /// `(x - mean) / (std + eps)` with the package's action stats.
+    fn normalized_action(m: &PolicyManifest, raw: &[f32]) -> Vec<f32> {
+        let s = m
+            .normalize()
+            .find_map(|s| s.stats_for(PREV_CHUNK_LEFT_OVER))
+            .unwrap();
+        let (mean, std) = (s.mean.as_ref().unwrap(), s.std.as_ref().unwrap());
+        raw.iter()
+            .enumerate()
+            .map(|(i, &x)| ((f64::from(x) - mean[i % 7]) / (std[i % 7] + 1e-8)) as f32)
+            .collect()
+    }
+
+    #[test]
+    fn rtc_package_serves_the_full_chunk_and_advertises_rtc() {
+        let r = smolvla_rtc();
+        let spec = r.engine.spec();
+        assert_eq!(spec.chunk, [50, 7]);
+        assert_eq!(spec.rtc_chunk_size, Some(50));
+        // Packages without the RTC ports advertise none.
+        assert_eq!(smolvla(true).engine.spec().rtc_chunk_size, None);
+    }
+
+    #[test]
+    fn rtc_inputs_are_fed_normalized_and_typed_as_the_ports() {
+        let mut r = smolvla_rtc();
+        let spec = r.engine.spec().clone();
+        let m = PolicyManifest::parse(SMOLVLA_RTC, LoadOptions::default()).unwrap();
+        let mut o = obs(&spec, "pick up the bowl");
+        let left: Vec<f32> = (0..350).map(|i| i as f32 * 0.001 - 0.1).collect();
+        o.rtc = Some(cascadia_types::RtcInputs {
+            prev_chunk_left_over: left.clone(),
+            inference_delay: 3,
+            max_guidance_weight: 5.0,
+            execution_horizon: 10,
+        });
+        let chunk = r.engine.infer(&o).unwrap();
+        assert_eq!((chunk.steps, chunk.dim), (50, 7));
+        let t = input(&r.log, PREV_CHUNK_LEFT_OVER);
+        assert_eq!(t.shape, vec![1, 50, 7]);
+        let want = normalized_action(&m, &left);
+        for (a, b) in f32s(&t).iter().zip(&want) {
+            assert!((a - b).abs() <= 1e-6, "{a} vs {b}");
+        }
+        let delay = input(&r.log, INFERENCE_DELAY);
+        assert_eq!((delay.shape.clone(), i64s(&delay)), (vec![], &[3i64][..]));
+        let w = input(&r.log, MAX_GUIDANCE_WEIGHT);
+        assert_eq!((w.shape.clone(), f32s(&w)), (vec![], &[5.0f32][..]));
+        let h = input(&r.log, EXECUTION_HORIZON);
+        assert_eq!(i64s(&h), &[10]);
+
+        // Without RTC fields the guidance is off: weight 0 makes the graph's
+        // correction exactly zero, so the chunk is the plain one.
+        o.rtc = None;
+        r.engine.infer(&o).unwrap();
+        assert_eq!(f32s(&input(&r.log, MAX_GUIDANCE_WEIGHT)), &[0.0]);
+        assert_eq!(i64s(&input(&r.log, INFERENCE_DELAY)), &[0]);
+        assert_eq!(i64s(&input(&r.log, EXECUTION_HORIZON)), &[1]);
+        let zeros = normalized_action(&m, &[0.0; 350]);
+        assert_eq!(f32s(&input(&r.log, PREV_CHUNK_LEFT_OVER)), zeros.as_slice());
+    }
+
+    #[test]
+    fn rtc_ports_are_all_or_none_and_need_the_full_chunk() {
+        let log = Arc::new(Mutex::new(Log::default()));
+        let (mut inputs, outputs) = smolvla_rtc_ports();
+        inputs.retain(|p| p.aliases[0] != EXECUTION_HORIZON);
+        let e = pipeline_with(
+            SMOLVLA_RTC,
+            (&inputs, &outputs),
+            false,
+            true,
+            48,
+            &log,
+            vec![],
+        )
+        .err()
+        .unwrap()
+        .to_string();
+        assert!(e.contains("RTC ports come as a group"), "{e}");
+
+        let (mut inputs, outputs) = smolvla_rtc_ports();
+        inputs[6] = port(PREV_CHUNK_LEFT_OVER, DType::F32, &[1, 40, 7]);
+        let e = pipeline_with(
+            SMOLVLA_RTC,
+            (&inputs, &outputs),
+            false,
+            true,
+            48,
+            &log,
+            vec![],
+        )
+        .err()
+        .unwrap()
+        .to_string();
+        assert!(e.contains("prev_chunk_left_over is [1, 40, 7]"), "{e}");
+
+        // A trimmer would serve part of the chunk the leftover indexes.
+        let mut v: serde_json::Value = serde_json::from_str(SMOLVLA_RTC).unwrap();
+        v["model"]["postprocessors"]
+            .as_array_mut()
+            .unwrap()
+            .push(serde_json::json!({"type": "action_chunk_trimmer", "n_action_steps": 10}));
+        let (inputs, outputs) = smolvla_rtc_ports();
+        let e = pipeline_with(
+            &v.to_string(),
+            (&inputs, &outputs),
+            false,
+            true,
+            48,
+            &log,
+            vec![],
+        )
+        .err()
+        .unwrap()
+        .to_string();
+        assert!(e.contains("RTC package must serve the whole chunk"), "{e}");
+
+        // The leftover is normalized like the actions; a package without its stats is refused.
+        let mut v: serde_json::Value = serde_json::from_str(SMOLVLA_RTC).unwrap();
+        for step in v["model"]["preprocessors"].as_array_mut().unwrap() {
+            if let Some(stats) = step.get_mut("stats").and_then(|v| v.as_object_mut()) {
+                stats.remove(PREV_CHUNK_LEFT_OVER);
+            }
+        }
+        let e = pipeline_with(
+            &v.to_string(),
+            (&inputs, &outputs),
+            false,
+            true,
+            48,
+            &log,
+            vec![],
+        )
+        .err()
+        .unwrap()
+        .to_string();
+        assert!(
+            e.contains("no normalize stats for prev_chunk_left_over"),
+            "{e}"
+        );
     }
 
     #[test]

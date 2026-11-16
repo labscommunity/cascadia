@@ -20,7 +20,7 @@ pub use load::LoadProgress;
 pub use peer::{PeerEndpoint, PeerLayout};
 pub use policy::{
     is_valid_policy_name, ActionChunk, Image, NoiseMode, Observation, PolicySpec, ResizeConvention,
-    ServerResize,
+    RtcInputs, ServerResize,
 };
 pub use shard::{ShardPlan, ShardSpec};
 pub use stats::ApiStats;

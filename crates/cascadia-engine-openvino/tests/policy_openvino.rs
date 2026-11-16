@@ -24,7 +24,7 @@
 //! exporter's seeds; same rule). MolmoAct2's are Intel's runtime stages in
 //! `molmoact2-stages-f32.npz` (the exporter's `fixtures-f32.npz`, saved
 //! uncompressed) and the PyTorch f32 pipeline on a real LIBERO frame pair in
-//! `molmoact2-e2e.npz` (same rule).
+//! `molmoact2-e2e.npz` (same rule). The RTC packages are listed above their tests.
 #![cfg(feature = "openvino")]
 
 use std::path::{Path, PathBuf};
@@ -41,7 +41,7 @@ use cascadia_engine_openvino::policy::{
     Precision, ServerFacts,
 };
 use cascadia_ov_genai_shim::{DType, PortInfo, Runtime};
-use cascadia_types::{Image, NoiseMode, Observation, ResizeConvention};
+use cascadia_types::{Image, NoiseMode, Observation, ResizeConvention, RtcInputs};
 
 fn package(test: &str) -> Option<PathBuf> {
     package_from("CASCADIA_POLICY_PACKAGE", test)
@@ -250,6 +250,7 @@ fn observation(engine: &OvPolicyEngine, prompt: &str) -> Observation {
         prompt: prompt.into(),
         seed: None,
         noise: Some(NoiseRng::seeded(42).normal(50 * 32)),
+        rtc: None,
     }
 }
 
@@ -807,6 +808,7 @@ fn xvla_observation(z: &[u8]) -> Observation {
         prompt: npz(z, "task").string(),
         seed: None,
         noise: Some(npz(z, "in_noise").f32s()),
+        rtc: None,
     }
 }
 
@@ -1183,6 +1185,7 @@ impl JepaRef {
             prompt: npz(&self.inputs, &format!("{case}/task")).string(),
             seed: None,
             noise: Some(npz(&self.inputs, &format!("{case}/noise")).f32s()),
+            rtc: None,
         }
     }
 
@@ -1525,6 +1528,7 @@ fn evo1_cases(dir: &Path) -> Vec<(Observation, Vec<f32>)> {
                 prompt: task.clone(),
                 seed: None,
                 noise: Some(npz(&z, &format!("{case}_in_noise")).f32s()),
+                rtc: None,
             };
             // LeRobot's 50 postprocessed rows; the engine serves the first 14.
             let want = npz(&z, &format!("{case}_final")).f32s()[..14 * 7].to_vec();
@@ -1659,6 +1663,7 @@ fn xr0_observation(z: &[u8], prefix: &str, task: String, noise: Vec<f32>) -> Obs
         prompt: task,
         seed: None,
         noise: Some(noise),
+        rtc: None,
     }
 }
 
@@ -1995,6 +2000,7 @@ fn gr00t_observation(frames: &[u8], z: &[u8], case: &str, obs: &str) -> Observat
         prompt: npz(frames, "task").string(),
         seed: None,
         noise: Some(npz(z, &format!("{case}__actions")).f32s()),
+        rtc: None,
     }
 }
 
@@ -2297,6 +2303,7 @@ fn molmo_observation(z: &[u8], prefix: &str, task: String) -> Observation {
         prompt: task,
         seed: None,
         noise: None,
+        rtc: None,
     }
 }
 
@@ -2600,4 +2607,234 @@ fn molmoact2_gpu_f32_load_is_an_error_in_its_own_process() {
             assert!(m.contains("try without --precision f32"), "{m}");
         }
     }
+}
+
+// ---- real-time chunking (RTC) ----
+//
+// SmolVLA and π0.5 LIBERO exported with Intel's exporter with RTC on and off
+// (the full chunk, no trimmer). Per model `<M>` (`SMOLVLA`, `PI05`):
+// - `CASCADIA_POLICY_PACKAGE_<M>_RTC`, `..._<M>_NORTC`: the shipped packages
+//   (fp16 weights) from the same export run;
+// - `CASCADIA_POLICY_PACKAGE_<M>_RTC_F32`: the RTC export's float32 twin;
+// - `CASCADIA_POLICY_RTC_REF_<M>`: raw inputs and Intel's PyTorch f32 outputs
+//   (`actions_rtc`, `actions_plain`) for them.
+
+/// The reference's raw inputs, as a robot sends them.
+fn rtc_case(z: &[u8], spec: &cascadia_types::PolicySpec) -> (Observation, RtcInputs) {
+    let images = spec
+        .cameras
+        .iter()
+        .map(|c| {
+            let a = npz(z, &format!("image_{c}"));
+            assert_eq!(a.shape, [spec.height as usize, spec.width as usize, 3]);
+            (
+                c.clone(),
+                Image {
+                    height: spec.height,
+                    width: spec.width,
+                    data: a.data,
+                },
+            )
+        })
+        .collect();
+    let obs = Observation {
+        images,
+        state: npz(z, "state").f32s(),
+        prompt: npz(z, "prompt").string(),
+        seed: None,
+        noise: Some(npz(z, "noise").f32s()),
+        rtc: None,
+    };
+    let rtc = RtcInputs {
+        prev_chunk_left_over: npz(z, "left").f32s(),
+        inference_delay: npz(z, "delay").i64s()[0] as u32,
+        max_guidance_weight: npz(z, "weight").f32s()[0],
+        execution_horizon: npz(z, "horizon").i64s()[0] as u32,
+    };
+    (obs, rtc)
+}
+
+fn rtc_reference(model: &str, test: &str) -> Option<Vec<u8>> {
+    let path = package_from(&format!("CASCADIA_POLICY_RTC_REF_{model}"), test)?;
+    Some(std::fs::read(&path).unwrap_or_else(|e| panic!("{}: {e}", path.display())))
+}
+
+/// Gate 1: guidance 0 (no RTC fields, or the fields with weight 0) is
+/// bit-exact to the package exported without RTC, on CPU f32.
+fn rtc_guidance_zero_is_the_plain_chunk(model: &str) {
+    let test = format!(
+        "{}_rtc_guidance_zero_is_the_plain_chunk",
+        model.to_lowercase()
+    );
+    let (Some(rtc_dir), Some(plain_dir), Some(z)) = (
+        package_from(&format!("CASCADIA_POLICY_PACKAGE_{model}_RTC"), &test),
+        package_from(&format!("CASCADIA_POLICY_PACKAGE_{model}_NORTC"), &test),
+        rtc_reference(model, &test),
+    ) else {
+        return;
+    };
+    let mut plain = OvPolicyEngine::load(&plain_dir, &cpu()).unwrap();
+    let mut rtc = OvPolicyEngine::load(&rtc_dir, &cpu()).unwrap();
+    assert_eq!(plain.spec().rtc_chunk_size, None);
+    let [t, d] = rtc.spec().chunk;
+    assert_eq!(rtc.spec().rtc_chunk_size, Some(t));
+    assert_eq!(plain.spec().chunk, [t, d]);
+    let (obs, fields) = rtc_case(&z, rtc.spec());
+    let want = plain.infer(&obs).unwrap();
+    let off = rtc.infer(&obs).unwrap();
+    let mut zero = obs.clone();
+    zero.rtc = Some(RtcInputs {
+        max_guidance_weight: 0.0,
+        ..fields.clone()
+    });
+    let zero = rtc.infer(&zero).unwrap();
+    let mut on = obs.clone();
+    on.rtc = Some(fields);
+    let on = rtc.infer(&on).unwrap();
+    let bits = |v: &[f32]| v.iter().map(|x| x.to_bits()).collect::<Vec<_>>();
+    eprintln!(
+        "{model} cpu: no fields {:.1} ms, weight 0 {:.1} ms, plain package {:.1} ms; \
+         guidance on moves the chunk by {} (max abs)",
+        off.infer_ms,
+        zero.infer_ms,
+        want.infer_ms,
+        max_abs_diff(&on.actions, &want.actions)
+    );
+    assert_eq!(bits(&off.actions), bits(&want.actions), "no RTC fields");
+    assert_eq!(
+        bits(&zero.actions),
+        bits(&want.actions),
+        "max_guidance_weight 0"
+    );
+    assert!(
+        max_abs_diff(&on.actions, &want.actions) > 1e-3,
+        "guidance had no effect"
+    );
+}
+
+#[test]
+fn smolvla_rtc_guidance_zero_is_the_plain_chunk() {
+    rtc_guidance_zero_is_the_plain_chunk("SMOLVLA");
+}
+
+#[test]
+fn pi05_rtc_guidance_zero_is_the_plain_chunk() {
+    rtc_guidance_zero_is_the_plain_chunk("PI05");
+}
+
+/// Gate 2: with guidance on, the engine on the f32 twin matches Intel's
+/// PyTorch RTC path within 1e-4 on CPU f32 (and its plain path too).
+fn rtc_matches_intels_pytorch(model: &str) {
+    let test = format!("{}_rtc_matches_intels_pytorch", model.to_lowercase());
+    let (Some(dir), Some(z)) = (
+        package_from(&format!("CASCADIA_POLICY_PACKAGE_{model}_RTC_F32"), &test),
+        rtc_reference(model, &test),
+    ) else {
+        return;
+    };
+    let mut engine = OvPolicyEngine::load(&dir, &cpu()).unwrap();
+    let (mut obs, fields) = rtc_case(&z, engine.spec());
+    let plain = engine.infer(&obs).unwrap();
+    obs.rtc = Some(fields);
+    let on = engine.infer(&obs).unwrap();
+    let (want_on, want_plain) = (
+        npz(&z, "actions_rtc").f32s(),
+        npz(&z, "actions_plain").f32s(),
+    );
+    let (d_on, d_plain) = (
+        max_abs_diff(&on.actions, &want_on),
+        max_abs_diff(&plain.actions, &want_plain),
+    );
+    eprintln!(
+        "{model} cpu f32 vs PyTorch: rtc {d_on:.2e}, plain {d_plain:.2e}; rtc effect {:.4} \
+         (max abs); {:.1} ms",
+        max_abs_diff(&want_on, &want_plain),
+        on.infer_ms
+    );
+    assert_eq!(on.actions.len(), want_on.len());
+    assert!(d_on <= 1e-4, "rtc: max abs diff {d_on} > 1e-4");
+    assert!(d_plain <= 1e-4, "plain: max abs diff {d_plain} > 1e-4");
+}
+
+#[test]
+fn smolvla_rtc_matches_intels_pytorch() {
+    rtc_matches_intels_pytorch("SMOLVLA");
+}
+
+#[test]
+fn pi05_rtc_matches_intels_pytorch() {
+    rtc_matches_intels_pytorch("PI05");
+}
+
+/// Gate 3: on the GPU at f16, RTC chunks are finite and stay as close to the
+/// CPU f32 result as the plain chunk does (twice its deviation, plus 1e-3).
+fn rtc_gpu_f16_stays_in_the_f16_envelope(model: &str) {
+    let test = format!(
+        "{}_rtc_gpu_f16_stays_in_the_f16_envelope",
+        model.to_lowercase()
+    );
+    let (Some(dir), Some(z)) = (
+        package_from(&format!("CASCADIA_POLICY_PACKAGE_{model}_RTC"), &test),
+        rtc_reference(model, &test),
+    ) else {
+        return;
+    };
+    if !gpu_enabled(&test) {
+        return;
+    }
+    let mut cpu_engine = OvPolicyEngine::load(&dir, &cpu()).unwrap();
+    let (obs, fields) = rtc_case(&z, cpu_engine.spec());
+    let mut on = obs.clone();
+    on.rtc = Some(fields);
+    let (cpu_plain, cpu_on) = (
+        cpu_engine.infer(&obs).unwrap(),
+        cpu_engine.infer(&on).unwrap(),
+    );
+    drop(cpu_engine);
+    let gpu = OvPolicyOptions {
+        device: "GPU".into(),
+        ..OvPolicyOptions::default()
+    };
+    let mut engine = OvPolicyEngine::load(&dir, &gpu).unwrap();
+    let warm = engine.warmup().unwrap();
+    let mut ms = (Vec::new(), Vec::new());
+    let (mut g_plain, mut g_on) = (None, None);
+    for _ in 0..10 {
+        let p = engine.infer(&obs).unwrap();
+        let r = engine.infer(&on).unwrap();
+        ms.0.push(p.infer_ms);
+        ms.1.push(r.infer_ms);
+        g_plain = Some(p);
+        g_on = Some(r);
+    }
+    let (g_plain, g_on) = (g_plain.unwrap(), g_on.unwrap());
+    let median = |v: &mut Vec<f64>| {
+        v.sort_by(f64::total_cmp);
+        v[v.len() / 2]
+    };
+    let (d_plain, d_on) = (
+        max_abs_diff(&g_plain.actions, &cpu_plain.actions),
+        max_abs_diff(&g_on.actions, &cpu_on.actions),
+    );
+    eprintln!(
+        "{model} gpu f16: plain p50 {:.1} ms, rtc p50 {:.1} ms, warmup {warm:?}; vs cpu f32: \
+         plain {d_plain:.2e}, rtc {d_on:.2e}",
+        median(&mut ms.0),
+        median(&mut ms.1)
+    );
+    assert!(g_on.actions.iter().all(|x| x.is_finite()));
+    assert!(
+        d_on <= 2.0 * d_plain + 1e-3,
+        "rtc f16 deviation {d_on} is outside the plain chunk's envelope ({d_plain})"
+    );
+}
+
+#[test]
+fn smolvla_rtc_gpu_f16_stays_in_the_f16_envelope() {
+    rtc_gpu_f16_stays_in_the_f16_envelope("SMOLVLA");
+}
+
+#[test]
+fn pi05_rtc_gpu_f16_stays_in_the_f16_envelope() {
+    rtc_gpu_f16_stays_in_the_f16_envelope("PI05");
 }

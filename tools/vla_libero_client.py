@@ -7,6 +7,15 @@ each action, through openpi's own WebSocket client, so a run is also the interop
     MUJOCO_GL=egl python tools/vla_libero_client.py --url ws://127.0.0.1:8000/v1/policy/ws \
         --suite libero_spatial --episodes-per-task 5 --seed 7 --out spatial.jsonl
 
+`--async-delay D --execution-horizon S` runs the robot side of real-time chunking (RTC) the way
+physicalai's `RTCExecution` does, with the inference delay simulated in control steps: a new chunk
+is requested when fewer than S + D actions are left, the robot executes D more old actions while
+it is computed, and the new chunk takes over at its index D. With `--rtc` each request also sends
+the unexecuted actions (`prev_chunk_left_over`) and the guidance fields, so the new chunk is pulled
+toward them; without it the same schedule switches chunks naively. Each switch's seam jump (the
+L2 distance between the first new action and the old action it replaces, gripper excluded) is
+recorded.
+
 Needs `openpi-client`, a LIBERO install (`hf-libero`, which brings robosuite and MuJoCo), torch
 (LIBERO loads its initial states with it) and pillow. Headless machines render with
 `MUJOCO_GL=egl` or `MUJOCO_GL=osmesa`.
@@ -152,6 +161,58 @@ def run_episode(client, env, init_state, task, meta, max_steps, seed_base, flip=
     return done, t, infer_ms, rtt_ms, error
 
 
+def run_episode_async(client, env, init_state, task, meta, max_steps, seed_base, flip, delay, horizon,
+                      rtc_weight, control_mode="relative"):
+    """Chunks switched under a simulated inference delay; `rtc_weight` None sends no RTC fields."""
+    env.reset()
+    obs = env.set_init_state(init_state)
+    set_control_mode(env, "relative")
+    queue, infer_ms, rtt_ms, seams, done, t, error = [], [], [], [], False, 0, None
+    first = True
+    chunk_len = meta.get("rtc_chunk_size") or meta["chunk"][0]
+    while t < max_steps + NUM_STEPS_WAIT:
+        if t < NUM_STEPS_WAIT:
+            obs, _, done, _ = env.step(LIBERO_DUMMY_ACTION)
+            t += 1
+            if t == NUM_STEPS_WAIT:
+                set_control_mode(env, control_mode)
+            continue
+        if first or len(queue) < horizon + delay:
+            req = observation(obs, task, meta, seed_base + t, flip)
+            if rtc_weight is not None and not first:
+                left = np.zeros((chunk_len, meta["chunk"][1]), dtype=np.float32)
+                left[: len(queue)] = np.asarray(queue[:chunk_len], dtype=np.float32)
+                req.update(prev_chunk_left_over=left, inference_delay=delay,
+                           max_guidance_weight=float(rtc_weight), execution_horizon=horizon)
+            t0 = time.perf_counter()
+            try:
+                reply = client.infer(req)
+            except RuntimeError as e:
+                error = str(e)
+                break
+            rtt_ms.append((time.perf_counter() - t0) * 1000)
+            infer_ms.append(float(reply["server_timing"]["infer_ms"]))
+            chunk = list(np.asarray(reply["actions"], dtype=np.float32))
+            skip = 0 if first else delay
+            # The robot keeps executing the old chunk while the new one is computed.
+            for _ in range(skip):
+                obs, _, done, _ = env.step(queue.pop(0).tolist())
+                t += 1
+                if done:
+                    break
+            if done:
+                break
+            if queue:
+                seams.append(float(np.linalg.norm(chunk[skip][:6] - queue[0][:6])))
+            queue = chunk[skip:]
+            first = False
+        obs, _, done, _ = env.step(queue.pop(0).tolist())
+        if done:
+            break
+        t += 1
+    return done, t, infer_ms, rtt_ms, error, seams
+
+
 def main():
     ap = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     ap.add_argument("--url", required=True, help="ws://<host>:<port>/v1/policy/ws")
@@ -170,6 +231,12 @@ def main():
                     help="absolute: actions are end-effector poses (X-VLA), as LeRobot's env.control_mode")
     ap.add_argument("--gripper", choices=["raw", "binarize_invert"], default="raw",
                     help="binarize_invert: gripper g in [0, 1] -> -sign(2g - 1) (GR00T's LIBERO rule)")
+    ap.add_argument("--async-delay", type=int, default=0,
+                    help="simulated inference delay in control steps; >0 switches chunks as RTCExecution does")
+    ap.add_argument("--execution-horizon", type=int, default=10,
+                    help="with --async-delay: fresh actions per chunk (RTC execution_horizon)")
+    ap.add_argument("--rtc", type=float, default=None, metavar="MAX_GUIDANCE_WEIGHT",
+                    help="with --async-delay: send the RTC fields with this max_guidance_weight")
     args = ap.parse_args()
 
     from libero.libero import benchmark, get_libero_path
@@ -184,13 +251,17 @@ def main():
     client = websocket_client_policy.WebsocketClientPolicy(host=args.url, port=None)
     meta = client.get_server_metadata()
     check_metadata(meta)
+    if args.rtc is not None and not meta.get("rtc_chunk_size"):
+        sys.exit("--rtc needs a package exported with RTC (rtc_chunk_size is null)")
     print(f"server model={meta['model']} device={meta['device']} cameras={meta['cameras']} "
           f"{meta['height']}x{meta['width']} resize={meta['resize']} chunk={meta['chunk']} "
-          f"noise={meta['noise']} flip={args.flip} replan={args.replan} gripper={args.gripper} control_mode={args.control_mode}", flush=True)
+          f"noise={meta['noise']} flip={args.flip} replan={args.replan} gripper={args.gripper} control_mode={args.control_mode} "
+          f"async_delay={args.async_delay} horizon={args.execution_horizon} rtc={args.rtc} "
+          f"rtc_chunk_size={meta.get('rtc_chunk_size')}", flush=True)
 
     out = args.out.open("w") if args.out else None
     n = k = errors = 0
-    all_infer = []
+    all_infer, all_seams = [], []
     start = time.perf_counter()
     for task_id in tasks:
         task = suite.get_task(task_id)
@@ -207,11 +278,20 @@ def main():
         for ep in range(args.episodes_per_task):
             t0 = time.perf_counter()
             seed_base = args.seed * 1_000_000 + task_id * 10_000 + ep * 1_000
-            done, steps, infer_ms, rtt_ms, error = run_episode(
-                client, env, init_states[ep], task.language, meta, max_steps, seed_base,
-                args.flip == "both", args.replan, args.gripper,
-                args.control_mode,
-            )
+            seams = []
+            if args.async_delay > 0:
+                done, steps, infer_ms, rtt_ms, error, seams = run_episode_async(
+                    client, env, init_states[ep], task.language, meta, max_steps, seed_base,
+                    args.flip == "both", args.async_delay, args.execution_horizon, args.rtc,
+                    args.control_mode,
+                )
+            else:
+                done, steps, infer_ms, rtt_ms, error = run_episode(
+                    client, env, init_states[ep], task.language, meta, max_steps, seed_base,
+                    args.flip == "both", args.replan, args.gripper,
+                    args.control_mode,
+                )
+            all_seams += seams
             wall = time.perf_counter() - t0
             n += 1
             k += bool(done)
@@ -225,13 +305,16 @@ def main():
                 "infer_ms_p50": round(statistics.median(infer_ms), 2) if infer_ms else None,
                 "rtt_ms_mean": round(statistics.fmean(rtt_ms), 2) if rtt_ms else None,
                 "error": error,
+                "seams": [round(x, 5) for x in seams],
             }
             if out:
                 out.write(json.dumps(rec) + "\n")
                 out.flush()
             print(f"episode task={task_id} ep={ep} success={done} steps={steps} "
                   f"calls={len(infer_ms)} infer_ms={rec['infer_ms_mean']} rtt_ms={rec['rtt_ms_mean']} "
-                  f"wall_s={rec['wall_s']}" + (f" error={error!r}" if error else ""), flush=True)
+                  f"wall_s={rec['wall_s']}"
+                  + (f" seam_mean={statistics.fmean(seams):.4f}" if seams else "")
+                  + (f" error={error!r}" if error else ""), flush=True)
         env.close()
     if out:
         out.close()
@@ -239,7 +322,9 @@ def main():
     p50 = statistics.median(all_infer) if all_infer else float("nan")
     print(f"LIBERO-RESULT suite={args.suite} episodes={n} success={k} rate={k / max(n, 1):.3f} "
           f"mean_infer_ms={mean:.1f} p50_infer_ms={p50:.1f} errors={errors} "
-          f"wall_s={time.perf_counter() - start:.0f}", flush=True)
+          + (f"seams={len(all_seams)} seam_mean={statistics.fmean(all_seams):.4f} "
+             f"seam_p90={sorted(all_seams)[int(0.9 * (len(all_seams) - 1))]:.4f} " if all_seams else "")
+          + f"wall_s={time.perf_counter() - start:.0f}", flush=True)
 
 
 if __name__ == "__main__":

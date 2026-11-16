@@ -8,7 +8,9 @@ use cascadia_api::policy::physicalai::{
     MAX_REQUEST_BYTES, NO_SEQ, XR0_CUBIC_EXACT,
 };
 use cascadia_api::policy::{max_payload_bytes, metadata_json_for, PackageIdentity};
-use cascadia_types::{ActionChunk, Image, NoiseMode, PolicySpec, ResizeConvention, ServerResize};
+use cascadia_types::{
+    ActionChunk, Image, NoiseMode, PolicySpec, ResizeConvention, RtcInputs, ServerResize,
+};
 
 macro_rules! fixture {
     ($name:literal) => {
@@ -35,6 +37,15 @@ fn spec() -> PolicySpec {
         manifest_sha256: "ab".repeat(32),
         precision: "f32".into(),
         server_resize: Some(cascadia_types::ServerResize::Letterbox),
+        rtc_chunk_size: None,
+    }
+}
+
+/// [`spec`] exported with RTC: leftover `[2, 3]`.
+fn rtc_spec() -> PolicySpec {
+    PolicySpec {
+        rtc_chunk_size: Some(2),
+        ..spec()
     }
 }
 
@@ -65,6 +76,81 @@ fn metadata_reply_is_byte_for_byte_physicalai() {
         encode_metadata(&identity(), &spec(), max()),
         fixture!("metadata.msgpack")
     );
+}
+
+#[test]
+fn rtc_metadata_is_byte_for_byte_physicalai() {
+    let max = u64::from(max_payload_bytes(&rtc_spec()));
+    assert_eq!(max, 67184 + 24, "generate.py's MAX_REQUEST_BYTES_RTC");
+    assert_eq!(
+        encode_metadata(&identity(), &rtc_spec(), max),
+        fixture!("metadata-rtc.msgpack")
+    );
+}
+
+/// What physicalai's `RTCExecution` sends: the leftover `[1, T, D]` and numpy scalars.
+#[test]
+fn rtc_execution_inputs_decode() {
+    let max = u64::from(max_payload_bytes(&rtc_spec()));
+    let r = decode_predict(fixture!("predict-rtc.msgpack"), &rtc_spec(), max).unwrap();
+    assert_eq!(r.seq, 7);
+    assert_eq!(
+        r.observation.rtc,
+        Some(RtcInputs {
+            prev_chunk_left_over: vec![0.75, 0.5, -1.0, 0.0, 0.0, 0.0],
+            inference_delay: 0,
+            max_guidance_weight: 5.0,
+            execution_horizon: 1,
+        })
+    );
+    let e = decode_predict(fixture!("predict-rtc.msgpack"), &spec(), max).unwrap_err();
+    assert!(e.message().contains("takes no RTC inputs"), "{e}");
+}
+
+#[test]
+fn rtc_refusals() {
+    let max = u64::from(max_payload_bytes(&rtc_spec()));
+    let scalar = |dtype: &str, data: &[u8]| {
+        let (dtype, data) = (dtype.to_string(), data.to_vec());
+        val(move |b| mp::np(b, &dtype, &[], &data))
+    };
+    let req = || {
+        good()
+            .input(
+                "prev_chunk_left_over",
+                val(|b| mp::np(b, "float32", &[1, 2, 3], &f32s(&[0.5; 6]))),
+            )
+            .input("inference_delay", scalar("int64", &1i64.to_le_bytes()))
+            .input(
+                "max_guidance_weight",
+                scalar("float32", &5f32.to_le_bytes()),
+            )
+            .input("execution_horizon", scalar("int64", &1i64.to_le_bytes()))
+    };
+    let err = |r: Req| decode_predict(&r.pack(), &rtc_spec(), max).unwrap_err().0;
+    decode_predict(&req().pack(), &rtc_spec(), max).unwrap();
+    let e = err(req().without_input("execution_horizon"));
+    assert!(e.contains("RTC needs all of"), "{e}");
+    let e = err(req().input("inference_delay", scalar("float32", &1f32.to_le_bytes())));
+    assert!(
+        e.contains("inference_delay must be a non-negative integer"),
+        "{e}"
+    );
+    let e = err(req().input("execution_horizon", scalar("int64", &(-1i64).to_le_bytes())));
+    assert!(
+        e.contains("execution_horizon must be a non-negative integer"),
+        "{e}"
+    );
+    let e = err(req().input(
+        "prev_chunk_left_over",
+        val(|b| mp::np(b, "float32", &[1, 2, 8], &f32s(&[0.5; 16]))),
+    ));
+    assert!(
+        e.contains("prev_chunk_left_over has shape [1, 2, 8]"),
+        "{e}"
+    );
+    let e = err(req().input("execution_horizon", scalar("int64", &2i64.to_le_bytes())));
+    assert!(e.contains("more than half the chunk"), "{e}");
 }
 
 #[test]
@@ -223,6 +309,8 @@ fn the_websocket_metadata_carries_the_package_identity() {
     assert_eq!(v["chunk_size"], 2);
     assert!(v["rtc_chunk_size"].is_null());
     assert_eq!(v["warmup_ms"], 180);
+    let v: serde_json::Value = serde_json::from_str(&metadata_json_for(&rtc_spec(), &id)).unwrap();
+    assert_eq!(v["rtc_chunk_size"], 2);
 }
 
 // ---- refusals: hand-built requests in physicalai's layout ----

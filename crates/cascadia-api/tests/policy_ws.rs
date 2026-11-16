@@ -38,6 +38,7 @@ fn spec() -> PolicySpec {
         manifest_sha256: String::new(),
         precision: String::new(),
         server_resize: None,
+        rtc_chunk_size: None,
     }
 }
 

@@ -12,7 +12,7 @@ const MAX_DEPTH: usize = 8;
 /// would otherwise be a million nodes).
 pub(crate) const MAX_VALUES: usize = 512;
 
-/// Entries in one map: the request has 5 keys, `images` one per camera, an
+/// Entries in one map: the request has 9 keys, `images` one per camera, an
 /// array header 4.
 pub(crate) const MAX_MAP_LEN: usize = 32;
 

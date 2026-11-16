@@ -5,7 +5,7 @@
 
 use std::collections::HashSet;
 
-use cascadia_types::{ActionChunk, NoiseMode, Observation, PolicySpec};
+use cascadia_types::{ActionChunk, NoiseMode, Observation, PolicySpec, RtcInputs};
 
 use crate::{EngineError, EngineResult};
 
@@ -26,7 +26,8 @@ pub const PAYLOAD_MAX_BYTES: u32 = 8 * 1024 * 1024 - 64 * 1024;
 
 /// The WebSocket message cap for `spec`: every camera's `H*W*3` bytes, the
 /// state as f64 (numpy's default dtype, the widest a request may send), the
-/// noise as f32, the prompt cap, plus [`PAYLOAD_FRAMING_BYTES`].
+/// noise and the RTC leftover (`rtc_chunk_size * D`) as f32, the prompt cap,
+/// plus [`PAYLOAD_FRAMING_BYTES`].
 ///
 /// Refuses a spec whose cap overflows or exceeds [`PAYLOAD_MAX_BYTES`].
 pub fn payload_cap(spec: &PolicySpec) -> EngineResult<u32> {
@@ -40,11 +41,19 @@ pub fn payload_cap(spec: &PolicySpec) -> EngineResult<u32> {
             .and_then(|n| n.checked_mul(4)),
         None => Some(0),
     };
+    let leftover = match spec.rtc_chunk_size {
+        Some(t) => t
+            .checked_mul(spec.chunk[1])
+            .and_then(|n| (n as u64).checked_mul(4)),
+        None => Some(0),
+    };
     let total = frame
         .and_then(|f| f.checked_mul(spec.cameras.len() as u64))
         .zip((spec.state_len as u64).checked_mul(8))
         .and_then(|(a, b)| a.checked_add(b))
         .zip(noise)
+        .and_then(|(a, b)| a.checked_add(b))
+        .zip(leftover)
         .and_then(|(a, b)| a.checked_add(b))
         .and_then(|a| a.checked_add(spec.prompt_max_bytes as u64))
         .and_then(|a| a.checked_add(PAYLOAD_FRAMING_BYTES));
@@ -79,8 +88,8 @@ pub trait PolicyEngine: Send {
 /// Check an observation against `spec` before any work is queued.
 ///
 /// Covers what the spec alone settles: camera names (exactly the advertised
-/// set), frame sizes, state length and finiteness, prompt size, and whether
-/// noise is allowed and its length.
+/// set), frame sizes, state length and finiteness, prompt size, whether
+/// noise is allowed and its length, and the RTC inputs.
 pub fn check_observation(spec: &PolicySpec, obs: &Observation) -> EngineResult<()> {
     let bad = |msg: String| Err(EngineError::InvalidConfig(msg));
     let mut seen = HashSet::new();
@@ -154,6 +163,50 @@ pub fn check_observation(spec: &PolicySpec, obs: &Observation) -> EngineResult<(
         {
             return bad(format!("noise must be finite with |x| <= {NOISE_ABS_MAX}"));
         }
+    }
+    if let Some(rtc) = &obs.rtc {
+        check_rtc(spec, rtc)?;
+    }
+    Ok(())
+}
+
+/// The ranges physicalai's `RTCPolicyMixin._validate_rtc_inputs` enforces,
+/// plus the leftover's shape and finiteness.
+fn check_rtc(spec: &PolicySpec, rtc: &RtcInputs) -> EngineResult<()> {
+    let bad = |msg: String| Err(EngineError::InvalidConfig(msg));
+    let Some(t) = spec.rtc_chunk_size else {
+        return bad("this package takes no RTC inputs; export it with RTC enabled".into());
+    };
+    let d = spec.chunk[1];
+    if t.checked_mul(d) != Some(rtc.prev_chunk_left_over.len()) {
+        return bad(format!(
+            "prev_chunk_left_over has {} values; expected {} for shape [{t}, {d}]",
+            rtc.prev_chunk_left_over.len(),
+            t.saturating_mul(d)
+        ));
+    }
+    if rtc.prev_chunk_left_over.iter().any(|x| !x.is_finite()) {
+        return bad("prev_chunk_left_over contains a non-finite value".into());
+    }
+    let (delay, horizon) = (rtc.inference_delay as usize, rtc.execution_horizon as usize);
+    if horizon == 0 {
+        return bad("execution_horizon must be positive".into());
+    }
+    if horizon > t / 2 {
+        return bad(format!(
+            "execution_horizon {horizon} is more than half the chunk ({t})"
+        ));
+    }
+    if delay > horizon {
+        return bad(format!(
+            "RTC needs 0 <= inference_delay <= execution_horizon; got {delay} > {horizon}"
+        ));
+    }
+    if !rtc.max_guidance_weight.is_finite() || rtc.max_guidance_weight < 0.0 {
+        return bad(format!(
+            "max_guidance_weight must be finite and non-negative; got {}",
+            rtc.max_guidance_weight
+        ));
     }
     Ok(())
 }
@@ -266,6 +319,24 @@ mod tests {
             manifest_sha256: String::new(),
             precision: String::new(),
             server_resize: None,
+            rtc_chunk_size: None,
+        }
+    }
+
+    fn rtc_spec() -> PolicySpec {
+        PolicySpec {
+            chunk: [4, 3],
+            rtc_chunk_size: Some(4),
+            ..spec(NoiseMode::Input)
+        }
+    }
+
+    fn rtc() -> RtcInputs {
+        RtcInputs {
+            prev_chunk_left_over: vec![0.5; 12],
+            inference_delay: 1,
+            max_guidance_weight: 5.0,
+            execution_horizon: 2,
         }
     }
 
@@ -284,6 +355,7 @@ mod tests {
             prompt: "pick".into(),
             seed: None,
             noise: None,
+            rtc: None,
         }
     }
 
@@ -343,6 +415,54 @@ mod tests {
         assert!(err_of(&s, &o).contains("5 values; expected 6 for shape [1, 2, 3]"));
         o.noise = Some(vec![0.0; 6]);
         check_observation(&s, &o).unwrap();
+    }
+
+    #[test]
+    fn rtc_inputs_are_checked_against_the_spec() {
+        let mut o = obs();
+        o.rtc = Some(rtc());
+        assert!(err_of(&spec(NoiseMode::Input), &o).contains("takes no RTC inputs"));
+        let s = rtc_spec();
+        check_observation(&s, &o).unwrap();
+        let bad = |f: &dyn Fn(&mut RtcInputs)| {
+            let mut o = obs();
+            let mut r = rtc();
+            f(&mut r);
+            o.rtc = Some(r);
+            err_of(&s, &o)
+        };
+        let e = bad(&|r| r.prev_chunk_left_over.pop().map(drop).unwrap());
+        assert!(e.contains("11 values; expected 12 for shape [4, 3]"), "{e}");
+        let e = bad(&|r| r.prev_chunk_left_over[3] = f32::INFINITY);
+        assert!(e.contains("non-finite"), "{e}");
+        let e = bad(&|r| r.execution_horizon = 0);
+        assert!(e.contains("execution_horizon must be positive"), "{e}");
+        let e = bad(&|r| r.execution_horizon = 3);
+        assert!(e.contains("more than half the chunk"), "{e}");
+        let e = bad(&|r| r.inference_delay = 3);
+        assert!(
+            e.contains("0 <= inference_delay <= execution_horizon"),
+            "{e}"
+        );
+        let e = bad(&|r| r.max_guidance_weight = -1.0);
+        assert!(
+            e.contains("max_guidance_weight must be finite and non-negative"),
+            "{e}"
+        );
+        let e = bad(&|r| r.max_guidance_weight = f32::NAN);
+        assert!(e.contains("max_guidance_weight must be finite"), "{e}");
+    }
+
+    #[test]
+    fn payload_cap_counts_the_rtc_leftover() {
+        let plain = PolicySpec {
+            rtc_chunk_size: None,
+            ..rtc_spec()
+        };
+        assert_eq!(
+            payload_cap(&rtc_spec()).unwrap(),
+            payload_cap(&plain).unwrap() + 4 * 3 * 4
+        );
     }
 
     #[test]
