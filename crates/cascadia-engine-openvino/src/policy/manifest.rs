@@ -11,6 +11,8 @@ use cascadia_engine::{EngineError, EngineResult};
 use serde::Deserialize;
 use serde_json::{Map, Value};
 
+use super::package::SKIPPED_DIR;
+
 /// The only `format` this loader accepts.
 pub const FORMAT: &str = "policy_package";
 
@@ -1054,6 +1056,18 @@ pub fn confine_artifact(path: &str) -> EngineResult<String> {
         Some("has a drive letter or stream (':')")
     } else if path.split(['/', '\\']).any(|c| c == "..") {
         Some("escapes the package directory ('..')")
+    } else if path
+        .split(['/', '\\'])
+        .find(|c| *c != ".")
+        // NTFS drops trailing dots and spaces, so `.cache.` opens `.cache`.
+        .is_some_and(|c| {
+            c.trim_end_matches(['.', ' '])
+                .eq_ignore_ascii_case(SKIPPED_DIR)
+        })
+    {
+        // The package identity skips it; reading it would let two packages
+        // that compute different actions match.
+        Some("is under the top-level .cache directory, which package_sha256 skips")
     } else {
         None
     };

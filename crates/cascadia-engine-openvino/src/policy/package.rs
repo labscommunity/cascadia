@@ -21,8 +21,12 @@ const GIT_SHA: &str = env!("CASCADIA_GIT_SHA");
 /// the target is (a Hub snapshot links out to its blob store). A symlink to a
 /// directory, a dangling one and anything but a file or directory are refused
 /// by name, as is a name `sha256sum` would escape (not UTF-8, `\\` or a newline).
-/// Nothing is ignored, OS metadata files included: an extra file can only
-/// refuse a match, never make two different packages match.
+/// Nothing else is ignored, OS metadata files included: an extra file can
+/// only refuse a match, never make two different packages match.
+///
+/// A top-level directory named `.cache` (any case) is skipped: `hf download
+/// --local-dir` writes per-download timestamps there, and the manifest may not
+/// name a path in it ([`super::manifest::confine_artifact`]).
 pub fn package_sha256(dir: &Path) -> std::io::Result<String> {
     package_sha256_with(dir, &[])
 }
@@ -32,7 +36,8 @@ pub fn package_sha256(dir: &Path) -> std::io::Result<String> {
 /// checksum, say). Each is a file name, no glob and no path, matched without
 /// case (as APFS and NTFS open it); the same name in a subdirectory, or a
 /// directory of that name, still counts. A name with a separator, a glob
-/// character, `.` or `..` is refused (`InvalidInput`).
+/// character, `.` or `..` is refused (`InvalidInput`). The top-level `.cache`
+/// directory is skipped here too, so both digests agree.
 ///
 /// This does not know which files the engine reads: ignoring one makes two
 /// packages that compute different actions match. Check the list against the
@@ -43,7 +48,9 @@ pub fn package_sha256_with(dir: &Path, ignore: &[String]) -> std::io::Result<Str
 }
 
 /// [`package_sha256_with`], also without the directory `skip` (the OpenVINO
-/// compile cache, which never changes outputs) when it lies inside `dir`.
+/// compile cache, which never changes outputs) when it lies inside `dir`. It
+/// skips the top-level `.cache` like the public digests, so the load's
+/// `package_sha256` equals theirs.
 pub(crate) fn digest(
     dir: &Path,
     ignore: &[String],
@@ -88,6 +95,9 @@ fn check_plain_names(ignore: &[String]) -> std::io::Result<()> {
         None => Ok(()),
     }
 }
+
+/// The top-level directory the digest skips; the engine never reads it.
+pub(crate) const SKIPPED_DIR: &str = ".cache";
 
 /// Read beside the tokenizer IR for the added special tokens.
 pub(crate) const TOKENIZER_JSON: &str = "tokenizer.json";
@@ -212,6 +222,9 @@ fn walk(
             continue;
         }
         if kind.is_dir() {
+            if prefix.is_empty() && rel.eq_ignore_ascii_case(SKIPPED_DIR) {
+                continue;
+            }
             if skip.is_some() && path.canonicalize().ok().as_deref() == skip {
                 continue;
             }
@@ -353,6 +366,96 @@ mod tests {
         fs::write(a.join("ov-cache/123.blob"), b"compiled").unwrap();
         assert_eq!(before, digest(&a, &[], Some(&a.join("ov-cache"))).unwrap());
         assert_ne!(before, package_sha256(&a).unwrap());
+    }
+
+    #[test]
+    fn a_top_level_hub_cache_does_not_count() {
+        let t = tempfile::tempdir().unwrap();
+        let a = package(t.path(), "a", b"w");
+        let b = package(t.path(), "b", b"w");
+        fs::create_dir_all(b.join(".cache/huggingface/download")).unwrap();
+        fs::write(b.join(".cache/huggingface/download/x.metadata"), b"t1").unwrap();
+        assert_eq!(package_sha256(&a).unwrap(), package_sha256(&b).unwrap());
+        assert_eq!(
+            package_sha256_with(&a, &[".staging".into()]).unwrap(),
+            digest(&b, &[".staging".into()], None).unwrap()
+        );
+    }
+
+    #[test]
+    fn a_top_level_cache_matches_without_case() {
+        let t = tempfile::tempdir().unwrap();
+        let a = package(t.path(), "a", b"w");
+        let b = package(t.path(), "b", b"w");
+        fs::create_dir_all(b.join(".CACHE")).unwrap();
+        fs::write(b.join(".CACHE/f"), b"x").unwrap();
+        assert_eq!(package_sha256(&a).unwrap(), package_sha256(&b).unwrap());
+    }
+
+    #[test]
+    fn a_nested_cache_directory_still_counts() {
+        let t = tempfile::tempdir().unwrap();
+        let a = package(t.path(), "a", b"w");
+        let before = package_sha256(&a).unwrap();
+        fs::create_dir_all(a.join("sub/.cache")).unwrap();
+        fs::write(a.join("sub/.cache/f"), b"x").unwrap();
+        assert_ne!(before, package_sha256(&a).unwrap());
+    }
+
+    #[test]
+    fn a_top_level_file_named_cache_still_counts() {
+        let t = tempfile::tempdir().unwrap();
+        let a = package(t.path(), "a", b"w");
+        let before = package_sha256(&a).unwrap();
+        fs::write(a.join(".cache"), b"x").unwrap();
+        assert_ne!(before, package_sha256(&a).unwrap());
+    }
+
+    #[test]
+    fn a_manifest_naming_the_skipped_cache_is_refused() {
+        let fixture: serde_json::Value = serde_json::from_str(include_str!(
+            "../../tests/fixtures/policy/intel-smolvla-libero-manifest.json"
+        ))
+        .unwrap();
+        let parse = |v: &serde_json::Value| {
+            super::super::manifest::PolicyManifest::parse(
+                &v.to_string(),
+                super::super::manifest::LoadOptions::default(),
+            )
+        };
+        for path in [
+            ".cache/smolvla.xml",
+            ".Cache/huggingface/smolvla.xml",
+            "./.cache/smolvla.xml",
+            ".cache\\smolvla.xml",
+            // NTFS drops trailing dots and spaces, opening `.cache`.
+            ".cache./smolvla.xml",
+            ".cache /smolvla.xml",
+        ] {
+            let mut v = fixture.clone();
+            v["model"]["artifacts"]["openvino"] = path.into();
+            let e = parse(&v).unwrap_err();
+            assert!(matches!(e, EngineError::InvalidConfig(_)), "{path}: {e}");
+            assert!(e.to_string().contains(".cache"), "{path}: {e}");
+        }
+        let mut v = fixture.clone();
+        let steps = v["model"]["preprocessors"].as_array_mut().unwrap();
+        let tok = steps
+            .iter_mut()
+            .find(|s| s["type"] == "ov_tokenizer")
+            .unwrap();
+        tok["artifact"] = ".CACHE/tokenizer.xml".into();
+        assert!(matches!(parse(&v), Err(EngineError::InvalidConfig(_))));
+        // Deeper, or only sharing the prefix, is an ordinary path.
+        for ok in [
+            "sub/.cache/smolvla.xml",
+            ".cache.xml",
+            ".cachex/smolvla.xml",
+        ] {
+            let mut v = fixture.clone();
+            v["model"]["artifacts"]["openvino"] = ok.into();
+            parse(&v).unwrap_or_else(|e| panic!("{ok}: {e}"));
+        }
     }
 
     #[cfg(unix)]

@@ -614,18 +614,24 @@ at one precision send identical bytes; the slowest warmup call appears only in
 - `package_sha256` (`cascadia_engine_openvino::policy::package_sha256`) covers every file in the
   package directory: `sha256sum` of the `sha256sum` listing (`<hex>  <path>`) of every file, by
   `/`-separated path relative to the package, sorted bytewise, so it can be checked by hand with
-  `cd <pkg> && find . -type f | sed 's|^\./||' | LC_ALL=C sort | tr '\n' '\0' | xargs -0 sha256sum
-  | sha256sum` (for a package without symlinks). A copied package has the same digest; any added,
-  removed, renamed or changed file changes it. A symlink to a file counts as that file's content
-  under the link's path, wherever it points, because a Hub snapshot is made of links into its blob
-  store (see `confine_artifact`). A symlink to a directory, a dangling symlink, any other non-file,
-  and a name `sha256sum` would escape (not UTF-8, `\` or a newline) refuse the load, naming the
-  entry. Each file is opened without blocking (unix) and checked to be a regular file on the open
-  handle, so an entry swapped for a FIFO after the walk is refused instead of waited on. Nothing is
-  ignored by default, OS metadata files (`.DS_Store`, `Thumbs.db`) included: an extra file can only
-  make two equal packages look different, which refuses a failover, never the reverse. Two
-  exceptions. `OvPolicyOptions.cache_dir`, when it lies inside the package: the compile cache never
-  changes outputs and is written after the digest is taken. And `OvPolicyOptions.digest_ignore`
+  `cd <pkg> && find . -type d -ipath ./.cache -prune -o -type f -print | sed 's|^\./||'
+  | LC_ALL=C sort | tr '\n' '\0' | xargs -0 sha256sum | sha256sum` (for a package without symlinks).
+  A copied package has the same digest; any added, removed, renamed or changed file changes it. A
+  symlink to a file counts as that file's content under the link's path, wherever it points, because
+  a Hub snapshot is made of links into its blob store (see `confine_artifact`). A symlink to a
+  directory, a dangling symlink, any other non-file, and a name `sha256sum` would escape (not UTF-8,
+  `\` or a newline) refuse the load, naming the entry. Each file is opened without blocking (unix)
+  and checked to be a regular file on the open handle, so an entry swapped for a FIFO after the walk
+  is refused instead of waited on. Nothing else is ignored by default, OS metadata files
+  (`.DS_Store`, `Thumbs.db`) included: an extra file can only make two equal packages look
+  different, which refuses a failover, never the reverse. Three exceptions. A top-level directory
+  named `.cache` (any case; deeper ones and a file of that name still count): `hf download
+  --local-dir` writes per-download timestamps under `.cache/huggingface/`, so two servers that
+  downloaded one pinned revision would never match. The engine never reads it, because
+  `confine_artifact` refuses a manifest path whose first component is `.cache` (also with NTFS's
+  dropped trailing dots or spaces), and every other file it opens sits beside a manifest artifact.
+  `OvPolicyOptions.cache_dir`, when it lies inside the package: the compile cache never changes
+  outputs and is written after the digest is taken. And `OvPolicyOptions.digest_ignore`
   (`package_sha256_with(dir, ignore)`), empty by default: top-level file names, no globs and no
   paths, matched without case (as APFS and NTFS open them), for files a deployer writes next to the
   package that never reach the engine (a staging checksum, say), so two nodes staged by one

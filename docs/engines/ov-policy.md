@@ -231,5 +231,7 @@ The policy API has **no authentication and no TLS**, like the chat API (see
   executable code, but its IRs are parsed and compiled by OpenVINO and the tokenizer extension, which
   are not hardened against hostile files, and its manifest decides how observations are transformed
   and how actions are scaled. A tampered package can make the robot move wrongly with no error.
-  The metadata's `package_sha256` covers every file in the package; compare it with the digest of
-  the package you vetted.
+  The metadata's `package_sha256` covers every file in the package except a top-level `.cache`
+  folder (the per-download timestamps `hf download --local-dir` writes, so two servers that
+  downloaded one revision match); compare it with the digest of the package you vetted. A manifest
+  that names a path under `.cache` is refused at load, so nothing the engine reads is left out.
