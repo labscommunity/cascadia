@@ -356,6 +356,10 @@ jobs:
             || { echo "::error::doctor did not report OpenVINO GenAI $want from the bundled lib/"; exit 1; }
           printf '%s\n' "$out" | grep -q "OpenVINO devices.*CPU" \
             || { echo "::error::doctor did not enumerate the CPU device from the bundled runtime"; exit 1; }
+          # ov-policy tokenizes prompts with the extension the bundle ships in lib/: doctor's
+          # line names its path when found, and says "not found" otherwise.
+          printf '%s\n' "$out" | grep -q "OpenVINO tokenizers extension.*openvino_tokenizers" \
+            || { echo "::error::doctor did not find the bundled openvino_tokenizers extension"; exit 1; }
 
       - name: Upload bundle to release
         if: ${{ env.DRY_RUN != 'true' }}
@@ -466,6 +470,8 @@ jobs:
           if ($out -match "OpenVINO GenAI.*but built against") { throw "doctor reports an OpenVINO GenAI runtime/build skew in the bundled DLLs" }
           if ($out -notmatch "OpenVINO GenAI.*$([regex]::Escape($want))") { throw "doctor did not report OpenVINO GenAI $want from the bundled DLLs" }
           if ($out -notmatch "OpenVINO devices.*CPU") { throw "doctor did not enumerate the CPU device from the bundled runtime" }
+          # ov-policy's tokenizer extension, beside cascadia.exe: the line names its path when found.
+          if ($out -notmatch "OpenVINO tokenizers extension.*openvino_tokenizers") { throw "doctor did not find the bundled openvino_tokenizers extension" }
 
       - name: Upload bundle to release
         if: ${{ env.DRY_RUN != 'true' }}

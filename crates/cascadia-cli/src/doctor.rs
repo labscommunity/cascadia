@@ -512,7 +512,8 @@ fn check_tokenizers_extension(r: &mut Report) {
 }
 
 /// `cascadia export-policy` builds its Python environment with uv. Optional, like llama-server:
-/// serving a package needs no uv, so a missing one is a note.
+/// serving a package needs no uv, so a missing, unreadable or old one is a note, as chat's
+/// export-only dependencies are.
 fn uv_check(
     found: Option<std::path::PathBuf>,
     version: Option<(u64, u64, u64)>,
@@ -529,12 +530,12 @@ fn uv_check(
             )],
         ),
         (Some(p), None) => (
-            Level::Warn,
+            Level::Info,
             format!("{}: could not read `uv --version`", p.display()),
             vec![format!("`cascadia export-policy` needs uv {need} or newer")],
         ),
         (Some(p), Some(v)) if v < MIN_UV => (
-            Level::Warn,
+            Level::Info,
             format!("{} is uv {}.{}.{}, too old", p.display(), v.0, v.1, v.2),
             vec![format!(
                 "`cascadia export-policy` needs uv {need} or newer (`uv self update`)"
@@ -581,7 +582,10 @@ pub fn cmd_doctor(args: DoctorArgs) -> Result<()> {
     println!();
     match r.worst {
         Level::Ok | Level::Info => {
-            println!("All good. Try:  cascadia run <model-dir>   (export one first: cascadia shard --help)");
+            println!(
+                "All good. Try:  cascadia run <model-dir>   (export one first: cascadia shard \
+                 --help, or for a robot policy cascadia export-policy --help)"
+            );
         }
         Level::Warn => {
             println!("Mostly OK with warnings above — see the remediation notes.");
@@ -650,9 +654,10 @@ mod tests {
         assert!(level == Level::Info);
         assert!(notes.join("\n").contains("export-policy"));
         let p = || Some(std::path::PathBuf::from("/usr/bin/uv"));
-        assert!(uv_check(p(), None).0 == Level::Warn);
+        // Export-only, so never a warning: serving needs no uv.
+        assert!(uv_check(p(), None).0 == Level::Info);
         let (level, detail, notes) = uv_check(p(), Some((0, 13, 5)));
-        assert!(level == Level::Warn);
+        assert!(level == Level::Info);
         assert!(detail.contains("0.13.5"), "{detail}");
         assert!(notes.join("\n").contains("0.13.6"));
         let (level, detail, notes) = uv_check(p(), Some((0, 13, 6)));

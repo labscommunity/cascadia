@@ -206,8 +206,8 @@ Checked before any work is queued:
 
 `cascadia doctor` has an `ov-policy` section: it finds the OpenVINO tokenizers extension the engine
 tokenizes prompts with (a miss is a warning naming the paths tried), and checks that uv 0.13.6 or
-newer is on `PATH` for `cascadia export-policy` (a miss is informational, with the install command:
-serving needs no uv).
+newer is on `PATH` for `cascadia export-policy` (a missing, unreadable or older uv is informational,
+with the install or update command: serving needs no uv).
 
 ## Security
 
