@@ -55,7 +55,8 @@ const GEMMA_PROHIBITED_USE: &str = "https://ai.google.dev/gemma/prohibited_use_p
 pub struct ExportPolicyArgs {
     /// The checkpoint: a Hugging Face model id, e.g. `lerobot/smolvla_libero`, or a local
     /// LeRobot checkpoint directory (`config.json`, the weights and the processor files), as
-    /// `cascadia shard` takes a local directory. A directory wins over a same-named model id.
+    /// `cascadia shard` takes a local directory. Write a directory as a path (`./name`); a model
+    /// id that is also a directory here is refused.
     #[arg(long)]
     pub model: String,
     /// Package directory to write; must not exist or be empty.
