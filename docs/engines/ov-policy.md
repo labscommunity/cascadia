@@ -29,7 +29,7 @@ The engine loads nine policy kinds. Where a package for each comes from:
 
 | Kind | Package source |
 |---|---|
-| `smolvla`, `pi05` | Intel publishes LIBERO packages on Hugging Face (`OpenVINO/smolvla-libero-fp16-ov`, `OpenVINO/pi05-libero-fp16-ov`); `cascadia export-policy --model <hf-model-id> --output-dir <dir>` exports a LeRobot checkpoint of either kind (design doc, "Exporter"). |
+| `smolvla`, `pi05` | Intel publishes LIBERO packages on Hugging Face (`OpenVINO/smolvla-libero-fp16-ov`, `OpenVINO/pi05-libero-fp16-ov`); `cascadia export-policy --model <hf-model-id or ./local-dir> --output-dir <dir>` exports a LeRobot checkpoint of either kind (design doc, "Exporter"). |
 | `gr00t_n1d7` | Intel's edge-ai-suites single-IR exporter, run on NVIDIA's checkpoint. |
 | `molmoact2` | Intel's exporter in physical-ai-studio. |
 | `pi0`, `xvla`, `evo1`, `vlajepa`, `xr0` | Exported by hand with Intel's physicalai-train exporter, patched or with LeRobot modules per kind. |

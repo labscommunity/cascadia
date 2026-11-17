@@ -431,27 +431,36 @@ pub(crate) fn serving_process(procs: &[ProcessFacts], own_pid: u32) -> Option<St
     ))
 }
 
-/// Whether `--model` names a local checkpoint directory rather than a model id.
+/// Whether `--model` names a local checkpoint rather than a model id (see [`crate::model_arg`]).
 pub(crate) fn is_local_checkpoint(model: &str) -> bool {
-    Path::new(model).is_dir()
+    matches!(
+        crate::model_arg::classify(model, |m| validate_model_id(m).is_ok()),
+        Ok(crate::model_arg::ModelArg::Local)
+    )
 }
 
 /// Local argument checks that need no network.
 pub(crate) fn check_inputs(args: &ExportPolicyArgs) -> Result<()> {
-    if is_local_checkpoint(&args.model) {
-        if !Path::new(&args.model).join("config.json").is_file() {
+    match crate::model_arg::classify(&args.model, |m| validate_model_id(m).is_ok())? {
+        crate::model_arg::ModelArg::Local if Path::new(&args.model).is_dir() => {
+            if !Path::new(&args.model).join("config.json").is_file() {
+                return Err(anyhow!(
+                    "{} has no config.json; a local --model must be a LeRobot checkpoint \
+                     directory",
+                    args.model
+                ));
+            }
+        }
+        crate::model_arg::ModelArg::Local => {
+            let id = validate_model_id(&args.model)
+                .err()
+                .map_or(String::new(), |e| format!("{e}\n"));
             return Err(anyhow!(
-                "{} has no config.json; a local --model must be a LeRobot checkpoint directory",
+                "{id}If {} is meant to be a local directory, it does not exist.",
                 args.model
             ));
         }
-    } else {
-        validate_model_id(&args.model).map_err(|e| {
-            anyhow!(
-                "{e}\nIf {} is meant to be a local directory, it does not exist.",
-                args.model
-            )
-        })?;
+        crate::model_arg::ModelArg::Hub => {}
     }
     let staging = staging_dir(&args.output_dir)?;
     for p in [staging.clone(), sibling(&staging, ".f32")] {
@@ -1175,6 +1184,23 @@ mod tests {
             "{n}"
         );
         assert!(!n.contains(root.path().to_str().unwrap()), "{n}");
+        // An id-shaped name that is also a directory here is refused, not exported locally.
+        let cwd = std::env::current_dir().unwrap();
+        let owner = tempfile::tempdir_in(&cwd).unwrap();
+        let owner_name = owner
+            .path()
+            .file_name()
+            .unwrap()
+            .to_str()
+            .unwrap()
+            .replace('.', "x");
+        std::fs::create_dir_all(cwd.join(&owner_name).join("ckpt")).unwrap();
+        let ambiguous = format!("{owner_name}/ckpt");
+        let e = check_inputs(&args(&ambiguous, &out))
+            .unwrap_err()
+            .to_string();
+        std::fs::remove_dir_all(cwd.join(&owner_name)).unwrap();
+        assert!(e.contains(&format!("Write ./{ambiguous}")), "{e}");
         // A path that does not exist is still read as a model id, and says so.
         let e = check_inputs(&args("./no/such/dir", &out))
             .unwrap_err()

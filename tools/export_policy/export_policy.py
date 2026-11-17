@@ -206,14 +206,42 @@ def card_license(readme: str) -> str | None:
     return None
 
 
+def escaping_link(root: Path) -> str | None:
+    """The first link under a local checkpoint that resolves outside it, or None.
+
+    The policy loader reads the checkpoint's weights and configs itself, so a link that leaves the
+    directory would pull an arbitrary file of this machine into the export.
+    """
+    top = root.resolve()
+    for p in sorted(root.rglob("*")):
+        if p.is_symlink() and not p.resolve().is_relative_to(top):
+            return p.relative_to(root).as_posix()
+    return None
+
+
 def local_files(root: Path) -> set[str]:
-    """Every file under a local checkpoint, as repository-relative paths."""
-    return {p.relative_to(root).as_posix() for p in root.rglob("*") if p.is_file()}
+    """Every regular file under a local checkpoint, as repository-relative paths (no links)."""
+    return {
+        p.relative_to(root).as_posix() for p in root.rglob("*") if p.is_file() and not p.is_symlink()
+    }
+
+
+def local_file(root: Path, name: str) -> Path | None:
+    """`name` under `root` if it is a regular file inside it; None if absent; ValueError for a
+    link or a path that leaves the directory."""
+    path = root / name
+    if not path.exists() and not path.is_symlink():
+        return None
+    if path.is_symlink() or not path.is_file():
+        raise ValueError(f"{name} in the local checkpoint is a link or not a regular file")
+    if not path.resolve().is_relative_to(root.resolve()):
+        raise ValueError(f"{name} resolves outside the local checkpoint")
+    return path
 
 
 def _read_local_json(root: Path, filename: str) -> dict | None:
-    path = root / filename
-    return json.loads(path.read_text(encoding="utf-8")) if path.is_file() else None
+    path = local_file(root, filename)
+    return json.loads(path.read_text(encoding="utf-8")) if path else None
 
 
 def _read_json(model: str, filename: str, revision: str | None) -> dict | None:
@@ -254,12 +282,23 @@ def preflight(model: str) -> dict:
     files = None
     local = Path(model) if Path(model).is_dir() else None
     if local is not None:
+        link = escaping_link(local)
+        if link is not None:
+            out["error"] = (
+                f"{model}: {link} is a link that leaves the checkpoint directory; copy the file in "
+                f"instead of linking it"
+            )
+            return out
         files = local_files(local)
         out["revision"] = LOCAL_REVISION
-        readme = local / "README.md"
-        out["license"] = card_license(readme.read_text(encoding="utf-8")) if readme.is_file() else None
-        out["license_files"] = license_files(files)
-        return _preflight_checks(out, files, lambda name: _read_local_json(local, name), local=True)
+        try:
+            readme = local_file(local, "README.md")
+            out["license"] = card_license(readme.read_text(encoding="utf-8")) if readme else None
+            out["license_files"] = license_files(files)
+            return _preflight_checks(out, files, lambda name: _read_local_json(local, name), local=True)
+        except ValueError as e:
+            out["error"] = f"{model}: {e}"
+            return out
     from huggingface_hub import model_info
     from huggingface_hub.errors import HfHubHTTPError, HFValidationError, RepositoryNotFoundError
 
@@ -420,6 +459,11 @@ def export(args: argparse.Namespace) -> int:
     tmp = out.with_name(out.name + ".f32")
     stats = load_stats(Path(args.stats)) if args.stats else None
 
+    if revision == LOCAL_REVISION:
+        link = escaping_link(Path(args.model))
+        if link is not None:
+            log(f"EXPORT FAILED: {link} is a link that leaves the checkpoint directory")
+            return 1
     t0 = time.perf_counter()
     _bind_revision(kind, args.model, revision)
     policy = _load_policy(kind, args.model, args.rtc)
@@ -468,12 +512,14 @@ def export(args: argparse.Namespace) -> int:
     if pre.get("license_files"):
         for name in pre["license_files"]:
             if revision == LOCAL_REVISION:
-                src = Path(args.model) / name
+                src = local_file(Path(args.model), name)
+                if src is None:
+                    raise ValueError(f"{name} left the local checkpoint during the export")
+                shutil.copy2(src, out / name, follow_symlinks=False)
             else:
                 from huggingface_hub import hf_hub_download
 
-                src = hf_hub_download(args.model, name, revision=revision)
-            shutil.copy2(src, out / name)
+                shutil.copy2(hf_hub_download(args.model, name, revision=revision), out / name)
         log(f"LICENCE OK copied {', '.join(pre['license_files'])}")
 
     if args.verify:

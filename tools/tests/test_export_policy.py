@@ -113,6 +113,28 @@ class LocalCheckpoint(unittest.TestCase):
         self.assertEqual(len(out["notes"]), 1)
         self.assertIn("google/paligemma-3b-pt-224", out["notes"][0])
 
+    @unittest.skipIf(os.name == "nt", "symlinks need privileges on Windows")
+    def test_a_link_out_of_the_checkpoint_is_refused(self):
+        with tempfile.TemporaryDirectory() as outside, tempfile.TemporaryDirectory() as d:
+            secret = Path(outside) / "id_key"
+            secret.write_text("private")
+            self._checkpoint(Path(d), "smolvla")
+            (Path(d) / "LICENSE").unlink()
+            (Path(d) / "LICENSE").symlink_to(secret)
+            out = ep.preflight(d)
+            self.assertIn("leaves the checkpoint directory", out["error"])
+            self.assertIn("LICENSE", out["error"])
+            # Even a link that stays inside is not a licence file to copy.
+            (Path(d) / "LICENSE").unlink()
+            (Path(d) / "LICENSE").symlink_to(Path(d) / "README.md")
+            self.assertNotIn("LICENSE", ep.local_files(Path(d)))
+            with self.assertRaises(ValueError):
+                ep.local_file(Path(d), "LICENSE")
+            # A weights file linked from outside is refused the same way.
+            (Path(d) / "LICENSE").unlink()
+            (Path(d) / "model.safetensors").symlink_to(secret)
+            self.assertEqual(ep.escaping_link(Path(d)), "model.safetensors")
+
     def test_a_local_directory_without_config_is_refused(self):
         with tempfile.TemporaryDirectory() as d:
             out = ep.preflight(d)

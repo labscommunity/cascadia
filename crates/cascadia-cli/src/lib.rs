@@ -33,6 +33,7 @@ pub mod discover;
 pub mod doctor;
 pub mod export_policy;
 mod host_check;
+mod model_arg;
 pub mod placement;
 pub mod profile;
 pub mod profile_stage;
@@ -3562,6 +3563,8 @@ async fn cmd_shard(args: ShardArgs) -> Result<()> {
     {
         eprintln!("warning: --static-seq/--static-context are ignored without --target npu");
     }
+    // `owner/name` with a same-named folder here is refused, as export-policy refuses it.
+    model_arg::classify(&args.model, |m| export_policy::validate_model_id(m).is_ok())?;
     // The same host checks export-policy refuses on; a shard export's need depends on the
     // model, so here they only warn.
     for w in host_check::shard_warnings(&host_check::read_host()) {
@@ -4390,6 +4393,37 @@ mod tests {
             Command::Shard(args) => args,
             _ => panic!("expected shard subcommand"),
         }
+    }
+
+    /// `shard --model owner/name` with a same-named folder here is refused, as export-policy
+    /// refuses it; `./owner/name` is the folder.
+    #[tokio::test]
+    async fn shard_refuses_an_id_that_is_also_a_folder_here() {
+        let cwd = std::env::current_dir().unwrap();
+        let tmp = tempfile::tempdir_in(&cwd).unwrap();
+        let owner = tmp
+            .path()
+            .file_name()
+            .unwrap()
+            .to_str()
+            .unwrap()
+            .replace('.', "y");
+        std::fs::create_dir_all(cwd.join(&owner).join("m")).unwrap();
+        let model = format!("{owner}/m");
+        let res = cmd_shard(parse_shard(&[
+            "cascadia",
+            "shard",
+            "--model",
+            &model,
+            "-o",
+            "out",
+            "--num-stages",
+            "1",
+        ]))
+        .await;
+        std::fs::remove_dir_all(cwd.join(&owner)).unwrap();
+        let e = res.unwrap_err().to_string();
+        assert!(e.contains(&format!("Write ./{model}")), "{e}");
     }
 
     /// True if `flag` appears immediately followed by `value` in the argv.
