@@ -589,15 +589,16 @@ async fn metrics() -> impl IntoResponse {
     ([(header::CONTENT_TYPE, content_type)], body)
 }
 
-/// Marks a 5xx raised before the request ever reached the engine, so
-/// [`track_pipeline_health`] does not read it as the pipeline failing.
+/// Marks a 5xx that says nothing about the pipeline failing (raised before the
+/// request reached the engine, or a capacity refusal), so
+/// [`track_pipeline_health`] does not latch readiness on it.
 ///
-/// The readiness flip is a latch with an asymmetry: a 5xx that keeps serving
-/// other traffic (a capacity 503) heals on the next 2xx, but one that a load
-/// balancer gates on `/health` stops the traffic that would have healed it.
-/// A chat-template render failure is request-shape-determined and never
-/// touches the pipeline, so letting it latch drains a healthy node
-/// permanently on a single request.
+/// The latch heals only on a later 2xx, and a load balancer that gates on
+/// `/health` stops the traffic that would bring one. So a 5xx a client can
+/// cause must not latch, or one caller drains a healthy node: a chat-template
+/// render failure is request-shape-determined, and a capacity 503 is what a
+/// caller gets by holding every slot with open streams (their 200s were
+/// counted when the streams started).
 #[derive(Clone, Copy)]
 struct PreEngineFailure;
 
@@ -2600,13 +2601,7 @@ async fn chat_completions(
         Ok(p) => p,
         Err(_) => {
             count_rejected("capacity");
-            return (
-                StatusCode::SERVICE_UNAVAILABLE,
-                Json(serde_json::json!({
-                    "error": "engine at capacity; retry after current requests complete"
-                })),
-            )
-                .into_response();
+            return capacity_response();
         }
     };
 
@@ -2820,13 +2815,7 @@ async fn completions(
         Ok(p) => p,
         Err(_) => {
             count_rejected("capacity");
-            return (
-                StatusCode::SERVICE_UNAVAILABLE,
-                Json(serde_json::json!({
-                    "error": "engine at capacity; retry after current requests complete"
-                })),
-            )
-                .into_response();
+            return capacity_response();
         }
     };
     state.stats.requests_total.fetch_add(1, Ordering::Relaxed);
@@ -3539,6 +3528,19 @@ fn content_frame(
     format!("data: {payload}\n\n")
 }
 
+/// The permit gate's 503; see [`PreEngineFailure`] for why it leaves readiness alone.
+fn capacity_response() -> axum::response::Response {
+    let mut resp = (
+        StatusCode::SERVICE_UNAVAILABLE,
+        Json(serde_json::json!({
+            "error": "engine at capacity; retry after current requests complete"
+        })),
+    )
+        .into_response();
+    resp.extensions_mut().insert(PreEngineFailure);
+    resp
+}
+
 fn engine_error_response(err: cascadia_engine::EngineError) -> axum::response::Response {
     use cascadia_engine::EngineError;
     // An engine-queue-full 503 is the same "at capacity" experience as the
@@ -3594,7 +3596,13 @@ fn engine_error_response(err: cascadia_engine::EngineError) -> axum::response::R
         // this node's to explain, like any other engine failure.
         EngineError::BatchAborted(_) => StatusCode::INTERNAL_SERVER_ERROR,
     };
-    (status, Json(serde_json::json!({"error": err.to_string()}))).into_response()
+    let capacity = matches!(err, EngineError::QueueFull { .. });
+    let mut resp = (status, Json(serde_json::json!({"error": err.to_string()}))).into_response();
+    // Capacity, like the permit gate's 503: not the pipeline failing.
+    if capacity {
+        resp.extensions_mut().insert(PreEngineFailure);
+    }
+    resp
 }
 
 async fn cancel(State(state): State<AppState>, Path(task_id): Path<String>) -> impl IntoResponse {
@@ -7263,7 +7271,7 @@ level={{ effort_map[eff] }}";
             .unwrap();
         let app = make_router(Arc::new(runner), "queuefull-model");
         let (status, _) = post_chat(
-            app,
+            app.clone(),
             serde_json::json!({
                 "model": "queuefull-model",
                 "messages": [{"role": "user", "content": "hi"}],
@@ -7271,6 +7279,20 @@ level={{ effort_map[eff] }}";
         )
         .await;
         assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+        let health = app
+            .oneshot(
+                Request::builder()
+                    .uri("/health")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            health.status(),
+            StatusCode::OK,
+            "a capacity 503 must not latch /health"
+        );
         let capacity_after = cascadia_metrics::API_REJECTED_TOTAL
             .with_label_values(&["capacity"])
             .get();
@@ -7278,6 +7300,60 @@ level={{ effort_map[eff] }}";
             capacity_after > capacity_before,
             "QueueFull 503 must count as a capacity rejection ({capacity_before} -> {capacity_after})"
         );
+    }
+
+    /// The permit gate's 503 is what a caller gets by holding every slot, so it
+    /// must not latch `/health` (no slots here stands in for all of them held).
+    #[tokio::test]
+    async fn permit_gate_503_does_not_latch_health() {
+        let runner = Runner::new(Box::new(MockBuilder::new()));
+        runner
+            .start(
+                PeerLayout::single_stage(),
+                ShardSpec::single_stage("mock-model", "CPU"),
+            )
+            .await
+            .unwrap();
+        let cfg = Config {
+            max_concurrent_requests: 0,
+            ..Config::default()
+        };
+        let app = make_router_with_config(Arc::new(runner), "mock-model", cfg);
+        for (uri, body) in [
+            (
+                "/v1/chat/completions",
+                serde_json::json!({"model": "mock-model", "messages": [{"role": "user", "content": "hi"}]}),
+            ),
+            (
+                "/v1/completions",
+                serde_json::json!({"model": "mock-model", "prompt": "hi"}),
+            ),
+        ] {
+            let r = app
+                .clone()
+                .oneshot(
+                    Request::builder()
+                        .method("POST")
+                        .uri(uri)
+                        .header("content-type", "application/json")
+                        .body(Body::from(body.to_string()))
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(r.status(), StatusCode::SERVICE_UNAVAILABLE, "{uri}");
+            let health = app
+                .clone()
+                .oneshot(
+                    Request::builder()
+                        .uri("/health")
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(health.status(), StatusCode::OK, "{uri}");
+        }
     }
 
     /// Engine that emits a token every step and NEVER finishes. Only

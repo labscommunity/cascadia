@@ -27,7 +27,7 @@ use super::physicalai::{
     encode_predict_reply, encode_reset_ok, key_prefix, read_seq, ControlError, ErrorCode,
     ServerIdentity, Timings, MAX_REQUEST_BYTES, NO_SEQ,
 };
-use super::server::SharedPolicy;
+use super::server::{is_engine_fault, SharedPolicy};
 use super::{check_reply, max_payload_bytes, PackageIdentity};
 
 /// A setup failure: a bad address or name, or Zenoh refusing to open.
@@ -173,6 +173,7 @@ impl Backend for LocalBackend {
                 Err(e) => Err(BackendError::Model(e.0)),
             },
             Err(EngineError::InvalidConfig(m)) => Err(BackendError::Invalid(m)),
+            Err(e) if !is_engine_fault(&e) => Err(BackendError::Invalid(e.to_string())),
             Err(e) => Err(BackendError::Model(e.to_string())),
         }
     }
@@ -598,6 +599,55 @@ mod tests {
             package_sha256: String::new(),
             server_resize: Some(cascadia_types::ServerResize::Letterbox),
             rtc_chunk_size: None,
+        }
+    }
+
+    /// Fails every call with the error its function builds.
+    struct Failing(PolicySpec, fn() -> EngineError);
+
+    impl cascadia_engine::PolicyEngine for Failing {
+        fn spec(&self) -> &PolicySpec {
+            &self.0
+        }
+        fn warmup(&mut self) -> cascadia_engine::EngineResult<Vec<u32>> {
+            Ok(Vec::new())
+        }
+        fn infer(&mut self, _: &Observation) -> cascadia_engine::EngineResult<ActionChunk> {
+            Err((self.1)())
+        }
+    }
+
+    /// A refusal is `invalid_request` and leaves readiness up; an engine
+    /// failure is `model_error` and clears it.
+    #[test]
+    fn refusals_leave_readiness_and_faults_clear_it() {
+        let cases: [(fn() -> EngineError, bool); 3] = [
+            (|| EngineError::PromptTooLong("over".into()), false),
+            (|| EngineError::InvalidConfig("bad".into()), false),
+            (|| EngineError::Backend("device lost".into()), true),
+        ];
+        for (make, fault) in cases {
+            let policy = SharedPolicy::new(Box::new(Failing(spec(), make)), 1).unwrap();
+            let backend = LocalBackend {
+                _slot: policy.try_slot().unwrap(),
+                policy: policy.clone(),
+            };
+            let obs = Observation {
+                images: Vec::new(),
+                state: Vec::new(),
+                prompt: String::new(),
+                seed: None,
+                noise: None,
+                rtc: None,
+            };
+            let deadline = Instant::now() + Duration::from_secs(10);
+            let e = backend.infer(&obs, deadline).err().unwrap();
+            let e_name = format!("{e:?}");
+            match (fault, e) {
+                (false, BackendError::Invalid(_)) | (true, BackendError::Model(_)) => {}
+                _ => panic!("{} answered {e_name}", make()),
+            }
+            assert_eq!(policy.is_ready(), !fault, "{}", make());
         }
     }
 

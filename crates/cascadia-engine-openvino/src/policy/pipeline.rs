@@ -243,6 +243,18 @@ impl Refusal {
     }
 }
 
+/// A tokenizer failure on a request's text. The tokenizer handled the
+/// package's own prompt at load and warmup, so a later failure follows from
+/// the text the client sent: a refusal, which leaves `/health` alone.
+fn refused_text(e: EngineError) -> EngineError {
+    match e {
+        EngineError::Backend(m) => {
+            EngineError::InvalidConfig(format!("the prompt could not be tokenized: {m}"))
+        }
+        other => other,
+    }
+}
+
 fn refuse<T>(msg: impl std::fmt::Display) -> EngineResult<T> {
     Err(EngineError::InvalidConfig(format!("policy model: {msg}")))
 }
@@ -1334,7 +1346,7 @@ impl PolicyPipeline {
         let zeros = vec![0.0; self.spec.state_len];
         let text = prompt_text(&self.manifest, task, &zeros, true)?;
         let tok = self.tokenizer.as_mut().ok_or(EngineError::NotLoaded)?;
-        let tokens = tok.tokenize(&text)?;
+        let tokens = tok.tokenize(&text).map_err(refused_text)?;
         let count = tokens.mask.iter().filter(|&&m| m).count();
         let limit = self.binding.prompt_len;
         // Only the image-slot prompts (π0.5) carry the state; the others' counts are exact.
@@ -1384,12 +1396,14 @@ impl PolicyPipeline {
             .tokenizer
             .as_mut()
             .ok_or(EngineError::NotLoaded)?
-            .tokenize(text)?;
+            .tokenize(text)
+            .map_err(refused_text)?;
         if self.binding.layout == PortLayout::Gr00t {
             return Ok(tokens);
         }
+        // Warmup's prompt filled the port, so a width that differs follows from this text.
         if tokens.ids.len() != limit || tokens.mask.len() != limit {
-            return Err(EngineError::Backend(format!(
+            return Err(EngineError::InvalidConfig(format!(
                 "the tokenizer produced {} ids and {} mask values; the model's prompt port takes {limit}",
                 tokens.ids.len(),
                 tokens.mask.len()
@@ -1834,8 +1848,10 @@ impl PolicyPipeline {
                 "the action output is {shape:?}; expected [1, {steps}, {dim}]"
             )));
         }
+        // Warmup proved the model answers finite actions, so a non-finite one
+        // follows from this request's inputs: refused, not an engine fault.
         if out.iter().any(|x| !x.is_finite()) {
-            return Err(EngineError::Backend(
+            return Err(EngineError::InvalidConfig(
                 "the model returned a non-finite action; refusing to send it".into(),
             ));
         }
@@ -1882,7 +1898,7 @@ impl PolicyPipeline {
         }
         let actions: Vec<f32> = actions.iter().map(|&x| x as f32).collect();
         if actions.iter().any(|x| !x.is_finite()) {
-            return Err(EngineError::Backend(
+            return Err(EngineError::InvalidConfig(
                 "denormalized actions overflow f32; refusing to send them".into(),
             ));
         }
@@ -1973,6 +1989,9 @@ mod tests {
         inputs: Vec<(String, HostTensor)>,
         infers: usize,
         fail_infer: bool,
+        /// The tokenizer fails, or returns one id too many.
+        fail_tokenize: bool,
+        extra_token: bool,
         texts: Vec<String>,
     }
 
@@ -2050,7 +2069,13 @@ mod tests {
             FAKE_SPECIAL.iter().map(|s| s.to_string()).collect()
         }
         fn tokenize(&mut self, text: &str) -> EngineResult<Tokens> {
-            self.log.lock().unwrap().texts.push(text.into());
+            let mut log = self.log.lock().unwrap();
+            log.texts.push(text.into());
+            if log.fail_tokenize {
+                return Err(EngineError::Backend("fake tokenizer failed".into()));
+            }
+            let extra = log.extra_token;
+            drop(log);
             let mut ids: Vec<i64> = fake_ids(text);
             if !self.truncation_state {
                 ids.truncate(self.port);
@@ -2058,7 +2083,11 @@ mod tests {
             let count = ids.len();
             let width = count.max(self.port);
             ids.resize(width, 0);
-            let mask = (0..width).map(|i| i < count).collect();
+            let mut mask: Vec<bool> = (0..width).map(|i| i < count).collect();
+            if extra {
+                ids.push(0);
+                mask.push(false);
+            }
             Ok(Tokens { ids, mask })
         }
     }
@@ -3559,7 +3588,51 @@ mod tests {
         let mut out = vec![0.0; 350];
         out[3] = f32::INFINITY;
         let mut r = rig(SMOLVLA_NOISE, false, true, out);
-        assert!(r.engine.infer(&obs(&spec, "go")).is_err());
+        let e = r.engine.infer(&obs(&spec, "go")).unwrap_err();
+        assert!(matches!(e, EngineError::InvalidConfig(_)), "{e}");
+    }
+
+    /// Every failure a request's own content can cause is a refusal
+    /// (`InvalidConfig` / `PromptTooLong`), so the server's `/health` stays up;
+    /// only the model's own calls fail as `Backend`.
+    #[test]
+    fn request_caused_failures_are_refusals() {
+        let refused = |e: &EngineError| {
+            matches!(
+                e,
+                EngineError::InvalidConfig(_) | EngineError::PromptTooLong(_)
+            )
+        };
+        let mut r = smolvla(true);
+        let spec = r.engine.spec().clone();
+        let e = r.engine.infer(&obs(&spec, &"x".repeat(200))).unwrap_err();
+        assert!(matches!(e, EngineError::PromptTooLong(_)), "{e}");
+        r.log.lock().unwrap().fail_tokenize = true;
+        let e = r.engine.infer(&obs(&spec, "go left")).unwrap_err();
+        assert!(
+            refused(&e) && e.to_string().contains("could not be tokenized"),
+            "{e}"
+        );
+        let mut r = smolvla(true);
+        r.log.lock().unwrap().extra_token = true;
+        let e = r.engine.infer(&obs(&spec, "go")).unwrap_err();
+        assert!(
+            refused(&e) && e.to_string().contains("prompt port takes"),
+            "{e}"
+        );
+        // Finite model output that the package's stats scale past f32.
+        let mut v: serde_json::Value = serde_json::from_str(PI05_LIBERO).unwrap();
+        let std = &mut v["model"]["postprocessors"][0]["stats"]["action"]["std"];
+        *std = serde_json::json!(vec![1e10; std.as_array().unwrap().len()]);
+        let mut r = rig(&v.to_string(), true, true, vec![1e30; 350]);
+        let spec = r.engine.spec().clone();
+        let e = r.engine.infer(&obs(&spec, "go")).unwrap_err();
+        assert!(refused(&e) && e.to_string().contains("overflow f32"), "{e}");
+        let mut r = smolvla(true);
+        r.log.lock().unwrap().fail_infer = true;
+        let spec = r.engine.spec().clone();
+        let e = r.engine.infer(&obs(&spec, "go")).unwrap_err();
+        assert!(matches!(e, EngineError::Backend(_)), "{e}");
     }
 
     #[test]

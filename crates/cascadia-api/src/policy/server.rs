@@ -114,7 +114,7 @@ impl SharedPolicy {
 
     /// One `infer` call on the engine from [`Self::lock`]; a panicking engine
     /// becomes an error, so every caller still gets an answer. Counts the call
-    /// and, but for a refused request (`InvalidConfig`), sets readiness from it.
+    /// and, but for a refused request (see [`is_engine_fault`]), sets readiness from it.
     pub fn infer_guarded(
         &self,
         engine: &mut dyn PolicyEngine,
@@ -135,7 +135,7 @@ impl SharedPolicy {
                 self.ready.store(true, Ordering::Relaxed);
                 "ok"
             }
-            Err(EngineError::InvalidConfig(_)) => "invalid",
+            Err(e) if !is_engine_fault(e) => "invalid",
             Err(_) => {
                 self.ready.store(false, Ordering::Relaxed);
                 "error"
@@ -145,6 +145,28 @@ impl SharedPolicy {
             .with_label_values(&[model, result])
             .inc();
         res
+    }
+}
+
+/// Whether `e` is the engine or device failing, which clears `/health`, rather
+/// than a request it refused. A client chooses what it sends, so an error its
+/// request alone can cause must stay a refusal, or one caller could take a
+/// healthy server out of a load balancer. Exhaustive so a new variant is classified.
+pub fn is_engine_fault(e: &EngineError) -> bool {
+    match e {
+        // The ones chat answers with a 4xx, or (capacity) leaves out of `/health`.
+        EngineError::InvalidConfig(_)
+        | EngineError::PromptTooLong(_)
+        | EngineError::QueueFull { .. }
+        | EngineError::PeerRejected(_)
+        | EngineError::ShardRejected(_)
+        | EngineError::ModelNotFound(_) => false,
+        EngineError::NotLoaded
+        | EngineError::NotConnected
+        | EngineError::Backend(_)
+        | EngineError::Io(_)
+        | EngineError::BatchAborted(_)
+        | EngineError::Task { .. } => true,
     }
 }
 
@@ -302,8 +324,8 @@ async fn serve_socket(socket: WebSocket, st: PolicyState, slot: OwnedSemaphorePe
                             let res = policy.infer_guarded(&mut **engine, &obs);
                             drop(engine);
                             match &res {
-                                Err(EngineError::InvalidConfig(m)) => {
-                                    tracing::info!(reason = %m, "policy request refused");
+                                Err(e) if !is_engine_fault(e) => {
+                                    tracing::info!(reason = %e, "policy request refused");
                                 }
                                 Err(e) => tracing::warn!(error = %e, "policy engine failed a request"),
                                 Ok(_) => {}

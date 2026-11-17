@@ -9,7 +9,7 @@ use std::time::{Duration, Instant};
 
 use cascadia_api::policy::server::{policy_router, serve_policy, PolicyServerConfig};
 use cascadia_api::policy::{decode_request, encode_metadata, encode_reply, max_payload_bytes};
-use cascadia_engine::{EngineResult, MockPolicyEngine, PolicyEngine};
+use cascadia_engine::{EngineError, EngineResult, MockPolicyEngine, PolicyEngine};
 use cascadia_types::{ActionChunk, NoiseMode, Observation, PolicySpec, ResizeConvention};
 use futures::{SinkExt, StreamExt};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -60,7 +60,8 @@ impl PolicyEngine for Slow {
 }
 
 /// Counts calls that reach the engine, takes `delay` each, and panics on the
-/// prompt "panic".
+/// prompt "panic"; "too long", "refused" and "nan" answer as a real engine
+/// does for a request whose content it cannot serve.
 struct Probe {
     inner: MockPolicyEngine,
     delay: Duration,
@@ -80,6 +81,16 @@ impl PolicyEngine for Probe {
             obs.prompt.trim() != "panic",
             "probe engine panics on request"
         );
+        match obs.prompt.trim() {
+            "too long" => return Err(EngineError::PromptTooLong("over the window".into())),
+            "refused" => return Err(EngineError::InvalidConfig("bad request".into())),
+            "nan" => {
+                let mut c = self.inner.infer(obs)?;
+                c.actions[0] = f32::NAN;
+                return Ok(c);
+            }
+            _ => {}
+        }
         std::thread::sleep(self.delay);
         self.inner.infer(obs)
     }
@@ -478,6 +489,28 @@ async fn health_degrades_after_an_engine_failure_and_recovers() {
     let health = http_get(addr, "/health").await;
     assert!(health.starts_with("HTTP/1.1 200"), "{health}");
     assert!(health.contains(r#"{"status":"ok"}"#), "{health}");
+}
+
+/// A request whose content the engine refuses, however it refuses it, is
+/// answered as refused and leaves `/health` up: a caller must not be able to
+/// take a healthy server out of a load balancer.
+#[tokio::test]
+async fn health_stays_up_for_requests_the_engine_refuses() {
+    let (engine, calls) = probe(Duration::ZERO);
+    let addr = start_engine(engine, PolicyServerConfig::default()).await;
+    let mut ws = connect(addr).await;
+    for prompt in ["too long        ", "refused         ", "nan             "] {
+        ws.send(Message::Binary(request_with_prompt(prompt)))
+            .await
+            .unwrap();
+        assert!(
+            matches!(next_data(&mut ws).await, Message::Text(_)),
+            "{prompt:?}"
+        );
+        let health = http_get(addr, "/health").await;
+        assert!(health.starts_with("HTTP/1.1 200"), "{prompt:?}: {health}");
+    }
+    assert_eq!(calls.load(Ordering::SeqCst), 3, "each reached the engine");
 }
 
 /// `/metrics` serves the Prometheus registry with the policy infer families and
