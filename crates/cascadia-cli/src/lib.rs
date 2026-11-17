@@ -1579,8 +1579,11 @@ async fn cmd_run_policy(args: RunArgs) -> Result<()> {
     // Device and precision errors (NPU, CPU f16) before any file is read.
     compile_config(&args.device, precision)?;
     let dir = PathBuf::from(&args.model);
+    if !dir.is_dir() {
+        return Err(missing_model_error(&args.model, EngineKind::OvPolicy));
+    }
     if !dir.join("manifest.json").is_file() {
-        return Err(missing_policy_package_error(&args.model, dir.is_dir()));
+        return Err(missing_manifest_error(&args.model));
     }
     let mut identity = cascadia_api::policy::PackageIdentity::from_package_dir(&dir)
         .with_context(|| format!("reading {}", dir.join("manifest.json").display()))?;
@@ -1667,31 +1670,15 @@ fn policy_load_options(
     }
 }
 
-/// [`missing_model_error`] for a policy package: how to export one. `is_dir` says the path is a
-/// directory without a `manifest.json` (a LeRobot checkpoint, most likely).
-fn missing_policy_package_error(model: &str, is_dir: bool) -> anyhow::Error {
-    // `-ov` keeps the suggested output apart from a local checkpoint of the same name.
-    let out = format!("./{}-ov", model_stem(model));
-    let what = if is_dir {
-        format!(
-            "{model} has no manifest.json, so it is not a policy_package. If it is a local \
-             LeRobot checkpoint (SmolVLA or pi0.5)"
-        )
-    } else {
-        format!(
-            "no policy package directory at {model}\n\n\
-             If that is a path, it does not exist. If it is a Hugging Face LeRobot checkpoint \
-             (SmolVLA or pi0.5)"
-        )
-    };
+/// A directory `--engine ov-policy` cannot serve: no `manifest.json`, so most likely a LeRobot
+/// checkpoint that still needs `cascadia export-policy`.
+fn missing_manifest_error(model: &str) -> anyhow::Error {
+    let hint = export_hint(model, EngineKind::OvPolicy);
     anyhow!(
-        "{what}: --engine ov-policy takes a local policy_package directory (manifest.json, the \
-         policy IR and the tokenizer IR) and never downloads or converts one. Export it first:\n\
-         \n  \
-         cascadia export-policy --model {model} --output-dir {out}\n    \
-         cascadia run {out} --engine ov-policy\n\
+        "{model} has no manifest.json; it is not an exported robot model. If it is a local \
+         LeRobot checkpoint (SmolVLA or pi0.5), export it first:\n\
          \n\
-         Other kinds: see docs/engines/ov-policy.md."
+         {hint}"
     )
 }
 
@@ -2306,6 +2293,12 @@ fn export_hint(model: &str, engine: EngineKind) -> String {
              export_deepseek_v4.py, export_inkling.py)."
                 .to_string()
         }
+        // `-ov` keeps the output apart from a local checkpoint of the same name.
+        EngineKind::OvPolicy => format!(
+            "  cascadia export-policy --model {model} --output-dir ./{stem}-ov\n    \
+             cascadia run ./{stem}-ov --engine ov-policy\n  \
+             (other robot models: see docs/engines/ov-policy.md)"
+        ),
         EngineKind::OvDistSpec => format!(
             "  cascadia shard --model {model} --output-dir ./{stem}-2stage --num-stages 2\n    \
              cascadia worker --engine ov-dist-spec --model ./{stem}-2stage --draft-model <ir-dir> ..."
@@ -5234,7 +5227,7 @@ mod tests {
             ),
             (
                 vec!["/no/such/pkg", "--engine", "ov-policy", "--device", "CPU"],
-                "no policy package directory",
+                "no model directory at /no/such/pkg",
             ),
         ] {
             let e = format!("{:#}", cmd_run(run_args(&argv)).await.unwrap_err());
@@ -5275,7 +5268,12 @@ mod tests {
             .await
             .unwrap_err()
         );
-        assert!(e.contains("has no manifest.json"), "{e}");
+        assert!(
+            e.contains(&format!(
+                "{path} has no manifest.json; it is not an exported robot model"
+            )),
+            "{e}"
+        );
         assert!(
             e.contains(&format!(
                 "cascadia export-policy --model {path} --output-dir ./"
