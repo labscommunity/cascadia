@@ -1,55 +1,24 @@
 //! `CASCADIA_GIT_SHA`: the commit this crate is built from, for
 //! `policy::engine_build`. The build environment's `CASCADIA_GIT_SHA` wins
 //! (a container build without `.git`), then the git checkout's `HEAD`, with
-//! `-dirty` appended when the working tree has changes, else `unknown`. A
+//! `-dirty` appended when tracked files have changes, else `unknown`. A
 //! `CASCADIA_GIT_SHA` left set in a shell overrides git too.
 
-use std::process::Command;
+#[path = "build_sha.rs"]
+mod build_sha;
+
+use std::path::Path;
 
 fn git(args: &[&str]) -> Option<String> {
-    let out = Command::new("git")
-        .args(args)
-        .current_dir(env!("CARGO_MANIFEST_DIR"))
-        .output()
-        .ok()?;
-    let s = String::from_utf8(out.stdout).ok()?.trim().to_string();
-    (out.status.success() && !s.is_empty()).then_some(s)
-}
-
-/// Whether the checkout has uncommitted or untracked changes. A failed
-/// `git status` counts as dirty: a build that cannot prove it is clean
-/// must not claim to be.
-fn dirty() -> bool {
-    let Ok(out) = Command::new("git")
-        // No index refresh: a write here would look like a change next build.
-        .args(["--no-optional-locks", "status", "--porcelain"])
-        .current_dir(env!("CARGO_MANIFEST_DIR"))
-        .output()
-    else {
-        return true;
-    };
-    !out.status.success() || !out.stdout.is_empty()
+    build_sha::git(Path::new(env!("CARGO_MANIFEST_DIR")), args)
 }
 
 fn main() {
     // A container or tarball build has no .git: pass the commit in.
     println!("cargo:rerun-if-env-changed=CASCADIA_GIT_SHA");
-    let from_env = std::env::var("CASCADIA_GIT_SHA")
-        .ok()
-        .map(|s| s.trim().to_string())
-        .filter(|s| !s.is_empty());
-    let mut clean = false;
-    let sha = match from_env {
-        Some(sha) => sha,
-        None => match git(&["rev-parse", "HEAD"]) {
-            Some(head) if dirty() => format!("{head}-dirty"),
-            Some(head) => {
-                clean = true;
-                head
-            }
-            None => "unknown".into(),
-        },
-    };
+    let from_env = std::env::var("CASCADIA_GIT_SHA").ok();
+    let (sha, clean) =
+        build_sha::engine_sha(from_env.as_deref(), Path::new(env!("CARGO_MANIFEST_DIR")));
     println!("cargo:rustc-env=CASCADIA_GIT_SHA={sha}");
     // Rebuild on a new commit or checkout, not only when this crate changes.
     // Cargo reruns a build script on every build while a watched path is

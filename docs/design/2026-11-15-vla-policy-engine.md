@@ -650,8 +650,8 @@ at one precision send identical bytes; the slowest warmup call appears only in
   argument in a container or tarball build, which has no `.git`; one left set in a shell
   overrides git too), else the checkout's `HEAD`, else `unknown`. It has no time or host in it, so two builds of one commit on one runtime give the same
   string, and `engine_build(runtime)` gives it for any runtime string. It is not in the metadata
-  bytes. A build from a modified working tree (`git status --porcelain` not empty, untracked
-  files included) reports `<HEAD>-dirty`. An `engine_build` with `+unknown`, a `-dirty` sha, or
+  bytes. A build whose tracked files differ from `HEAD`, staged or not, reports `<HEAD>-dirty`;
+  untracked files do not count, since a cargo git checkout always holds an untracked `.cargo-ok`. An `engine_build` with `+unknown`, a `-dirty` sha, or
   otherwise not of this form never matches anything, itself included, since it cannot tell two
   engines apart; `engine_build_is_known(&str)` applies that rule.
 - Two servers compute the same actions for a request when `package_sha256`, `precision`, `device`
