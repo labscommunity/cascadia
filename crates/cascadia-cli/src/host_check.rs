@@ -1,5 +1,6 @@
 //! The host checks the two exporters share: memory headroom and a process serving models.
-//! `export-policy` refuses on them, `shard` warns.
+//! A serving process is a warning for both; low memory is a refusal for `export-policy` and a
+//! warning for `shard`.
 
 use crate::export_policy::{HostFacts, ProcessFacts};
 
@@ -94,13 +95,17 @@ pub(crate) fn shard_warnings(f: &HostFacts) -> Vec<String> {
             gib(headroom(f))
         ));
     }
-    if let Some(found) = serving_process(&f.processes, f.own_pid) {
-        out.push(format!(
-            "{found} is serving on this host; the export takes much of the machine's memory and \
-             can starve it"
-        ));
-    }
+    out.extend(serving_warning(f));
     out
+}
+
+/// The warning both exporters print when another process serves models here; they export anyway.
+pub(crate) fn serving_warning(f: &HostFacts) -> Option<String> {
+    let found = serving_process(&f.processes, f.own_pid)?;
+    Some(format!(
+        "{found} is serving on this host; the export takes much of the machine's memory and can \
+         starve it"
+    ))
 }
 
 #[cfg(test)]

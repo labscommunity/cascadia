@@ -2,7 +2,7 @@
 //!
 //! Python runs only here, in a uv environment under the Cascadia cache built from the hashed
 //! requirements embedded below. Every refusal comes before the checkpoint is downloaded: the host
-//! checks (uv, memory, a serving process) before any environment exists, and the metadata checks
+//! checks (uv, memory) before any environment exists, and the metadata checks
 //! (gated tokenizer, statistics) from a small environment holding only `huggingface_hub`.
 
 use std::path::{Path, PathBuf};
@@ -419,17 +419,7 @@ pub(crate) fn host_refusal(f: &HostFacts) -> Option<String> {
             gib(f.total_ram)
         ));
     }
-    serving_process(&f.processes, f.own_pid)
-}
-
-/// [`crate::host_check::serving_process`] as export-policy's refusal.
-pub(crate) fn serving_process(procs: &[ProcessFacts], own_pid: u32) -> Option<String> {
-    let found = crate::host_check::serving_process(procs, own_pid)?;
-    Some(format!(
-        "{found} is serving on this host. An export takes most of the machine's memory for many \
-         minutes and would starve it. Export on a disposable Linux machine instead (x86-64, \
-         32 GiB of RAM plus swap) and copy the package over."
-    ))
+    None
 }
 
 /// Whether `--model` names a local checkpoint rather than a model id (see [`crate::model_arg`]).
@@ -628,8 +618,12 @@ pub(crate) fn run_export(args: &ExportPolicyArgs, host: &mut dyn ExportHost) -> 
     if let Some(why) = platform_refusal(std::env::consts::OS, std::env::consts::ARCH) {
         return Err(anyhow!(why));
     }
-    if let Some(why) = host_refusal(&host.facts()) {
+    let facts = host.facts();
+    if let Some(why) = host_refusal(&facts) {
         return Err(anyhow!(why));
+    }
+    if let Some(w) = crate::host_check::serving_warning(&facts) {
+        eprintln!("warning: {w}");
     }
     check_inputs(args)?;
     host.prepare_preflight()?;
@@ -980,6 +974,7 @@ pub fn cmd_export_policy(args: ExportPolicyArgs) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::host_check::{serving_process, serving_warning};
 
     fn parse(argv: &[&str]) -> std::result::Result<crate::Cli, clap::Error> {
         use clap::Parser as _;
@@ -1209,8 +1204,9 @@ mod tests {
         assert!(e.contains("it does not exist"), "{e}");
     }
 
+    /// A serving process is a warning, as for `shard`; only memory refuses.
     #[test]
-    fn refuses_on_a_serving_host() {
+    fn warns_on_a_serving_host() {
         for p in [
             proc(9, "ovms", &["ovms", "--config_path", "c.json"]),
             proc(9, "OVMS.exe", &[]),
@@ -1230,10 +1226,19 @@ mod tests {
                 processes: vec![proc(1, "bash", &[]), p.clone()],
                 ..roomy()
             };
-            let msg = host_refusal(&f).unwrap_or_else(|| panic!("{p:?} not refused"));
+            assert_eq!(host_refusal(&f), None, "{p:?}");
+            let msg = serving_warning(&f).unwrap_or_else(|| panic!("{p:?} not warned"));
             assert!(msg.contains("pid 9"), "{msg}");
-            assert!(msg.contains("disposable Linux machine"), "{msg}");
+            assert!(msg.contains("can starve it"), "{msg}");
         }
+        let dir = tempfile::tempdir().unwrap();
+        let a = args("lerobot/smolvla_libero", &dir.path().join("pkg"));
+        let busy = HostFacts {
+            processes: vec![proc(5, "ovms", &[])],
+            ..roomy()
+        };
+        let (r, _) = run_fake(busy, passing("smolvla"), &a);
+        r.unwrap();
     }
 
     #[test]
@@ -1860,10 +1865,6 @@ mod tests {
             HostFacts {
                 available_ram: GIB,
                 free_swap: 0,
-                ..roomy()
-            },
-            HostFacts {
-                processes: vec![proc(5, "ovms", &[])],
                 ..roomy()
             },
         ] {

@@ -741,17 +741,17 @@ machine.
   failure.
 - **`--rtc`** exports the RTC port group (SmolVLA and π0.5): the policy's `rtc_enabled` is set and
   `n_action_steps` is the full chunk, so the package has no trimmer.
-- **Refusals before the checkpoint is downloaded.** Memory and a serving box are checked before
-  any environment exists; the gated files and statistics are read from Hugging Face metadata only,
+- **Refusals before the checkpoint is downloaded.** Memory is checked before any environment
+  exists; the gated files and statistics are read from Hugging Face metadata only,
   in a small environment holding `huggingface_hub` at the export environment's versions (a few MB),
   before the export environment is installed:
   - **Memory.** Less than 32 GiB of available RAM plus free swap (the main gate), or less than
     15 GiB of physical RAM as the OS reports it (a 16 GiB VM reports about 15.6). Measured: 14.3 GB
     RSS plus up to 10 GB swap for π0.5, completed on a 16 GiB box with 48 GiB swap. A 38.6 GB Mac
     with other work running froze and needed a forced restart.
-  - **A serving box.** A cascadia node or OVMS process, or `cascadia run`, `worker`,
-    `run-placement` or `serve` (found after any global flags), on this host. The message suggests
-    a disposable Linux machine.
+  - **A serving box is a warning, not a refusal**, as for `cascadia shard`: a cascadia node or
+    OVMS process, or `cascadia run`, `worker` or `run-placement` (found after any global flags),
+    on this host.
   - **Bad arguments.** A model id that is not `owner/name` under Hugging Face's rules, or an
     `--output-dir` with no directory name (`.`, `/`).
   - **Gated files.** No access to `google/paligemma-3b-pt-224` for π0.5, with a message saying

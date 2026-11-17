@@ -422,8 +422,9 @@ cascadia export-policy --model <MODEL> -o <DIR> [--rtc] [--stats <FILE>] [--veri
 
 Every refusal comes before the checkpoint is downloaded. It refuses a host
 with under 32 GiB of available RAM plus free swap or under 15 GiB of physical
-RAM (a π0.5 export peaked at 14.3 GB resident plus 10 GB of swap), and a host
-where another process is serving models.
+RAM (a π0.5 export peaked at 14.3 GB resident plus 10 GB of swap). Like
+`shard`, it warns, and exports anyway, when another process (OVMS, a cascadia
+node, `cascadia run`/`worker`) is serving on the host.
 
 ```bash
 cascadia export-policy --model lerobot/smolvla_libero --output-dir ./smolvla_libero-ov
