@@ -47,9 +47,6 @@ cascadia-elastic = { workspace = true }
 cascadia-transport = { workspace = true }
 tokio = { workspace = true }
 axum = { workspace = true }
-hyper = { version = "1", features = ["server", "http1"] }
-hyper-util = { version = "0.1", features = ["server-auto", "tokio"] }
-tower = { workspace = true }
 clap = { workspace = true }
 clap_complete = "4"
 serde = { workspace = true }

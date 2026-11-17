@@ -555,6 +555,59 @@ pub fn make_router_with_stats(
         .layer(axum::middleware::from_fn(track_http_metrics))
 }
 
+/// The HTTP request headers must arrive within this, so a client trickling
+/// them cannot hold a connection (and its task) open.
+pub const HEADER_READ_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+
+/// Serve `app` on `listener` over HTTP/1.1: `TCP_NODELAY` on every accepted
+/// stream (per-token SSE frames leave as they are written instead of being
+/// Nagle-batched into ~1 s bursts), a deadline on the request headers, and
+/// upgrades enabled, which the policy WebSocket needs (a loop without them
+/// answers 101 and never upgrades). axum 0.7's `serve` exposes neither knob.
+pub async fn serve_http(
+    listener: tokio::net::TcpListener,
+    app: Router,
+    header_read_timeout: std::time::Duration,
+) -> std::io::Result<()> {
+    use hyper::server::conn::http1;
+    use hyper_util::rt::{TokioIo, TokioTimer};
+    use std::convert::Infallible;
+    use tower::Service;
+
+    loop {
+        let (stream, _) = match listener.accept().await {
+            Ok(v) => v,
+            Err(e) => {
+                warn!(error = %e, "accept failed; retrying after 50ms");
+                tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+                continue;
+            }
+        };
+        if let Err(e) = stream.set_nodelay(true) {
+            warn!(error = %e, "set_nodelay failed on accepted stream");
+        }
+        let app = app.clone();
+        // axum::Router is Arc-backed, so a clone per request is cheap and
+        // gives tower's `call` the `&mut self` hyper's `Fn` service cannot.
+        let svc = hyper::service::service_fn(move |req: hyper::Request<hyper::body::Incoming>| {
+            let mut router = app.clone();
+            let fut = router.call(req.map(Body::new));
+            async move { Ok::<_, Infallible>(fut.await.unwrap_or_else(|e: Infallible| match e {})) }
+        });
+        tokio::spawn(async move {
+            if let Err(e) = http1::Builder::new()
+                .timer(TokioTimer::new())
+                .header_read_timeout(header_read_timeout)
+                .serve_connection(TokioIo::new(stream), svc)
+                .with_upgrades()
+                .await
+            {
+                tracing::debug!(error = %e, "connection ended");
+            }
+        });
+    }
+}
+
 /// Request middleware: per-route request counter + latency histogram. Uses
 /// the MATCHED route template (bounded cardinality), never the raw URI; a
 /// request that matched no route is bucketed as `other`. For streaming

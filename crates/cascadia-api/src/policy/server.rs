@@ -27,8 +27,7 @@ use super::{
 /// the next one is closed, so a dropped robot frees its slot.
 pub const PING_EVERY: Duration = Duration::from_secs(20);
 
-/// The HTTP request headers must arrive within this.
-pub const HEADER_READ_TIMEOUT: Duration = Duration::from_secs(10);
+pub use crate::HEADER_READ_TIMEOUT;
 
 pub const DEFAULT_MAX_CONNECTIONS: usize = 4;
 
@@ -372,45 +371,11 @@ async fn serve_socket(socket: WebSocket, st: PolicyState, slot: OwnedSemaphorePe
     let _ = tokio::time::timeout(Duration::from_secs(1), tx.close()).await;
 }
 
-/// Serve `app` over HTTP/1.1 with upgrades enabled, which the WebSocket
-/// needs (a loop without `.with_upgrades()` answers 101 and never upgrades),
-/// and with a deadline on the request headers.
+/// [`crate::serve_http`], which chat serves through too.
 pub async fn serve_policy(
     listener: tokio::net::TcpListener,
     app: Router,
     header_read_timeout: Duration,
 ) -> std::io::Result<()> {
-    use hyper::server::conn::http1;
-    use hyper_util::rt::{TokioIo, TokioTimer};
-    use std::convert::Infallible;
-    use tower::Service;
-
-    loop {
-        let (stream, _) = match listener.accept().await {
-            Ok(v) => v,
-            Err(e) => {
-                tracing::warn!(error = %e, "accept failed; retrying after 50ms");
-                tokio::time::sleep(Duration::from_millis(50)).await;
-                continue;
-            }
-        };
-        let _ = stream.set_nodelay(true);
-        let app = app.clone();
-        let svc = hyper::service::service_fn(move |req: hyper::Request<hyper::body::Incoming>| {
-            let mut router = app.clone();
-            let fut = router.call(req.map(axum::body::Body::new));
-            async move { Ok::<_, Infallible>(fut.await.unwrap_or_else(|e: Infallible| match e {})) }
-        });
-        tokio::spawn(async move {
-            if let Err(e) = http1::Builder::new()
-                .timer(TokioTimer::new())
-                .header_read_timeout(header_read_timeout)
-                .serve_connection(TokioIo::new(stream), svc)
-                .with_upgrades()
-                .await
-            {
-                tracing::debug!(error = %e, "policy connection ended");
-            }
-        });
-    }
+    crate::serve_http(listener, app, header_read_timeout).await
 }
