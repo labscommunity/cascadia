@@ -202,7 +202,7 @@ fn decodes_openpi_client_rtc_fields() {
     assert_eq!(obs.noise, None);
     // A package exported without RTC refuses them rather than ignoring them.
     let e = decode_request(REQUEST_RTC, &spec()).unwrap_err().0;
-    assert!(e.contains("takes no RTC inputs"), "{e}");
+    assert!(e.contains("this model takes no RTC inputs"), "{e}");
     // Without the fields an RTC package serves the plain chunk.
     assert_eq!(decode_request(REQUEST, &rtc_spec()).unwrap().rtc, None);
 }
@@ -325,7 +325,7 @@ fn refuses_bad_noise() {
     constant.noise_shape = None;
     assert!(Req::good()
         .err(&constant)
-        .contains("takes no noise input (noise mode constant)"));
+        .contains("this model takes no noise input (noise mode constant)"));
 }
 
 #[test]
@@ -510,7 +510,7 @@ fn rtc_fields_on_a_package_without_rtc_are_not_encoded() {
     let mut obs = decode_request(REQUEST_RTC, &rtc_spec()).unwrap();
     obs.noise = None;
     let e = encode_request(&obs, &spec()).unwrap_err();
-    assert!(e.0.contains("takes no RTC inputs"), "{e}");
+    assert!(e.0.contains("this model takes no RTC inputs"), "{e}");
 }
 
 #[test]

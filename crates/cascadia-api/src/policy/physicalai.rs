@@ -495,7 +495,7 @@ fn scalar_uint(what: &str, a: &NpArray<'_>) -> Result<u32, RequestError> {
 /// Map physicalai's inputs onto an [`Observation`] for `spec`.
 ///
 /// `state` is `[D]` or `[1, D]`; `task` a one-string list (the prompt);
-/// cameras `images.<name>`, or a bare `images` for a one-camera package;
+/// cameras `images.<name>`, or a bare `images` for a one-camera model;
 /// `noise` `float32 [1, *noise_shape]`, input-mode packages only; for an RTC
 /// package `prev_chunk_left_over` `float32 [1, T, D]` (or `[T, D]`) and the
 /// scalars `inference_delay`, `max_guidance_weight`, `execution_horizon`, as
@@ -530,7 +530,7 @@ fn observation(
             },
             ("noise", Some(a)) => {
                 if spec.noise != NoiseMode::Input {
-                    return refuse("this package takes no noise input");
+                    return refuse("this model takes no noise input");
                 }
                 if !matches!(a.dtype, "float32" | "<f4") {
                     return refuse(format!("noise has dtype {}; expected float32", a.dtype));
@@ -544,7 +544,7 @@ fn observation(
             }
             ("prev_chunk_left_over", Some(a)) => {
                 let Some(t) = spec.rtc_chunk_size else {
-                    return refuse("this package takes no RTC inputs; export it with RTC enabled");
+                    return refuse("this model takes no RTC inputs; export it with RTC enabled");
                 };
                 if !matches!(a.dtype, "float32" | "<f4") {
                     return refuse(format!(
@@ -564,7 +564,7 @@ fn observation(
             ("inference_delay" | "execution_horizon" | "max_guidance_weight", Some(_))
                 if spec.rtc_chunk_size.is_none() =>
             {
-                return refuse("this package takes no RTC inputs; export it with RTC enabled")
+                return refuse("this model takes no RTC inputs; export it with RTC enabled")
             }
             ("inference_delay", Some(a)) => delay = Some(scalar_uint(name, &a)?),
             ("execution_horizon", Some(a)) => horizon = Some(scalar_uint(name, &a)?),
@@ -593,7 +593,7 @@ fn observation(
                 None if spec.cameras.len() == 1 => spec.cameras[0].clone(),
                 None => {
                     return refuse(format!(
-                    "a bare \"images\" key needs a one-camera package; send images.<name> for {:?}",
+                    "a bare \"images\" key needs a one-camera model; send images.<name> for {:?}",
                     spec.cameras
                 ))
                 }
@@ -858,7 +858,7 @@ fn not_resizable(cam: &str, img: &Image, spec: &PolicySpec) -> String {
         String::new()
     };
     format!(
-        "camera {cam:?} is {}x{}; this package's image preprocessing is not done on the \
+        "camera {cam:?} is {}x{}; this model's image preprocessing is not done on the \
          server, so send frames at {h}x{w}{hint}",
         img.height, img.width
     )
@@ -978,7 +978,7 @@ fn server_resize(cam: &str, img: &Image, spec: &PolicySpec) -> Result<Image, Req
                     Ok(cubic_frame(img, spec.height, spec.width))
                 }
                 Some((th, tw)) => refuse(format!(
-                    "camera {cam:?} is {}x{}, which this package's resize turns into {th}x{tw}; \
+                    "camera {cam:?} is {}x{}, which this model's resize turns into {th}x{tw}; \
                      its export takes {}x{}, so send frames at {}x{}",
                     img.height, img.width, spec.height, spec.width, spec.height, spec.width
                 )),

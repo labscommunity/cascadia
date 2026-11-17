@@ -119,7 +119,7 @@ impl VlaJepaHost {
             .collect();
         if positions.len() != self.num_embodied {
             return Err(EngineError::InvalidConfig(format!(
-                "the prompt has {} embodied-action tokens (id {}); the package needs exactly {}",
+                "the prompt has {} embodied-action tokens (id {}); the model needs exactly {}",
                 positions.len(),
                 self.embodied_token_id,
                 self.num_embodied

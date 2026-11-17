@@ -60,7 +60,7 @@ pub fn payload_cap(spec: &PolicySpec) -> EngineResult<u32> {
     match total {
         Some(t) if t <= u64::from(PAYLOAD_MAX_BYTES) => Ok(t as u32),
         _ => Err(EngineError::InvalidConfig(format!(
-            "a request for this package needs {} bytes; the WebSocket limit is {PAYLOAD_MAX_BYTES}",
+            "a request for this model needs {} bytes; the WebSocket limit is {PAYLOAD_MAX_BYTES}",
             total.map_or_else(|| "more than 2^64".into(), |t| t.to_string())
         ))),
     }
@@ -142,7 +142,7 @@ pub fn check_observation(spec: &PolicySpec, obs: &Observation) -> EngineResult<(
     }
     if let Some(noise) = &obs.noise {
         if spec.noise != NoiseMode::Input {
-            return bad("this package takes no noise input".into());
+            return bad("this model takes no noise input".into());
         }
         let Some(shape) = spec.noise_shape.as_deref() else {
             return bad("the spec has no noise shape for an input-mode package".into());
@@ -175,7 +175,7 @@ pub fn check_observation(spec: &PolicySpec, obs: &Observation) -> EngineResult<(
 fn check_rtc(spec: &PolicySpec, rtc: &RtcInputs) -> EngineResult<()> {
     let bad = |msg: String| Err(EngineError::InvalidConfig(msg));
     let Some(t) = spec.rtc_chunk_size else {
-        return bad("this package takes no RTC inputs; export it with RTC enabled".into());
+        return bad("this model takes no RTC inputs; export it with RTC enabled".into());
     };
     let d = spec.chunk[1];
     if t.checked_mul(d) != Some(rtc.prev_chunk_left_over.len()) {
@@ -408,7 +408,7 @@ mod tests {
         assert!(err_of(&s, &o).contains("17 bytes; the limit is 16"));
         let mut o = obs();
         o.noise = Some(vec![0.0; 6]);
-        assert!(err_of(&s, &o).contains("takes no noise"));
+        assert!(err_of(&s, &o).contains("this model takes no noise"));
         let s = spec(NoiseMode::Input);
         o.noise = Some(vec![0.0, 10.5, 0.0, 0.0, 0.0, 0.0]);
         assert!(err_of(&s, &o).contains("|x| <= 10"));
@@ -422,7 +422,7 @@ mod tests {
     fn rtc_inputs_are_checked_against_the_spec() {
         let mut o = obs();
         o.rtc = Some(rtc());
-        assert!(err_of(&spec(NoiseMode::Input), &o).contains("takes no RTC inputs"));
+        assert!(err_of(&spec(NoiseMode::Input), &o).contains("this model takes no RTC inputs"));
         let s = rtc_spec();
         check_observation(&s, &o).unwrap();
         let bad = |f: &dyn Fn(&mut RtcInputs)| {

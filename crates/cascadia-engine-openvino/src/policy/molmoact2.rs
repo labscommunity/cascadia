@@ -431,7 +431,7 @@ impl MolmoAct2Host {
         }
         if images != self.geo.cameras.len() {
             return Err(EngineError::InvalidConfig(format!(
-                "the prompt has {images} image placeholders; the package has {} cameras",
+                "the prompt has {images} image placeholders; the model has {} cameras",
                 self.geo.cameras.len()
             )));
         }

@@ -105,7 +105,10 @@ fn rtc_execution_inputs_decode() {
         })
     );
     let e = decode_predict(fixture!("predict-rtc.msgpack"), &spec(), max).unwrap_err();
-    assert!(e.message().contains("takes no RTC inputs"), "{e}");
+    assert!(
+        e.message().contains("this model takes no RTC inputs"),
+        "{e}"
+    );
 }
 
 #[test]
@@ -208,7 +211,7 @@ fn rtc_refusals() {
     )
     .unwrap_err()
     .0;
-    assert!(e.contains("takes no RTC inputs"), "{e}");
+    assert!(e.contains("this model takes no RTC inputs"), "{e}");
 }
 
 #[test]
@@ -303,7 +306,7 @@ fn a_bare_images_key_is_the_only_camera() {
     let r = decode_predict(fixture!("predict-single-camera.msgpack"), &one, max()).unwrap();
     assert_eq!(r.observation.images[0].0, "front");
     let e = decode_predict(fixture!("predict-single-camera.msgpack"), &spec(), max()).unwrap_err();
-    assert!(e.message().contains("one-camera package"), "{e}");
+    assert!(e.message().contains("needs a one-camera model"), "{e}");
 }
 
 #[test]

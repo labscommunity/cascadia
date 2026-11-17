@@ -385,7 +385,7 @@ impl Gr00tHost {
         let images = ids.iter().filter(|&&t| t == q.image_token_id).count();
         if images != self.geo.cameras {
             return Err(EngineError::InvalidConfig(format!(
-                "the prompt has {images} image tokens; the package has {} cameras",
+                "the prompt has {images} image tokens; the model has {} cameras",
                 self.geo.cameras
             )));
         }
@@ -563,10 +563,7 @@ mod tests {
         assert_eq!(row(2), [0, 1, 2, 1, 2, 3, 4, 5, 4, 5, 6, 0, 0, 0, 0, 0]);
         assert_eq!(h.id_budget(), 16 - 2 * 3);
         let e = h.inputs(&[5, 9, 6]).unwrap_err().to_string();
-        assert!(
-            e.contains("1 image tokens; the package has 2 cameras"),
-            "{e}"
-        );
+        assert!(e.contains("1 image tokens; the model has 2 cameras"), "{e}");
         let e = host(2, 10).inputs(&[5, 9, 6, 9, 7]).unwrap_err();
         assert!(matches!(e, EngineError::PromptTooLong(_)), "{e}");
     }

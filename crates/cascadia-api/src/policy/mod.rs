@@ -193,7 +193,7 @@ fn number(what: &str, v: Val<'_>) -> Result<f32, RequestError> {
 fn leftover(v: Val<'_>, spec: &PolicySpec) -> Result<Vec<f32>, RequestError> {
     const WHAT: &str = "prev_chunk_left_over";
     let Some(t) = spec.rtc_chunk_size else {
-        return refuse("this package takes no RTC inputs; export it with RTC enabled");
+        return refuse("this model takes no RTC inputs; export it with RTC enabled");
     };
     let a = NdArray::parse(WHAT, v)?;
     if a.dtype != "<f4" {
@@ -294,7 +294,7 @@ pub fn decode_request(bytes: &[u8], spec: &PolicySpec) -> Result<Observation, Re
                         NoiseMode::Constant => "constant",
                     };
                     return refuse(format!(
-                        "this package takes no noise input (noise mode {mode})"
+                        "this model takes no noise input (noise mode {mode})"
                     ));
                 }
                 let a = NdArray::parse("noise", v)?;
@@ -490,7 +490,7 @@ pub fn decode_metadata(bytes: &[u8]) -> Result<(PolicySpec, PackageIdentity), Re
 /// inputs for a package without RTC are refused.
 pub fn encode_request(obs: &Observation, spec: &PolicySpec) -> Result<Vec<u8>, RequestError> {
     if obs.rtc.is_some() && spec.rtc_chunk_size.is_none() {
-        return refuse("this package takes no RTC inputs; export it with RTC enabled");
+        return refuse("this model takes no RTC inputs; export it with RTC enabled");
     }
     let mut w = Writer::default();
     let n = 3
