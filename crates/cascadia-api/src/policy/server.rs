@@ -147,6 +147,28 @@ impl SharedPolicy {
     }
 }
 
+impl SharedPolicy {
+    /// Count a request refused before it reached the engine (it did not
+    /// decode, or was too large) as an `invalid` call.
+    pub fn count_refused(&self) {
+        cascadia_metrics::POLICY_INFERS_TOTAL
+            .with_label_values(&[self.spec.model.as_str(), "invalid"])
+            .inc();
+    }
+}
+
+/// Set chat's `cascadia_engine_model_load_duration_seconds` and
+/// `cascadia_engine_warmup_duration_seconds` for a loaded policy engine.
+pub fn record_load_times(spec: &PolicySpec, load: Duration, warmup: Duration) {
+    let labels = [spec.model.as_str(), spec.device.as_str()];
+    cascadia_metrics::ENGINE_LOAD_DURATION_SECONDS
+        .with_label_values(&labels)
+        .set(load.as_secs_f64());
+    cascadia_metrics::ENGINE_WARMUP_DURATION_SECONDS
+        .with_label_values(&labels)
+        .set(warmup.as_secs_f64());
+}
+
 /// Whether `e` is the engine or device failing, which clears `/health`, rather
 /// than a request it refused. A client chooses what it sends, so an error its
 /// request alone can cause must stay a refusal, or one caller could take a
@@ -255,6 +277,7 @@ async fn ws(
         Err(rejection) => return rejection.into_response(),
     };
     let Some(permit) = st.policy.try_slot() else {
+        crate::count_rejected("capacity");
         return error_response(
             StatusCode::SERVICE_UNAVAILABLE,
             format!(
@@ -303,7 +326,10 @@ async fn serve_socket(socket: WebSocket, st: PolicyState, slot: OwnedSemaphorePe
                     "one request at a time: wait for the reply before sending the next".into(),
                 )),
                 Some(Ok(Message::Binary(bytes))) => match decode_request(&bytes, st.policy.spec()) {
-                    Err(e) => Some(Message::Text(e.0)),
+                    Err(e) => {
+                        st.policy.count_refused();
+                        Some(Message::Text(e.0))
+                    }
                     Ok(obs) => {
                         busy = true;
                         let policy = st.policy.clone();

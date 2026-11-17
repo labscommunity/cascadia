@@ -52,8 +52,10 @@ WebSocket `/v1/policy/ws`, and with `--zenoh` Intel's physicalai protocol.
 Their replies become a robot's motor commands, and they have **no
 authentication and no TLS**, like the chat API. So:
 
-* The policy API binds `127.0.0.1:8000` unless `--api` is given, and
-  `--zenoh` binds loopback unless `--zenoh-allow-all-interfaces` is given.
+* The policy API binds `127.0.0.1:8000` unless `--api` is given, and both
+  `--api` and `--zenoh` refuse a non-loopback host unless
+  `--policy-allow-all-interfaces` is given. The chat API still binds all
+  interfaces by default and logs a warning when it does.
   Bound to a network address, anyone who can reach the port can drive the
   robot; OSS single-box mode has no way to restrict who calls.
 * A WebSocket upgrade whose `Origin` is not in `--policy-allow-origin`

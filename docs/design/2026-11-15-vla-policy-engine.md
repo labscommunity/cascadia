@@ -373,7 +373,7 @@ weights `w` from `inference_delay` and `execution_horizon`, and `v_t -= min(c·r
 
 ## Serving
 
-`cascadia run --engine ov-policy --model <dir>` takes its own path in `cmd_run`, before
+`cascadia run <dir> --engine ov-policy` (the package directory is `run`'s positional) takes its own path in `cmd_run`, before
 `WorkerArgs::single_node`: load and warm the engine, then serve the policy router plus `/health`
 and `/metrics`, which behave as the chat API's (`/health` turns 503 `degraded` after an engine
 failure until a call succeeds again; refused requests do not count). Shutdown closes the engine, as
@@ -576,14 +576,15 @@ wait on the same mutex as WebSocket calls.
 **Security.** Like Intel's server, there is no authentication: the session is a peer that listens
 on the one configured TCP endpoint, never connects out, has multicast and gossip scouting and shared
 memory off, and bounds incoming messages to `max_request_bytes`. It binds loopback unless
-`--zenoh-allow-all-interfaces` is given, and then warns. Authenticated network access is not built
+`--policy-allow-all-interfaces` is given, and then warns; the same opt-in governs the WebSocket's
+`--api` host. Authenticated network access is not built
 on Zenoh: Zenoh's `usrpwd` check happens inside the transport against a static credential
 dictionary, so the queryable never learns who called, and Intel's predict message carries no client
 identity; per-client authorization cannot be enforced there. A deployment that needs it keeps Zenoh
 on loopback and puts an authenticated hop in front through the bridge below.
 
 **Bridge.** `cascadia policy-bridge --zenoh 127.0.0.1:<port> --upstream <ws(s) URL> [--token-file
-<path>] [--ca-file <pem>] [--name <slot>]` serves Intel's protocol on loopback only (the same pinned
+<path>] [--ca-file <pem>] [--zenoh-name <slot>]` serves Intel's protocol on loopback only (the same pinned
 Zenoh settings) and forwards each predict as one openpi call to any openpi server: Cascadia's own, or
 a gateway that takes `Authorization: Bearer`. The token is read from the file, sent only over
 `wss://` or to loopback, and never logged. A `wss://` upstream is checked against the public web
@@ -666,7 +667,7 @@ at one precision send identical bytes; the slowest warmup call appears only in
 | `cascadia-engine` | `PolicyEngine: Send { fn spec(&self) -> &PolicySpec; fn warmup(&mut self) -> EngineResult<Vec<u32>>; fn infer(&mut self, obs: &Observation) -> EngineResult<ActionChunk>; fn close(&mut self) {} }` and a deterministic `MockPolicyEngine` for API and CLI tests on macOS. `warmup` makes `WARMUP_CALLS` (3) calls on zero frames, zero state, an empty prompt and seed 0, and returns each call's `infer_ms` rounded up to whole milliseconds; any failed call is returned as the error, so a package that cannot infer fails its load instead of serving errors. A caller can size a per-call timeout from the slowest. |
 | `cascadia-ov-genai-shim` | A `bool` dtype in `dtype_from_code`, `code_from_dtype`, the header defines and Rust `DType` (`from_code`, `bytes_per_element`); a string-tensor input for the tokenizer; a separate CPU runtime handle for the tokenizer, with the `openvino_tokenizers` extension added to that handle's `ov::Core`, and a way to set an infer request's state variable (`truncation`); `cascadia_runtime_has_op_type(handle, type)`, answered from op types recorded off the `ov::Model` before compile. Alias lookup already exists (`input_aliases`). |
 | `cascadia-engine-openvino` | `policy/`: manifest parsing (both component forms, version check, path confinement), port checks, the steps above (one module per family: `gr00t`, `molmoact2`, `qwen_vl`, `vla_jepa`, `xr0`), noise-mode detection, package identity (`package.rs`), `OvPolicyEngine` (`ov.rs`). `build.rs` sets the sha `engine_build` reports. |
-| `cascadia-api` | Policy router on its own state (the chat `AppState` stays untouched), the limits above, `axum` `ws` feature, msgpack with bin keys. The codec is a public module, `cascadia_api::policy`, so other serving layers can reuse it: `decode_request(&[u8], &PolicySpec) -> Result<Observation, RequestError>` (every decoding rule above; `RequestError` carries the client-facing message), `encode_reply(&ActionChunk) -> Vec<u8>`, `encode_metadata(&PolicySpec) -> Vec<u8>`, `metadata_json(&PolicySpec) -> String`, and `max_payload_bytes(&PolicySpec) -> u32` (the WebSocket cap formula). Behind the `zenoh` feature: `physicalai` (Intel's wire codec), `zenoh_server` and `bridge`. |
+| `cascadia-api` | Policy router on its own state (the chat `AppState` stays untouched), the limits above, `axum` `ws` feature, msgpack with bin keys. The codec is a public module, `cascadia_api::policy`, so other serving layers can reuse it: `decode_request(&[u8], &PolicySpec) -> Result<Observation, RequestError>` (every decoding rule above; `RequestError` carries the client-facing message), `encode_reply(&ActionChunk) -> Vec<u8>`, `encode_metadata(&PolicySpec) -> Vec<u8>`, `metadata_json(&PolicySpec) -> String`, and `max_payload_bytes(&PolicySpec) -> u32` (the WebSocket cap formula). `physicalai` (Intel's wire codec, built without Zenoh so its tests run everywhere), and behind the `zenoh` feature `zenoh_server` and `bridge`. |
 | `cascadia-cli` | `EngineKind::OvPolicy`, the policy serve path in `cmd_run`, `RunArgs.api` as `Option<String>`, refusal in `worker`/`build_builder`, `--zenoh` and `policy-bridge` (feature `zenoh`), `export-policy` with its driver script and hashed requirements file embedded by `include_str!` (as `cascadia shard` embeds `EXPORT_REQUIREMENTS`, since a release bundle carries only the binary), a `doctor` `ov-policy` section (the tokenizer extension, and uv for `export-policy`). |
 | `tools/` | `vla_reference.py` (the codec's golden msgpack bytes), `vla_libero_client.py` (benchmark adapter, with a reference resize per convention). Sources only; nothing here is read at run time. |
 | `.github/workflows/ai-pc-tests.yml` | Two steps that read the repository variable `CASCADIA_POLICY_PACKAGE_DIR`, check the package's `manifest.json` against the committed fixture and print the hashes of its top-level `.json`, `.xml` and `.bin` files, export `CASCADIA_POLICY_PACKAGE` and run `policy_openvino` with `CASCADIA_POLICY_GPU=1`; both skip when the variable is unset (see "Testing"). |

@@ -64,19 +64,20 @@ restart skips it; the cache never changes outputs.
 
 | Flag | Default | What it does |
 |---|---|---|
-| `--device GPU\|CPU` | `GPU` | Where the policy IR runs. The tokenizer always runs on CPU. **NPU is refused** for every policy (SmolVLA and π0.5 fail NPU compilation as exported; X-VLA compiles and returns wrong actions). |
+| `--device GPU\|CPU` | `GPU` | Where the policy IR runs: `GPU`, `GPU.N` (one of several GPUs), `CPU` or `CPU.N`; the compound forms (`AUTO`, `MULTI:`, `HETERO:`, `BATCH:`) are refused. The tokenizer always runs on CPU. **NPU is refused** for every policy (SmolVLA and π0.5 fail NPU compilation as exported; X-VLA compiles and returns wrong actions). |
 | `--policy-precision f16\|f32` | `f16` on GPU | GPU compute precision. CPU always runs f32 and refuses `f16`. Some large models (π0, XR0, GR00T, MolmoAct2) fail to compile at f32 on a 16 GB integrated GPU; that is a load error naming the IR and the device. |
-| `--api HOST:PORT` | `127.0.0.1:8000` | Where the HTTP and WebSocket API listens. See [Security](#security) before changing the host. |
+| `--api HOST:PORT` | `127.0.0.1:8000` | Where the HTTP and WebSocket API listens. A non-loopback host is refused without `--policy-allow-all-interfaces`; see [Security](#security). |
 | `--policy-allow-origin ORIGIN` | none | A browser `Origin` allowed to open the WebSocket (repeatable). |
-| `--policy-max-connections N` | `4` | Concurrent WebSocket connections; one more is refused with HTTP 503. |
+| `--policy-max-connections N` | `CASCADIA_API_MAX_CONCURRENT` if set, else `4` | Concurrent connections, shared by the WebSocket and Zenoh front ends; one more WebSocket is refused with HTTP 503. |
 | `--policy-allow-identity-stats` | off | Serve a package with placeholder statistics (testing only). |
 | `--zenoh HOST[:PORT]` | off | Also serve Intel's physicalai remote-inference protocol over Zenoh (below). |
 | `--zenoh-name NAME` | the manifest's policy name | The slot name physicalai clients are given. |
-| `--zenoh-allow-all-interfaces` | off | Let `--zenoh` bind a non-loopback host. |
+| `--policy-allow-all-interfaces` | off | Let the robot front ends (`--api` and `--zenoh`) bind a non-loopback host. |
 
 The robot-only flags carry the engine's prefix, as the sycl-llama ones carry `--llama-`; the Zenoh
 ones carry their front end's. Each is refused on a chat engine, and the chat-only `run` flags
-(`--prefix-cache-gb`, `--ep-*`, `--api-max-body-mb`, `--elastic*`, `--llama-*`) are refused here.
+(`--prefix-cache-gb`, `--ep-*`, `--api-max-body-mb`, `--elastic*`, `--llama-*`) are refused here,
+as each chat engine refuses another engine's flags.
 `--elastic` in particular is refused rather than ignored: its memory interposer has not been
 measured with a policy. `cascadia worker` refuses `ov-policy`: a policy is served by one process on
 one machine.
@@ -109,9 +110,13 @@ f16, depending on the model; see the design doc's Scope section for each kind).
 - `GET /health`: `{"status":"ok"}`, or 503 `{"status":"degraded"}` after the engine failed a call
   (a refused request does not count), until a call succeeds again, as on the chat engines.
 - `GET /metrics`: the Prometheus registry, as on the chat engines: per-route
-  `cascadia_http_requests_total` and `cascadia_http_request_duration_seconds`, plus
-  `cascadia_policy_infers_total{model,result}` (`ok`, `invalid` or `error`, from both front ends)
-  and `cascadia_policy_infer_duration_seconds{model}`.
+  `cascadia_http_requests_total` and `cascadia_http_request_duration_seconds`,
+  `cascadia_engine_model_load_duration_seconds` and `cascadia_engine_warmup_duration_seconds`, and
+  `cascadia_api_rejected_total{reason="capacity"}` for an upgrade refused because the server is
+  full, plus `cascadia_policy_infers_total{model,result}` (`ok`, `invalid` or `error`, from both
+  front ends; `invalid` includes requests that did not decode),
+  `cascadia_policy_infer_duration_seconds{model}` and, for Zenoh calls dropped before the model ran
+  them, `cascadia_policy_dropped_total{model,reason}` (`superseded` or `expired`).
 
 The keys are Cascadia's, so openpi clients are transport-compatible, not drop-in: a client written
 for another server's keys needs a small mapping.
@@ -161,7 +166,7 @@ cascadia policy-bridge --zenoh 127.0.0.1:7447 \
 - `--ca-file` trusts the `CERTIFICATE` blocks of that PEM file **instead of** the public web roots,
   for a gateway behind a private CA. It refuses a `ws://` upstream and a file with no parseable
   certificate.
-- `--name` sets the slot name; it defaults to the upstream's policy name.
+- `--zenoh-name` sets the slot name, as on `run`; it defaults to the upstream's policy name.
 
 One bridge serves one physicalai client. It ships in the same builds as `--zenoh`. Its loopback
 port has no authentication: any process on the same host can call the remote policy through it,
@@ -194,6 +199,8 @@ Checked before any work is queued:
 - Non-finite actions (possible from f16 overflow on the GPU) are an error, never sent.
 - One model per process; NPU, multi-machine sharding and server-side resize on the WebSocket are
   not supported.
+- `molmoact2` is refused on an ARM CPU: OpenVINO's ARM CPU plugin computes its graph wrongly (6.1e-1
+  off PyTorch on PyTorch's own inputs). Use an x86 CPU or the GPU.
 
 ## Doctor
 
@@ -207,12 +214,12 @@ serving needs no uv).
 The policy API has **no authentication and no TLS**, like the chat API (see
 [`../../SECURITY.md`](../../SECURITY.md)). A policy drives a robot, so the defaults are narrower:
 
-- **Loopback by default.** `--engine ov-policy` binds `127.0.0.1:8000` unless `--api` is given, and
-  `--zenoh` binds loopback unless `--zenoh-allow-all-interfaces` is given (it then warns).
+- **Loopback only, unless you opt in.** `--engine ov-policy` binds `127.0.0.1:8000` unless `--api`
+  is given, and both `--api` and `--zenoh` refuse a non-loopback host unless
+  `--policy-allow-all-interfaces` is given (they then warn).
 - **Bound to a network address, anyone who can reach the port can drive the robot.** With
-  `--api 0.0.0.0:8000` (or any non-loopback host), every client on that network can read the
-  metadata and send observations that become motor commands; the same holds for Zenoh with
-  `--zenoh-allow-all-interfaces`. In this single-box OSS mode there is no way to restrict who calls.
+  `--api 0.0.0.0:8000 --policy-allow-all-interfaces` (or any non-loopback host), every client on that network can read the
+  metadata and send observations that become motor commands; the same holds for Zenoh. In this single-box OSS mode there is no way to restrict who calls.
   Do it only on a network you control, or keep the server on loopback and put an authenticated TLS
   hop in front (a reverse proxy, or `policy-bridge` with `--token-file` against a gateway that
   checks the token).

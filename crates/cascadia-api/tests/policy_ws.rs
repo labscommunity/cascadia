@@ -219,6 +219,12 @@ async fn a_bad_request_gets_a_text_error_and_the_socket_stays_open() {
     }
     ws.send(Message::Binary(REQUEST.to_vec())).await.unwrap();
     assert_eq!(next_data(&mut ws).await, Message::Binary(expected_reply()));
+    // Counted as a refused call, as an engine refusal is.
+    let m = http_get(addr, "/metrics").await;
+    assert!(
+        m.contains(r#"cascadia_policy_infers_total{model="mock",result="invalid"}"#),
+        "{m}"
+    );
 }
 
 #[tokio::test]
@@ -277,6 +283,12 @@ async fn at_capacity_the_upgrade_gets_503() {
         }
         other => panic!("expected 503, got {other:?}"),
     }
+    // Booked like chat's permit-gate 503.
+    let m = http_get(addr, "/metrics").await;
+    assert!(
+        m.contains(r#"cascadia_api_rejected_total{reason="capacity"}"#),
+        "{m}"
+    );
     first.close(None).await.unwrap();
     drop(first);
     // The slot frees once the server sees the close.

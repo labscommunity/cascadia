@@ -349,7 +349,9 @@ pub struct WorkerArgs {
     #[arg(long)]
     pub next: Option<String>,
 
-    /// API bind address (e.g. :8000) — only valid for rank 0.
+    /// API bind address (e.g. :8000, all interfaces) — only valid for rank 0.
+    /// The API is unauthenticated, so a non-loopback bind logs a warning;
+    /// `127.0.0.1:8000` binds loopback only.
     #[arg(long)]
     pub api: Option<String>,
 
@@ -820,10 +822,11 @@ pub struct RunArgs {
     #[arg(long, value_enum, default_value_t = EngineKind::OvGenai)]
     pub engine: EngineKind,
 
-    /// API bind address. Defaults to `:8000` (all interfaces, port
-    /// 8000); `--engine ov-policy` defaults to `127.0.0.1:8000`, because the
-    /// policy API is unauthenticated and drives a robot. Pass e.g.
-    /// `127.0.0.1:8000` to bind loopback only.
+    /// API bind address. Chat engines default to `:8000` (all interfaces,
+    /// port 8000) and log a warning on any non-loopback bind, since the API
+    /// is unauthenticated; pass `127.0.0.1:8000` to bind loopback only.
+    /// `--engine ov-policy` defaults to `127.0.0.1:8000` and refuses a
+    /// non-loopback address without `--policy-allow-all-interfaces`.
     #[arg(long)]
     pub api: Option<String>,
 
@@ -838,8 +841,9 @@ pub struct RunArgs {
     #[arg(long, value_name = "ORIGIN")]
     pub policy_allow_origin: Vec<String>,
 
-    /// `--engine ov-policy` only: concurrent WebSocket connections (default
-    /// 4); one more is refused with HTTP 503.
+    /// `--engine ov-policy` only: concurrent connections across the
+    /// WebSocket and Zenoh front ends (default `CASCADIA_API_MAX_CONCURRENT`
+    /// when set, as for chat, else 4); one more is refused with HTTP 503.
     #[arg(long, value_parser = clap::value_parser!(u32).range(1..))]
     pub policy_max_connections: Option<u32>,
 
@@ -852,7 +856,7 @@ pub struct RunArgs {
     /// protocol over Zenoh, so `physicalai.inference.RemoteInferenceModel`
     /// can drive the policy. `HOST:PORT`, or `HOST` for physicalai's
     /// name-derived port. Unauthenticated: loopback only unless
-    /// `--zenoh-allow-all-interfaces`. Needs a build with `--features zenoh`.
+    /// `--policy-allow-all-interfaces`. Needs a build with `--features zenoh`.
     #[arg(long, value_name = "HOST[:PORT]")]
     pub zenoh: Option<String>,
 
@@ -861,10 +865,11 @@ pub struct RunArgs {
     #[arg(long, value_name = "NAME")]
     pub zenoh_name: Option<String>,
 
-    /// `--engine ov-policy` only: let `--zenoh` bind a non-loopback host.
-    /// Anything that reaches the port can drive the robot.
+    /// `--engine ov-policy` only: let the robot front ends (`--api`'s
+    /// WebSocket and `--zenoh`) bind a non-loopback address. Neither has
+    /// authentication: anything that reaches the port can drive the robot.
     #[arg(long)]
-    pub zenoh_allow_all_interfaces: bool,
+    pub policy_allow_all_interfaces: bool,
 
     /// `--engine qwen35` only: prefix-cache budget in GiB (0 disables; default
     /// min(16 GiB, RAM/4)). See `cascadia worker --help`.
@@ -979,10 +984,10 @@ pub struct PolicyBridgeArgs {
     #[arg(long, value_name = "PEM")]
     pub ca_file: Option<PathBuf>,
 
-    /// The slot name the physicalai client is given; defaults to the
-    /// upstream's policy name.
+    /// The slot name the physicalai client is given (as `run --zenoh-name`);
+    /// defaults to the upstream's policy name.
     #[arg(long, value_name = "NAME")]
-    pub name: Option<String>,
+    pub zenoh_name: Option<String>,
 }
 
 #[derive(Parser, Debug, Clone)]
@@ -1381,14 +1386,72 @@ fn check_engine_flags(args: &RunArgs) -> Result<()> {
         ("--zenoh", args.zenoh.is_some()),
         ("--zenoh-name", args.zenoh_name.is_some()),
         (
-            "--zenoh-allow-all-interfaces",
-            args.zenoh_allow_all_interfaces,
+            "--policy-allow-all-interfaces",
+            args.policy_allow_all_interfaces,
         ),
     ];
-    match used.iter().find(|(_, set)| *set) {
-        Some((flag, _)) => Err(anyhow!("{flag} applies to --engine ov-policy only")),
-        None => Ok(()),
+    if let Some((flag, _)) = used.iter().find(|(_, set)| *set) {
+        return Err(anyhow!("{flag} applies to --engine ov-policy only"));
     }
+    check_chat_flags_apply(args)
+}
+
+/// The sycl-llama-only `run` flags, each with whether it is set (a flag with
+/// a default counts as set when it differs from it).
+fn llama_flags_used(args: &RunArgs, d: &RunArgs) -> [(&'static str, bool); 8] {
+    [
+        ("--llama-mtp", args.llama_mtp),
+        ("--llama-bin", args.llama_bin.is_some()),
+        ("--llama-ctx", args.llama_ctx != d.llama_ctx),
+        ("--llama-ngl", args.llama_ngl != d.llama_ngl),
+        ("--llama-args", !args.llama_args.is_empty()),
+        ("--llama-host-layers", args.llama_host_layers.is_some()),
+        ("--llama-load-timeout", args.llama_load_timeout.is_some()),
+        (
+            "--llama-load-retries",
+            args.llama_load_retries != d.llama_load_retries,
+        ),
+    ]
+}
+
+/// Refuse an engine-specific chat flag on a chat engine that would ignore it.
+fn check_chat_flags_apply(args: &RunArgs) -> Result<()> {
+    let d = RunArgs::try_parse_from(["run", "m"]).expect("run parses with defaults");
+    let only = |engine: EngineKind, flags: &[(&'static str, bool)]| -> Result<()> {
+        match flags.iter().find(|(_, set)| *set) {
+            Some((flag, _)) if args.engine != engine => Err(anyhow!(
+                "{flag} applies to --engine {} only",
+                engine_name(engine)
+            )),
+            _ => Ok(()),
+        }
+    };
+    let elastic_tuning = [
+        ("--elastic-vram", args.elastic_vram != d.elastic_vram),
+        ("--elastic-share", args.elastic_share.is_some()),
+    ];
+    only(EngineKind::SyclLlama, &llama_flags_used(args, &d))?;
+    only(EngineKind::SyclLlama, &elastic_tuning)?;
+    if let Some((flag, _)) = elastic_tuning.iter().find(|(_, set)| *set) {
+        if !args.elastic {
+            return Err(anyhow!("{flag} needs --elastic"));
+        }
+    }
+    only(
+        EngineKind::Qwen36Moe,
+        &[("--prefix-cache-gb", args.prefix_cache_gb.is_some())],
+    )?;
+    only(
+        EngineKind::SparseMoe,
+        &[
+            ("--ep-workers", !args.ep_workers.is_empty()),
+            ("--ep-placement", args.ep_placement.is_some()),
+        ],
+    )?;
+    if args.ep_placement.is_some() && args.ep_workers.is_empty() {
+        return Err(anyhow!("--ep-placement needs --ep-workers"));
+    }
+    Ok(())
 }
 
 /// The chat-only `run` flags, refused on ov-policy. A flag with a default
@@ -1407,19 +1470,12 @@ fn check_chat_flags_unused(args: &RunArgs) -> Result<()> {
         ("--elastic", args.elastic),
         ("--elastic-vram", args.elastic_vram != d.elastic_vram),
         ("--elastic-share", args.elastic_share.is_some()),
-        ("--llama-mtp", args.llama_mtp),
-        ("--llama-bin", args.llama_bin.is_some()),
-        ("--llama-ctx", args.llama_ctx != d.llama_ctx),
-        ("--llama-ngl", args.llama_ngl != d.llama_ngl),
-        ("--llama-args", !args.llama_args.is_empty()),
-        ("--llama-host-layers", args.llama_host_layers.is_some()),
-        ("--llama-load-timeout", args.llama_load_timeout.is_some()),
-        (
-            "--llama-load-retries",
-            args.llama_load_retries != d.llama_load_retries,
-        ),
     ];
-    match used.iter().find(|(_, set)| *set) {
+    match used
+        .iter()
+        .chain(llama_flags_used(args, &d).iter())
+        .find(|(_, set)| *set)
+    {
         Some((flag, _)) => Err(anyhow!("{flag} does not apply to --engine ov-policy")),
         None => Ok(()),
     }
@@ -1471,6 +1527,7 @@ async fn cmd_run_policy(args: RunArgs) -> Result<()> {
     let api = args.api_addr();
     check_api_addr_is_tcp(Some(&api))?;
     let (host, port) = parse_addr(&api, "0.0.0.0")?;
+    check_policy_bind(&host, args.policy_allow_all_interfaces)?;
     let precision = args.policy_precision.map(|p| match p {
         PolicyPrecision::F16 => Precision::F16,
         PolicyPrecision::F32 => Precision::F32,
@@ -1487,22 +1544,49 @@ async fn cmd_run_policy(args: RunArgs) -> Result<()> {
     let opts = policy_load_options(&args, precision);
     let (engine, ms) =
         tokio::task::spawn_blocking(move || -> Result<(Box<dyn PolicyEngine>, Vec<u32>)> {
+            let started = std::time::Instant::now();
             let mut engine = OvPolicyEngine::load(&dir, &opts)
                 .with_context(|| format!("loading policy package {}", dir.display()))?;
+            let load = started.elapsed();
+            let started = std::time::Instant::now();
             let ms = engine.warmup().context("policy warmup")?;
+            cascadia_api::policy::server::record_load_times(engine.spec(), load, started.elapsed());
             info!(warmup_ms = ?ms, "policy warmed");
             Ok((Box::new(engine), ms))
         })
         .await
         .context("policy load task")??;
     identity.warmup_ms = ms.iter().copied().max();
-    let mut cfg = policy_server_config(&args);
+    let mut cfg = policy_server_config(
+        &args,
+        std::env::var("CASCADIA_API_MAX_CONCURRENT").ok().as_deref(),
+    );
     cfg.identity = identity;
     let listener = tokio::net::TcpListener::bind((host.as_str(), port))
         .await
         .with_context(|| format!("bind {host}:{port}"))?;
     let shutdown = install_shutdown_signal_handler().context("install_shutdown_signal_handler")?;
     serve_policy_engine(listener, engine, cfg, zenoh, shutdown).await
+}
+
+/// The policy WebSocket has no authentication and drives a robot, so it binds
+/// loopback unless the operator opts in, as `--zenoh` does.
+fn check_policy_bind(host: &str, allow_all_interfaces: bool) -> Result<()> {
+    if cascadia_api::policy::is_loopback_host(host) {
+        return Ok(());
+    }
+    if !allow_all_interfaces {
+        return Err(anyhow!(
+            "--api {host}: the policy server has no authentication, so it binds loopback only; \
+             pass --policy-allow-all-interfaces to bind {host}"
+        ));
+    }
+    tracing::warn!(
+        host,
+        "the policy WebSocket is listening beyond loopback with no authentication: \
+         anything that reaches it can drive the robot"
+    );
+    Ok(())
 }
 
 /// How `run` loads a package: chat's default compile cache, so a restart
@@ -1578,10 +1662,8 @@ fn zenoh_plan(
     identity: &cascadia_api::policy::PackageIdentity,
 ) -> Result<Option<ZenohPlan>> {
     let Some(addr) = &args.zenoh else {
-        if args.zenoh_name.is_some() || args.zenoh_allow_all_interfaces {
-            return Err(anyhow!(
-                "--zenoh-name and --zenoh-allow-all-interfaces need --zenoh"
-            ));
+        if args.zenoh_name.is_some() {
+            return Err(anyhow!("--zenoh-name needs --zenoh"));
         }
         return Ok(None);
     };
@@ -1602,17 +1684,22 @@ fn zenoh_plan(
         name,
         host,
         port,
-        allow_all_interfaces: args.zenoh_allow_all_interfaces,
+        allow_all_interfaces: args.policy_allow_all_interfaces,
     }))
 }
 
-fn policy_server_config(args: &RunArgs) -> cascadia_api::policy::server::PolicyServerConfig {
+/// `max_concurrent_env` is `CASCADIA_API_MAX_CONCURRENT`, the default cap.
+fn policy_server_config(
+    args: &RunArgs,
+    max_concurrent_env: Option<&str>,
+) -> cascadia_api::policy::server::PolicyServerConfig {
     use cascadia_api::policy::server::{PolicyServerConfig, DEFAULT_MAX_CONNECTIONS};
     PolicyServerConfig {
         allow_origins: args.policy_allow_origin.clone(),
-        max_connections: args
-            .policy_max_connections
-            .map_or(DEFAULT_MAX_CONNECTIONS, |n| n as usize),
+        max_connections: args.policy_max_connections.map_or_else(
+            || api_max_concurrent(max_concurrent_env, DEFAULT_MAX_CONNECTIONS),
+            |n| n as usize,
+        ),
         ..Default::default()
     }
 }
@@ -1669,13 +1756,17 @@ async fn serve_policy_engine(
     let res = tokio::select! {
         res = serve_policy(listener, app, HEADER_READ_TIMEOUT) => res.context("serve_policy"),
         sig = shutdown => {
-            info!(signal = %sig, "shutdown signal received; closing the policy engine");
+            info!(
+                signal = %sig,
+                pid = std::process::id(),
+                "shutdown signal received; closing the policy engine"
+            );
             Ok(())
         }
     };
     #[cfg(feature = "zenoh")]
     if let Some(z) = zenoh {
-        z.stop().await;
+        stop_bounded(z.stop()).await;
     }
     // As chat closes its runner: off the runtime (the lock waits for a call in
     // flight) and bounded, so a stuck engine cannot hold the exit.
@@ -1689,6 +1780,21 @@ async fn serve_policy_engine(
         ),
     }
     res
+}
+
+/// Stop a Zenoh front end within [`SHUTDOWN_CLOSE_TIMEOUT`], so a stuck
+/// session cannot hold the exit.
+#[cfg(feature = "zenoh")]
+async fn stop_bounded(stop: impl std::future::Future<Output = ()>) {
+    if tokio::time::timeout(SHUTDOWN_CLOSE_TIMEOUT, stop)
+        .await
+        .is_err()
+    {
+        tracing::warn!(
+            timeout_s = SHUTDOWN_CLOSE_TIMEOUT.as_secs(),
+            "the Zenoh front end did not stop in time; exiting anyway"
+        );
+    }
 }
 
 /// `cascadia policy-bridge`: physicalai on loopback, openpi upstream.
@@ -1706,16 +1812,16 @@ async fn cmd_policy_bridge(args: PolicyBridgeArgs) -> Result<()> {
         }
         None => None,
     };
-    if let Some(name) = &args.name {
+    if let Some(name) = &args.zenoh_name {
         cascadia_api::policy::physicalai::check_name(name)
-            .map_err(|e| anyhow!("--name {name:?}: {e}"))?;
+            .map_err(|e| anyhow!("--zenoh-name {name:?}: {e}"))?;
     }
     #[cfg(feature = "zenoh")]
     {
         use cascadia_api::policy::bridge::{start_bridge, Upstream};
         use cascadia_api::policy::zenoh_server::ZenohListen;
         let listen = ZenohListen {
-            name: args.name.unwrap_or_default(),
+            name: args.zenoh_name.unwrap_or_default(),
             host,
             port,
             allow_all_interfaces: false,
@@ -1732,8 +1838,8 @@ async fn cmd_policy_bridge(args: PolicyBridgeArgs) -> Result<()> {
         let shutdown =
             install_shutdown_signal_handler().context("install_shutdown_signal_handler")?;
         let sig = shutdown.await;
-        info!(signal = %sig, "shutdown signal received");
-        bridge.front.stop().await;
+        info!(signal = %sig, pid = std::process::id(), "shutdown signal received");
+        stop_bounded(bridge.front.stop()).await;
         Ok(())
     }
     #[cfg(not(feature = "zenoh"))]
@@ -3072,6 +3178,14 @@ async fn cmd_worker(args: WorkerArgs) -> Result<()> {
         // fallback, so it must be merged second.
         let app = api_router.merge(cascadia_dashboard::make_router(dash_state));
         let listener = tokio::net::TcpListener::bind((api_host.as_str(), api_port)).await?;
+        if !cascadia_api::policy::is_loopback_host(&api_host) {
+            tracing::warn!(
+                host = %api_host,
+                port = api_port,
+                "the API is listening beyond loopback with no authentication; bind \
+                 127.0.0.1 or put an authenticating proxy in front (see SECURITY.md)"
+            );
+        }
         // Only claim a dashboard when this build actually embeds one — the
         // unconditional "API + dashboard serving" line sent the first
         // source-build user to a bare 404 on `/`. `SPA_EMBEDDED` comes from
@@ -4647,7 +4761,7 @@ mod tests {
             &["--policy-max-connections", "2"],
             &["--zenoh", "127.0.0.1"],
             &["--zenoh-name", "x"],
-            &["--zenoh-allow-all-interfaces"],
+            &["--policy-allow-all-interfaces"],
             // The default value itself is still an explicit flag.
             &["--policy-max-connections", "4"],
             &["--policy-allow-identity-stats"],
@@ -4672,7 +4786,7 @@ mod tests {
         );
         let default = run_args(&["pkg", "--engine", "ov-policy"]);
         assert_eq!(default.policy_max_connections, None);
-        assert_eq!(policy_server_config(&default).max_connections, 4);
+        assert_eq!(policy_server_config(&default, None).max_connections, 4);
         let two = run_args(&[
             "pkg",
             "--engine",
@@ -4680,39 +4794,152 @@ mod tests {
             "--policy-max-connections",
             "2",
         ]);
-        assert_eq!(policy_server_config(&two).max_connections, 2);
+        assert_eq!(policy_server_config(&two, None).max_connections, 2);
     }
 
     #[test]
     fn chat_flags_are_refused_on_ov_policy() {
-        for flags in [
-            &["--prefix-cache-gb", "4"][..],
-            &["--ep-workers", "127.0.0.1:9201"],
-            &["--ep-placement", "p.json"],
-            &["--api-max-body-mb", "8"],
-            &["--elastic"],
-            &["--elastic-vram", "0"],
-            &["--elastic-share", "2"],
-            &["--llama-mtp"],
-            &["--llama-bin", "llama-server"],
-            &["--llama-ctx", "8192"],
-            &["--llama-ngl", "10"],
-            &["--llama-args", "-fa on"],
-            &["--llama-host-layers", "x"],
-            &["--llama-load-timeout", "5"],
-            &["--llama-load-retries", "3"],
+        for (engine, flags) in [
+            ("qwen35", &["--prefix-cache-gb", "4"][..]),
+            ("sparse-moe", &["--ep-workers", "127.0.0.1:9201"]),
+            (
+                "sparse-moe",
+                &["--ep-workers", "127.0.0.1:9201", "--ep-placement", "p.json"],
+            ),
+            ("ov-genai", &["--api-max-body-mb", "8"]),
+            ("ov-genai", &["--elastic"]),
+            ("sycl-llama", &["--elastic-vram", "0", "--elastic"]),
+            ("sycl-llama", &["--elastic-share", "2", "--elastic"]),
+            ("sycl-llama", &["--llama-mtp"]),
+            ("sycl-llama", &["--llama-bin", "llama-server"]),
+            ("sycl-llama", &["--llama-ctx", "8192"]),
+            ("sycl-llama", &["--llama-ngl", "10"]),
+            ("sycl-llama", &["--llama-args", "-fa on"]),
+            ("sycl-llama", &["--llama-host-layers", "x"]),
+            ("sycl-llama", &["--llama-load-timeout", "5"]),
+            ("sycl-llama", &["--llama-load-retries", "3"]),
         ] {
-            let mut argv = vec!["m"];
+            let mut argv = vec!["m", "--engine", engine];
             argv.extend_from_slice(flags);
             check_engine_flags(&run_args(&argv)).unwrap();
+            let mut argv = vec!["m"];
+            argv.extend_from_slice(flags);
             argv.extend(["--engine", "ov-policy"]);
             let e = check_engine_flags(&run_args(&argv))
                 .unwrap_err()
                 .to_string();
-            assert!(e.contains(flags[0]), "{e}");
+            assert!(
+                flags.iter().any(|f| f.starts_with("--") && e.contains(f)),
+                "{e}"
+            );
             assert!(e.contains("does not apply to --engine ov-policy"), "{e}");
         }
         check_engine_flags(&run_args(&["pkg", "--engine", "ov-policy"])).unwrap();
+    }
+
+    /// A chat engine refuses another engine's flags instead of ignoring them.
+    #[test]
+    fn chat_engines_refuse_flags_they_cannot_apply() {
+        let refused = |argv: &[&str]| {
+            let mut a = vec!["m"];
+            a.extend_from_slice(argv);
+            check_engine_flags(&run_args(&a)).unwrap_err().to_string()
+        };
+        for (flags, want) in [
+            (
+                &["--llama-ctx", "8192"][..],
+                "--llama-ctx applies to --engine sycl-llama only",
+            ),
+            (
+                &["--llama-mtp", "--engine", "ov-runtime"],
+                "--llama-mtp applies to --engine sycl-llama only",
+            ),
+            (
+                &["--elastic-share", "2", "--elastic"],
+                "--elastic-share applies to --engine sycl-llama only",
+            ),
+            (
+                &["--elastic-vram", "0", "--engine", "sycl-llama"],
+                "--elastic-vram needs --elastic",
+            ),
+            (
+                &["--elastic-share", "2", "--engine", "sycl-llama"],
+                "--elastic-share needs --elastic",
+            ),
+            (
+                &["--prefix-cache-gb", "4"],
+                "--prefix-cache-gb applies to --engine qwen35 only",
+            ),
+            (
+                &["--ep-workers", "127.0.0.1:9201", "--engine", "qwen35"],
+                "--ep-workers applies to --engine sparse-moe only",
+            ),
+            (
+                &["--ep-placement", "p.json", "--engine", "sparse-moe"],
+                "--ep-placement needs --ep-workers",
+            ),
+        ] {
+            assert!(
+                refused(flags).contains(want),
+                "{flags:?}: {}",
+                refused(flags)
+            );
+        }
+        // What every chat engine takes still passes.
+        for engine in ["ov-genai", "ov-runtime", "mock", "qwen35", "sycl-llama"] {
+            check_engine_flags(&run_args(&[
+                "m",
+                "--engine",
+                engine,
+                "--elastic",
+                "--api-max-body-mb",
+                "2",
+            ]))
+            .unwrap();
+        }
+    }
+
+    /// The policy WebSocket binds loopback unless the operator opts in.
+    #[test]
+    fn policy_bind_needs_an_opt_in_beyond_loopback() {
+        for host in ["127.0.0.1", "::1", "[::1]", "localhost"] {
+            check_policy_bind(host, false).unwrap();
+        }
+        for host in ["0.0.0.0", "192.0.2.7", "::"] {
+            let e = check_policy_bind(host, false).unwrap_err().to_string();
+            assert!(e.contains("--policy-allow-all-interfaces"), "{e}");
+            check_policy_bind(host, true).unwrap();
+        }
+        // The old Zenoh-only spelling is gone (it never shipped in a release).
+        assert!(Cli::try_parse_from([
+            "cascadia",
+            "run",
+            "pkg",
+            "--engine",
+            "ov-policy",
+            "--zenoh-allow-all-interfaces"
+        ])
+        .is_err());
+    }
+
+    /// `--policy-max-connections` defaults to `CASCADIA_API_MAX_CONCURRENT` like chat's cap.
+    #[test]
+    fn policy_max_connections_defaults_to_the_chat_env_cap() {
+        let args = run_args(&["pkg", "--engine", "ov-policy"]);
+        assert_eq!(policy_server_config(&args, Some("9")).max_connections, 9);
+        let explicit = run_args(&[
+            "pkg",
+            "--engine",
+            "ov-policy",
+            "--policy-max-connections",
+            "2",
+        ]);
+        assert_eq!(
+            policy_server_config(&explicit, Some("9")).max_connections,
+            2
+        );
+        assert_eq!(policy_server_config(&args, Some("zero")).max_connections, 4);
+        assert_eq!(policy_server_config(&args, None).max_connections, 4);
     }
 
     /// `run --engine ov-policy --elastic` is refused, so `main` must not re-exec
@@ -4979,7 +5206,8 @@ mod tests {
         };
         assert_eq!(plan(&[]).unwrap(), None);
         assert!(plan(&["--zenoh-name", "x"]).is_err());
-        assert!(plan(&["--zenoh-allow-all-interfaces"]).is_err());
+        // One opt-in for both robot front ends, so it no longer needs --zenoh.
+        assert_eq!(plan(&["--policy-allow-all-interfaces"]).unwrap(), None);
         let got = plan(&["--zenoh", "127.0.0.1"]);
         if cfg!(feature = "zenoh") {
             let p = got.unwrap().unwrap();

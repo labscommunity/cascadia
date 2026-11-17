@@ -262,6 +262,17 @@ pub static POLICY_INFERS_TOTAL: LazyLock<IntCounterVec> = LazyLock::new(|| {
     .expect("register cascadia_policy_infers_total")
 });
 
+/// physicalai (Zenoh) calls dropped before the model ran them: `superseded`
+/// by a newer call of the same kind, or `expired` past their `budget_ms`.
+pub static POLICY_DROPPED_TOTAL: LazyLock<IntCounterVec> = LazyLock::new(|| {
+    register_int_counter_vec!(
+        "cascadia_policy_dropped_total",
+        "Robot-policy Zenoh calls dropped unanswered by the model, by reason.",
+        &["model", "reason"]
+    )
+    .expect("register cascadia_policy_dropped_total")
+});
+
 /// Engine time of each successful policy `infer` call (the model lock wait excluded).
 pub static POLICY_INFER_DURATION_SECONDS: LazyLock<HistogramVec> = LazyLock::new(|| {
     register_histogram_vec!(
@@ -357,6 +368,7 @@ pub fn init() {
     LazyLock::force(&TRANSPORT_RECV_BYTES_TOTAL);
     LazyLock::force(&POLICY_INFERS_TOTAL);
     LazyLock::force(&POLICY_INFER_DURATION_SECONDS);
+    LazyLock::force(&POLICY_DROPPED_TOTAL);
 }
 
 /// Gather the default registry into Prometheus text exposition format.

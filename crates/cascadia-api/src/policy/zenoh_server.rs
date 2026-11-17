@@ -10,7 +10,6 @@
 //! listener is loopback unless the caller opts in.
 
 use std::collections::VecDeque;
-use std::net::IpAddr;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
 use std::time::{Duration, Instant};
@@ -60,16 +59,7 @@ pub struct ZenohListen {
     pub allow_all_interfaces: bool,
 }
 
-fn is_loopback(host: &str) -> bool {
-    match host
-        .trim_start_matches('[')
-        .trim_end_matches(']')
-        .parse::<IpAddr>()
-    {
-        Ok(ip) => ip.is_loopback(),
-        Err(_) => host.eq_ignore_ascii_case("localhost"),
-    }
-}
+use super::is_loopback_host as is_loopback;
 
 impl ZenohListen {
     pub fn port(&self) -> u16 {
@@ -86,7 +76,7 @@ impl ZenohListen {
         if !is_loopback(host) && !self.allow_all_interfaces {
             return err(format!(
                 "the Zenoh listener has no authentication, so it binds loopback only; \
-                 {host} needs --zenoh-allow-all-interfaces"
+                 {host} needs --policy-allow-all-interfaces"
             ));
         }
         let port = self.port();
@@ -235,6 +225,19 @@ fn reply_err(query: &Query, code: ErrorCode, seq: i128) {
 }
 
 impl Core {
+    /// `cascadia_policy_infers_total{result}` for a call refused before the engine.
+    fn count(&self, result: &str) {
+        cascadia_metrics::POLICY_INFERS_TOTAL
+            .with_label_values(&[self.spec.model.as_str(), result])
+            .inc();
+    }
+
+    fn drop_metric(&self, reason: &str) {
+        cascadia_metrics::POLICY_DROPPED_TOTAL
+            .with_label_values(&[self.spec.model.as_str(), reason])
+            .inc();
+    }
+
     fn on_query(&self, query: Query, cmd: Cmd) {
         let received = Instant::now();
         let payload = query
@@ -245,9 +248,11 @@ impl Core {
             return reply_err(&query, ErrorCode::ShuttingDown, read_seq(&payload));
         }
         if payload.len() as u64 > self.max_bytes {
+            self.count("invalid");
             return reply_err(&query, ErrorCode::InvalidRequest, NO_SEQ);
         }
         let refused = |why: &str| {
+            self.count("invalid");
             tracing::info!(command = ?cmd, reason = why, "physicalai request refused");
             reply_err(&query, ErrorCode::InvalidRequest, read_seq(&payload));
         };
@@ -300,6 +305,7 @@ impl Core {
             let old = q.remove(i).expect("position is in range");
             reply_err(&old.query, ErrorCode::Superseded, old.seq);
             self.counts.superseded.fetch_add(1, Ordering::Relaxed);
+            self.drop_metric("superseded");
         }
         q.push_back(job);
         self.cond.notify_one();
@@ -326,6 +332,7 @@ impl Core {
     fn run(&self, job: Job) {
         let expired = || {
             self.counts.expired.fetch_add(1, Ordering::Relaxed);
+            self.drop_metric("expired");
             tracing::info!(seq = %job.seq, "physicalai request expired");
             reply_err(&job.query, ErrorCode::Expired, job.seq);
         };
@@ -554,7 +561,7 @@ mod tests {
         );
         for host in ["0.0.0.0", "::", "192.168.1.20", "robot.lan"] {
             let e = listen(host, false).endpoint().unwrap_err().0;
-            assert!(e.contains("--zenoh-allow-all-interfaces"), "{host}: {e}");
+            assert!(e.contains("--policy-allow-all-interfaces"), "{host}: {e}");
             assert!(listen(host, true).endpoint().is_ok(), "{host}");
         }
         assert!(listen("a b", true).endpoint().is_err());

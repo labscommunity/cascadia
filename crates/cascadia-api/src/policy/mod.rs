@@ -16,6 +16,20 @@ use cascadia_types::{ActionChunk, Image, NoiseMode, Observation, PolicySpec, Rtc
 
 use msgpack::{Val, Writer};
 
+/// Whether `host` (an IP, `[v6]`, or `localhost`) is a loopback address: the
+/// robot front ends have no authentication, so they bind nothing else
+/// without an explicit opt-in.
+pub fn is_loopback_host(host: &str) -> bool {
+    match host
+        .trim_start_matches('[')
+        .trim_end_matches(']')
+        .parse::<std::net::IpAddr>()
+    {
+        Ok(ip) => ip.is_loopback(),
+        Err(_) => host.eq_ignore_ascii_case("localhost"),
+    }
+}
+
 /// A request the server refuses; the message goes back to the client as-is.
 #[derive(Clone, Debug, PartialEq, Eq, thiserror::Error)]
 #[error("{0}")]
