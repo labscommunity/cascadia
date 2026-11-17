@@ -259,7 +259,7 @@ fn refuse<T>(msg: impl std::fmt::Display) -> EngineResult<T> {
     Err(EngineError::InvalidConfig(format!("policy model: {msg}")))
 }
 
-/// `--policy-precision`: GPU compute precision. CPU always runs f32.
+/// `--ov-inference-precision` on ov-policy: GPU compute precision. CPU always runs f32.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Precision {
     F16,
@@ -281,7 +281,7 @@ pub fn compile_config(
     let f32_hint = PluginConfig::new().with("INFERENCE_PRECISION_HINT", "f32");
     let config = match (family, precision) {
         ("CPU", Some(Precision::F16)) => Err(EngineError::InvalidConfig(
-            "--policy-precision f16 is not available on CPU, which always runs f32".into(),
+            "--ov-inference-precision f16 is not available on CPU, which always runs f32".into(),
         )),
         ("CPU", _) => Ok(f32_hint),
         ("GPU", Some(Precision::F32)) => Ok(f32_hint),

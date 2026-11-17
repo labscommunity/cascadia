@@ -83,6 +83,7 @@ cascadia run [OPTIONS] <MODEL>
 | `--engine <ENGINE>` | `ov-genai` | Inference engine. Use `ov-runtime` for a `cascadia shard` tree. |
 | `--api <API>` | `:8000`; `127.0.0.1:8000` for `ov-policy` | API bind address. `127.0.0.1:8000` binds loopback only. The API is unauthenticated: a chat engine logs a warning on a non-loopback bind, and `ov-policy` refuses one without `--policy-allow-all-interfaces`. |
 | `--prefix-cache-gb <GB>` | min(16, RAM/4) | `qwen35` only: budget of the in-process prefix cache (system-block + chat-boundary state snapshots, restored for prompts that extend a cached prefix). `0` disables. |
+| `--ov-inference-precision <P>` | the device's | OpenVINO precision hint, as for [`worker`](#cascadia-worker) (`f16` / `bf16` / `f32`). |
 | `--api-max-body-mb <MB>` | `1` | Largest chat-completions request body (MiB); the rendered prompt is capped at the same size (1 MiB ≈ 250K tokens of English). Only `qwen35` also bounds the prompt in tokens against the model window; on other engines this byte cap is the whole guard, so lower it on an exposed endpoint. |
 
 `run` also takes the sycl-llama flags (`--llama-*`, `--elastic`,
@@ -98,16 +99,18 @@ Robot policies (`--engine ov-policy`, see [engines/ov-policy.md](engines/ov-poli
 | Flag | Default | Meaning |
 |---|---|---|
 | `--device <DEVICE>` | `GPU` | `GPU`, `GPU.N`, `CPU` or `CPU.N`. NPU and the compound forms are refused. |
-| `--policy-precision <P>` | `f16` on GPU | `f16` / `f32`. CPU always runs f32 and refuses `f16`. |
+| `--ov-inference-precision <P>` | `f16` on GPU | Chat's precision flag; `ov-policy` takes `f16` / `f32`. CPU always runs f32 and refuses `f16`. |
 | `--policy-allow-origin <ORIGIN>` | none | A browser `Origin` allowed to open the WebSocket (repeatable). |
-| `--policy-max-connections <N>` | `CASCADIA_API_MAX_CONCURRENT`, else `4` | Concurrent connections across the WebSocket and Zenoh front ends; one more WebSocket gets HTTP 503. |
 | `--policy-allow-identity-stats` | off | Serve a package with placeholder normalization statistics (testing only). |
 | `--policy-allow-all-interfaces` | off | Let the robot front ends (`--api`, `--zenoh`) bind a non-loopback host. Anyone who reaches the port can drive the robot. |
 | `--zenoh <HOST[:PORT]>` | off | Also serve Intel's physicalai protocol over Zenoh; no port means physicalai's name-derived one. Needs a build with `--features zenoh` (release bundles have it). |
 | `--zenoh-name <NAME>` | the manifest's policy name | The slot name physicalai clients are given. Needs `--zenoh`. |
 
 The chat-only flags (`--prefix-cache-gb`, `--ep-*`, `--api-max-body-mb`,
-`--elastic*`, `--llama-*`) are refused with `ov-policy`.
+`--elastic*`, `--llama-*`) are refused with `ov-policy`. Concurrent connections,
+across the WebSocket and Zenoh front ends, are capped by
+`CASCADIA_API_MAX_CONCURRENT` as chat requests are (default 4 here, since a
+robot keeps its socket open); one more WebSocket gets HTTP 503.
 
 Note the defaults differ from `worker` (`GPU`/`ov-genai` here, `CPU`/`mock`
 there): `run` assumes you want real inference on the accelerator.

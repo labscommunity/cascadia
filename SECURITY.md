@@ -62,7 +62,8 @@ authentication and no TLS**, like the chat API. So:
   (empty by default) is refused, so a browser page cannot open the socket.
   Clients that send no `Origin` are allowed: this is not authentication.
 * Inputs are bounded before any work: per-message size cap from the
-  policy's spec, 1 KiB prompt, 4 connections (503 beyond), checked array
+  policy's spec, 1 KiB prompt, at most `CASCADIA_API_MAX_CONCURRENT`
+  connections, default 4 (503 beyond), checked array
   sizes before allocation, and a missed ping closes the connection.
 * A `policy_package` is code-adjacent: OpenVINO parses and compiles its
   IRs and its manifest decides how actions are scaled. Load packages only

@@ -288,13 +288,6 @@ pub enum EngineKind {
     OvPolicy,
 }
 
-/// `--policy-precision` for `--engine ov-policy`.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, clap::ValueEnum)]
-pub enum PolicyPrecision {
-    F16,
-    F32,
-}
-
 #[derive(Parser, Debug, Clone)]
 pub struct WorkerArgs {
     /// 0-based stage index.
@@ -863,22 +856,17 @@ pub struct RunArgs {
     #[arg(long)]
     pub api: Option<String>,
 
-    /// `--engine ov-policy` only: GPU compute precision (default f16). CPU
-    /// always runs f32 and refuses f16.
-    #[arg(long, value_enum)]
-    pub policy_precision: Option<PolicyPrecision>,
+    /// OV inference precision hint, as for `cascadia worker`: f16, bf16 or
+    /// f32 on chat engines. `--engine ov-policy` takes f16 or f32 (default f16
+    /// on GPU); CPU always runs f32 and refuses f16.
+    #[arg(long, value_name = "PREC")]
+    pub ov_inference_precision: Option<String>,
 
     /// `--engine ov-policy` only: a browser `Origin` allowed to open the
     /// WebSocket (repeatable). Requests without an `Origin` header (robots,
     /// scripts) are always allowed; any other origin is refused.
     #[arg(long, value_name = "ORIGIN")]
     pub policy_allow_origin: Vec<String>,
-
-    /// `--engine ov-policy` only: concurrent connections across the
-    /// WebSocket and Zenoh front ends (default `CASCADIA_API_MAX_CONCURRENT`
-    /// when set, as for chat, else 4); one more is refused with HTTP 503.
-    #[arg(long, value_parser = clap::value_parser!(u32).range(1..))]
-    pub policy_max_connections: Option<u32>,
 
     /// `--engine ov-policy` only: serve a package whose normalization stats
     /// are identity placeholders. For testing; actions from it are not usable.
@@ -1418,9 +1406,7 @@ impl RunArgs {
     fn differs_from_default(&self, id: &str) -> Option<bool> {
         let d = RunArgs::try_parse_from(["run", "m"]).expect("run parses with defaults");
         Some(match id {
-            "policy_precision" => self.policy_precision.is_some(),
             "policy_allow_origin" => !self.policy_allow_origin.is_empty(),
-            "policy_max_connections" => self.policy_max_connections.is_some(),
             "policy_allow_identity_stats" => self.policy_allow_identity_stats,
             "zenoh" => self.zenoh.is_some(),
             "zenoh_name" => self.zenoh_name.is_some(),
@@ -1451,10 +1437,8 @@ impl RunArgs {
 }
 
 /// The policy-only `run` flags, refused on a chat engine.
-const POLICY_FLAGS: [&str; 7] = [
-    "--policy-precision",
+const POLICY_FLAGS: [&str; 5] = [
     "--policy-allow-origin",
-    "--policy-max-connections",
     "--policy-allow-identity-stats",
     "--zenoh",
     "--zenoh-name",
@@ -1544,6 +1528,11 @@ async fn cmd_run(args: RunArgs) -> Result<()> {
     if args.engine == EngineKind::OvPolicy {
         return cmd_run_policy(args).await;
     }
+    cmd_worker(run_worker_args(args)).await
+}
+
+/// The single-node worker a chat `run` starts.
+fn run_worker_args(args: RunArgs) -> WorkerArgs {
     let api = args.api_addr();
     let mut worker = WorkerArgs::single_node(
         args.model,
@@ -1569,7 +1558,8 @@ async fn cmd_run(args: RunArgs) -> Result<()> {
     worker.elastic_vram = args.elastic_vram;
     worker.elastic_share = args.elastic_share;
     worker.llama_mtp = args.llama_mtp;
-    cmd_worker(worker).await
+    worker.ov_inference_precision = args.ov_inference_precision;
+    worker
 }
 
 /// How long shutdown waits for an engine's `close` before exiting anyway.
@@ -1579,16 +1569,13 @@ const SHUTDOWN_CLOSE_TIMEOUT: std::time::Duration = std::time::Duration::from_se
 /// the policy router (no chat routes, no dashboard).
 async fn cmd_run_policy(args: RunArgs) -> Result<()> {
     use cascadia_engine::PolicyEngine;
-    use cascadia_engine_openvino::policy::{compile_config, OvPolicyEngine, Precision};
+    use cascadia_engine_openvino::policy::{compile_config, OvPolicyEngine};
 
     let api = args.api_addr();
     check_api_addr_is_tcp(Some(&api))?;
     let (host, port) = parse_addr(&api, "0.0.0.0")?;
     check_policy_bind(&host, args.policy_allow_all_interfaces)?;
-    let precision = args.policy_precision.map(|p| match p {
-        PolicyPrecision::F16 => Precision::F16,
-        PolicyPrecision::F32 => Precision::F32,
-    });
+    let precision = policy_precision(args.ov_inference_precision.as_deref())?;
     // Device and precision errors (NPU, CPU f16) before any file is read.
     compile_config(&args.device, precision)?;
     let dir = PathBuf::from(&args.model);
@@ -1624,6 +1611,22 @@ async fn cmd_run_policy(args: RunArgs) -> Result<()> {
         .with_context(|| format!("bind {host}:{port}"))?;
     let shutdown = install_shutdown_signal_handler().context("install_shutdown_signal_handler")?;
     serve_policy_engine(listener, engine, cfg, zenoh, shutdown).await
+}
+
+/// `--ov-inference-precision` for ov-policy, which computes at f16 or f32 only.
+fn policy_precision(
+    raw: Option<&str>,
+) -> Result<Option<cascadia_engine_openvino::policy::Precision>> {
+    use cascadia_engine_openvino::policy::Precision;
+    match raw.map(str::to_ascii_lowercase).as_deref() {
+        None => Ok(None),
+        Some("f16") => Ok(Some(Precision::F16)),
+        Some("f32") => Ok(Some(Precision::F32)),
+        Some(_) => Err(anyhow!(
+            "--ov-inference-precision {}: --engine ov-policy takes f16 or f32",
+            raw.unwrap_or_default()
+        )),
+    }
 }
 
 /// The policy WebSocket has no authentication and drives a robot, so it binds
@@ -1764,10 +1767,7 @@ fn policy_server_config(
     use cascadia_api::policy::server::{PolicyServerConfig, DEFAULT_MAX_CONNECTIONS};
     PolicyServerConfig {
         allow_origins: args.policy_allow_origin.clone(),
-        max_connections: args.policy_max_connections.map_or_else(
-            || api_max_concurrent(max_concurrent_env, DEFAULT_MAX_CONNECTIONS),
-            |n| n as usize,
-        ),
+        max_connections: api_max_concurrent(max_concurrent_env, DEFAULT_MAX_CONNECTIONS),
         ..Default::default()
     }
 }
@@ -4862,14 +4862,10 @@ mod tests {
     #[test]
     fn policy_flags_are_refused_on_other_engines() {
         for flags in [
-            &["--policy-precision", "f32"][..],
-            &["--policy-allow-origin", "http://x"],
-            &["--policy-max-connections", "2"],
+            &["--policy-allow-origin", "http://x"][..],
             &["--zenoh", "127.0.0.1"],
             &["--zenoh-name", "x"],
             &["--policy-allow-all-interfaces"],
-            // The default value itself is still an explicit flag.
-            &["--policy-max-connections", "4"],
             &["--policy-allow-identity-stats"],
         ] {
             let mut argv = vec!["m"];
@@ -4881,26 +4877,48 @@ mod tests {
             argv.extend(["--engine", "ov-policy"]);
             check_engine_flags(&run_args(&argv)).unwrap();
         }
-        // The pre-rename spellings are gone (nothing shipped them).
-        for old in [&["--precision", "f32"][..], &["--allow-identity-stats"]] {
+        // The robot-only spellings of chat's settings are gone (nothing shipped them).
+        for old in [
+            &["--precision", "f32"][..],
+            &["--allow-identity-stats"],
+            &["--policy-precision", "f32"],
+            &["--policy-max-connections", "2"],
+        ] {
             let mut argv = vec!["cascadia", "run", "pkg", "--engine", "ov-policy"];
             argv.extend_from_slice(old);
             assert!(Cli::try_parse_from(argv).is_err(), "{old:?}");
         }
-        assert!(
-            Cli::try_parse_from(["cascadia", "run", "m", "--policy-max-connections", "0"]).is_err()
+    }
+
+    /// `--ov-inference-precision` is chat's flag, so `run` hands it to a chat worker too.
+    #[test]
+    fn run_passes_the_inference_precision_to_a_chat_worker() {
+        let args = run_args(&["m", "--ov-inference-precision", "bf16"]);
+        check_engine_flags(&args).unwrap();
+        assert_eq!(
+            run_worker_args(args).ov_inference_precision.as_deref(),
+            Some("bf16")
         );
-        let default = run_args(&["pkg", "--engine", "ov-policy"]);
-        assert_eq!(default.policy_max_connections, None);
-        assert_eq!(policy_server_config(&default, None).max_connections, 4);
-        let two = run_args(&[
-            "pkg",
-            "--engine",
-            "ov-policy",
-            "--policy-max-connections",
-            "2",
-        ]);
-        assert_eq!(policy_server_config(&two, None).max_connections, 2);
+        assert_eq!(
+            run_worker_args(run_args(&["m"])).ov_inference_precision,
+            None
+        );
+    }
+
+    /// ov-policy computes at f16 or f32 only; the default is the device's.
+    #[test]
+    fn ov_policy_takes_f16_or_f32() {
+        use cascadia_engine_openvino::policy::Precision;
+        assert_eq!(policy_precision(None).unwrap(), None);
+        assert_eq!(policy_precision(Some("f16")).unwrap(), Some(Precision::F16));
+        assert_eq!(policy_precision(Some("F32")).unwrap(), Some(Precision::F32));
+        for bad in ["bf16", "dynamic", ""] {
+            let e = policy_precision(Some(bad)).unwrap_err().to_string();
+            assert_eq!(
+                e,
+                format!("--ov-inference-precision {bad}: --engine ov-policy takes f16 or f32")
+            );
+        }
     }
 
     #[test]
@@ -5020,9 +5038,9 @@ mod tests {
             let e = refused(&argv);
             assert!(e.contains(&format!("{} does not apply", flag[0])), "{e}");
         }
-        let e = refused(&["m", "--engine", "ov-genai", "--policy-max-connections", "4"]);
+        let e = refused(&["m", "--engine", "ov-genai", "--policy-allow-identity-stats"]);
         assert!(
-            e.contains("--policy-max-connections applies to --engine ov-policy only"),
+            e.contains("--policy-allow-identity-stats applies to --engine ov-policy only"),
             "{e}"
         );
         check_engine_flags(&run_args(&["m", "--engine", "ov-genai"])).unwrap();
@@ -5121,22 +5139,11 @@ mod tests {
         .is_err());
     }
 
-    /// `--policy-max-connections` defaults to `CASCADIA_API_MAX_CONCURRENT` like chat's cap.
+    /// Connections are capped by `CASCADIA_API_MAX_CONCURRENT`, chat's setting, default 4.
     #[test]
-    fn policy_max_connections_defaults_to_the_chat_env_cap() {
+    fn policy_connections_come_from_the_chat_env_cap() {
         let args = run_args(&["pkg", "--engine", "ov-policy"]);
         assert_eq!(policy_server_config(&args, Some("9")).max_connections, 9);
-        let explicit = run_args(&[
-            "pkg",
-            "--engine",
-            "ov-policy",
-            "--policy-max-connections",
-            "2",
-        ]);
-        assert_eq!(
-            policy_server_config(&explicit, Some("9")).max_connections,
-            2
-        );
         assert_eq!(policy_server_config(&args, Some("zero")).max_connections, 4);
         assert_eq!(policy_server_config(&args, None).max_connections, 4);
     }
@@ -5206,10 +5213,20 @@ mod tests {
                     "ov-policy",
                     "--device",
                     "CPU",
-                    "--policy-precision",
+                    "--ov-inference-precision",
                     "f16",
                 ],
-                "always runs f32",
+                "--ov-inference-precision f16 is not available on CPU, which always runs f32",
+            ),
+            (
+                vec![
+                    pkg,
+                    "--engine",
+                    "ov-policy",
+                    "--ov-inference-precision",
+                    "bf16",
+                ],
+                "--engine ov-policy takes f16 or f32",
             ),
             (
                 vec![pkg, "--engine", "ov-policy", "--device", "NPU"],

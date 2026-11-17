@@ -65,10 +65,9 @@ restart skips it; the cache never changes outputs.
 | Flag | Default | What it does |
 |---|---|---|
 | `--device GPU\|CPU` | `GPU` | Where the policy IR runs: `GPU`, `GPU.N` (one of several GPUs), `CPU` or `CPU.N`; the compound forms (`AUTO`, `MULTI:`, `HETERO:`, `BATCH:`) are refused. The tokenizer always runs on CPU. **NPU is refused** for every policy (SmolVLA and π0.5 fail NPU compilation as exported; X-VLA compiles and returns wrong actions). |
-| `--policy-precision f16\|f32` | `f16` on GPU | GPU compute precision. CPU always runs f32 and refuses `f16`. Some large models (π0, XR0, GR00T, MolmoAct2) fail to compile at f32 on a 16 GB integrated GPU; that is a load error naming the IR and the device. |
+| `--ov-inference-precision f16\|f32` | `f16` on GPU | GPU compute precision (chat's flag; `bf16` is refused here). CPU always runs f32 and refuses `f16`. Some large models (π0, XR0, GR00T, MolmoAct2) fail to compile at f32 on a 16 GB integrated GPU; that is a load error naming the IR and the device. |
 | `--api HOST:PORT` | `127.0.0.1:8000` | Where the HTTP and WebSocket API listens. A non-loopback host is refused without `--policy-allow-all-interfaces`; see [Security](#security). |
 | `--policy-allow-origin ORIGIN` | none | A browser `Origin` allowed to open the WebSocket (repeatable). |
-| `--policy-max-connections N` | `CASCADIA_API_MAX_CONCURRENT` if set, else `4` | Concurrent connections, shared by the WebSocket and Zenoh front ends; one more WebSocket is refused with HTTP 503. |
 | `--policy-allow-identity-stats` | off | Serve a package with placeholder statistics (testing only). |
 | `--zenoh HOST[:PORT]` | off | Also serve Intel's physicalai remote-inference protocol over Zenoh (below). |
 | `--zenoh-name NAME` | the manifest's policy name | The slot name physicalai clients are given. |
@@ -77,7 +76,10 @@ restart skips it; the cache never changes outputs.
 The robot-only flags carry the engine's prefix, as the sycl-llama ones carry `--llama-`; the Zenoh
 ones carry their front end's. Each is refused on a chat engine, and the chat-only `run` flags
 (`--prefix-cache-gb`, `--ep-*`, `--api-max-body-mb`, `--elastic*`, `--llama-*`) are refused here,
-as each chat engine refuses another engine's flags.
+as each chat engine refuses another engine's flags. Settings shared with chat keep chat's names:
+`--ov-inference-precision` above, and `CASCADIA_API_MAX_CONCURRENT`, which caps concurrent
+connections across the WebSocket and Zenoh front ends (default 4, since a robot keeps its socket
+open); one more WebSocket is refused with HTTP 503.
 `--elastic` in particular is refused rather than ignored: its memory interposer has not been
 measured with a policy. `cascadia worker` refuses `ov-policy`: a policy is served by one process on
 one machine.
@@ -192,8 +194,8 @@ Checked before any work is queued:
   and a 1 KiB prompt, plus 64 KiB of framing); larger ones close the connection.
 - Prompts are at most 1 KiB of UTF-8, and a prompt longer than the tokenizer's port is refused (an
   error frame naming the limit), never silently truncated.
-- At most `--policy-max-connections` (4) WebSocket connections, one request in flight each. At
-  capacity the upgrade is refused with HTTP 503.
+- At most `CASCADIA_API_MAX_CONCURRENT` (default 4) connections, shared by the WebSocket and Zenoh
+  front ends, one request in flight each. At capacity the upgrade is refused with HTTP 503.
 - The server pings every 20 s and closes a connection that misses a pong, so a dropped robot
   frees its slot. HTTP request headers must arrive within 10 s. There is no idle timeout.
 - Non-finite actions (possible from f16 overflow on the GPU) are an error, never sent.

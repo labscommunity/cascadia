@@ -706,7 +706,10 @@ fn pi0_gpu_f32_load_is_an_error_in_its_own_process() {
             assert!(matches!(e, EngineError::Backend(_)), "{e}");
             let m = e.to_string();
             assert!(m.contains("pi0.xml on GPU failed"), "{m}");
-            assert!(m.contains("try without --policy-precision f32"), "{m}");
+            assert!(
+                m.contains("try without --ov-inference-precision f32"),
+                "{m}"
+            );
         }
     }
 }
@@ -1863,7 +1866,7 @@ fn xr0_spec_prompt_limit_and_cpu_parity() {
 }
 
 /// XR0 on the GPU: f16 within 1e-2 of PyTorch f32 (spike: 3.2e-3 / 4.5e-3).
-/// At `--policy-precision f32` the GPU compile fails (`CL_INVALID_EVENT`), which must
+/// At `--ov-inference-precision f32` the GPU compile fails (`CL_INVALID_EVENT`), which must
 /// be a load error; that runs in a child process, as π0's does.
 #[test]
 fn xr0_gpu_infer_f16_and_f32_is_a_load_error() {
@@ -1930,7 +1933,10 @@ fn xr0_gpu_f32_load_is_an_error_in_its_own_process() {
             assert!(matches!(e, EngineError::Backend(_)), "{e}");
             let m = e.to_string();
             assert!(m.contains("xr0.xml on GPU failed"), "{m}");
-            assert!(m.contains("try without --policy-precision f32"), "{m}");
+            assert!(
+                m.contains("try without --ov-inference-precision f32"),
+                "{m}"
+            );
         }
     }
 }
@@ -2191,7 +2197,7 @@ fn gr00t_spec_prompt_limit_and_cpu_parity() {
 }
 
 /// GR00T on the GPU: f16 within 1e-2 of PyTorch f32 as served (spike: 7.4e-3
-/// normalized). At `--policy-precision f32` the GPU compile fails
+/// normalized). At `--ov-inference-precision f32` the GPU compile fails
 /// (`CL_INVALID_EVENT`), which must be a load error; that runs in a child
 /// process, as π0's does.
 #[test]
@@ -2256,7 +2262,10 @@ fn gr00t_gpu_f32_load_is_an_error_in_its_own_process() {
             assert!(matches!(e, EngineError::Backend(_)), "{e}");
             let m = e.to_string();
             assert!(m.contains("gr00t.xml on GPU failed"), "{m}");
-            assert!(m.contains("try without --policy-precision f32"), "{m}");
+            assert!(
+                m.contains("try without --ov-inference-precision f32"),
+                "{m}"
+            );
         }
     }
 }
@@ -2542,7 +2551,7 @@ fn molmoact2_spec_prompt_limit_and_cpu_parity() {
 }
 
 /// MolmoAct2 on the GPU: f16 within 1e-2 of PyTorch f32 as served (spike:
-/// 9.9e-4 normalized). At `--policy-precision f32` the GPU compile fails
+/// 9.9e-4 normalized). At `--ov-inference-precision f32` the GPU compile fails
 /// (`CL_INVALID_EVENT`), which must be a load error; that runs in a child
 /// process, as π0's does.
 #[test]
@@ -2604,7 +2613,10 @@ fn molmoact2_gpu_f32_load_is_an_error_in_its_own_process() {
             assert!(matches!(e, EngineError::Backend(_)), "{e}");
             let m = e.to_string();
             assert!(m.contains("molmoact2.xml on GPU failed"), "{m}");
-            assert!(m.contains("try without --policy-precision f32"), "{m}");
+            assert!(
+                m.contains("try without --ov-inference-precision f32"),
+                "{m}"
+            );
         }
     }
 }
