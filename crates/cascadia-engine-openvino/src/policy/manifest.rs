@@ -1041,7 +1041,9 @@ fn is_v1(v: &str) -> bool {
 ///
 /// Lexical on purpose, like Intel's check: no filesystem access, so a Hub
 /// snapshot's symlinks still resolve. Stricter than Intel's, which accepts an
-/// absolute path that happens to lie inside the package.
+/// absolute path that happens to lie inside the package. A name it cannot
+/// see into the skipped `.cache` (a symlink, a junction, an NTFS 8.3 name) is
+/// refused on disk at load by `package::check_not_skipped`.
 pub fn confine_artifact(path: &str) -> EngineResult<String> {
     let why = if path.is_empty() {
         Some("is empty")
@@ -1056,9 +1058,12 @@ pub fn confine_artifact(path: &str) -> EngineResult<String> {
         Some("has a drive letter or stream (':')")
     } else if path.split(['/', '\\']).any(|c| c == "..") {
         Some("escapes the package directory ('..')")
+    } else if path.split(['/', '\\']).any(|c| c.is_empty() || c == ".") {
+        // So the first component is the directory `Path::join` opens.
+        Some("has an empty or '.' component")
     } else if path
         .split(['/', '\\'])
-        .find(|c| *c != ".")
+        .next()
         // NTFS drops trailing dots and spaces, so `.cache.` opens `.cache`.
         .is_some_and(|c| {
             c.trim_end_matches(['.', ' '])

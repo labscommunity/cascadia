@@ -89,7 +89,10 @@ impl OvPolicyEngine {
         use sha2::Digest;
 
         let model = served_model(dir, opts.model_id.as_deref())?;
+        let top = [PathBuf::from("manifest.json"), PathBuf::from("NOTICE")];
+        super::package::check_not_skipped(dir, &top)?;
         let manifest = PolicyManifest::load(dir, opts.manifest)?;
+        super::package::check_not_skipped(dir, &super::package::engine_files(&manifest))?;
         let runtime = cascadia_ov_genai_shim::ov_version()
             .map_err(|e| EngineError::Backend(format!("reading the OpenVINO version: {e}")))?;
         let engine_build = super::package::engine_build(&runtime.runtime_core);

@@ -99,6 +99,50 @@ fn check_plain_names(ignore: &[String]) -> std::io::Result<()> {
 /// The top-level directory the digest skips; the engine never reads it.
 pub(crate) const SKIPPED_DIR: &str = ".cache";
 
+/// Refuse a package file whose real path lies in the skipped top-level
+/// `.cache`: reached through a symlink, a junction or an NTFS 8.3 name
+/// (`CACHE~1`), which `confine_artifact`'s lexical check cannot see. A file
+/// that does not resolve passes; its reader reports it.
+#[cfg_attr(not(feature = "openvino"), allow(dead_code))]
+pub(crate) fn check_not_skipped(dir: &Path, rels: &[PathBuf]) -> Result<(), EngineError> {
+    let Ok(root) = dir.canonicalize() else {
+        return Ok(());
+    };
+    for rel in rels {
+        let Ok(real) = dir.join(rel).canonicalize() else {
+            continue;
+        };
+        let first = real
+            .strip_prefix(&root)
+            .ok()
+            .and_then(|r| r.components().next());
+        if first.is_some_and(|c| c.as_os_str().eq_ignore_ascii_case(SKIPPED_DIR)) {
+            return Err(EngineError::InvalidConfig(format!(
+                "package file {} resolves into the top-level .cache directory, which \
+                 package_sha256 skips",
+                rel.display()
+            )));
+        }
+    }
+    Ok(())
+}
+
+/// The package files `OvPolicyEngine::load` opens after the manifest: each
+/// artifact, its `.bin` weights and the `tokenizer.json` beside the
+/// tokenizer IR.
+#[cfg_attr(not(feature = "openvino"), allow(dead_code))]
+pub(crate) fn engine_files(manifest: &super::manifest::PolicyManifest) -> Vec<PathBuf> {
+    let model = Path::new(&manifest.model_artifact);
+    let tokenizer = Path::new(manifest.tokenizer_artifact());
+    vec![
+        model.to_path_buf(),
+        model.with_extension("bin"),
+        tokenizer.to_path_buf(),
+        tokenizer.with_extension("bin"),
+        tokenizer.with_file_name(TOKENIZER_JSON),
+    ]
+}
+
 /// Read beside the tokenizer IR for the added special tokens.
 pub(crate) const TOKENIZER_JSON: &str = "tokenizer.json";
 
@@ -456,6 +500,97 @@ mod tests {
             v["model"]["artifacts"]["openvino"] = ok.into();
             parse(&v).unwrap_or_else(|e| panic!("{ok}: {e}"));
         }
+    }
+
+    #[test]
+    fn empty_and_dot_components_are_refused() {
+        use super::super::manifest::confine_artifact;
+        for path in [
+            ".//.cache/x",
+            "./.cache//x",
+            "./\\.cache\\x",
+            "a//b.xml",
+            "a\\\\b.xml",
+            "ir/",
+            "ir\\",
+            "./x.xml",
+            "a/./b.xml",
+        ] {
+            let e = confine_artifact(path).unwrap_err();
+            assert!(matches!(e, EngineError::InvalidConfig(_)), "{path}: {e}");
+            assert!(e.to_string().contains("component"), "{path}: {e}");
+        }
+    }
+
+    #[test]
+    fn engine_files_lists_what_load_opens() {
+        let files: Vec<String> = engine_files(&smolvla())
+            .iter()
+            .map(|p| p.to_string_lossy().into_owned())
+            .collect();
+        for f in [
+            "smolvla.xml",
+            "smolvla.bin",
+            "tokenizer.xml",
+            "tokenizer.bin",
+            "tokenizer.json",
+        ] {
+            assert!(files.iter().any(|x| x == f), "{f}: {files:?}");
+        }
+    }
+
+    // On Windows, `canonicalize` also resolves an NTFS 8.3 name (`CACHE~1`)
+    // and a junction to the real `.cache`; a unit test cannot create either.
+    #[cfg(unix)]
+    #[test]
+    fn a_file_resolving_into_the_skipped_cache_is_refused() {
+        use std::os::unix::fs::symlink;
+        let t = tempfile::tempdir().unwrap();
+        let a = package(t.path(), "a", b"w");
+        let rels = |r: &[&str]| r.iter().map(PathBuf::from).collect::<Vec<_>>();
+        let ok = rels(&["manifest.json", "NOTICE", "ir/policy.xml", "ir/policy.bin"]);
+        check_not_skipped(&a, &ok).unwrap();
+
+        fs::create_dir_all(a.join(".cache/real")).unwrap();
+        fs::write(a.join(".cache/real/m.xml"), b"<net/>").unwrap();
+        // A symlinked directory leading into `.cache`.
+        symlink(a.join(".cache/real"), a.join("linked")).unwrap();
+        // A file link, relative, into `.CACHE` through its real name.
+        symlink(".cache/real/m.xml", a.join("m.xml")).unwrap();
+        for bad in ["linked/m.xml", "m.xml"] {
+            let e = check_not_skipped(&a, &rels(&["manifest.json", bad])).unwrap_err();
+            assert!(matches!(e, EngineError::InvalidConfig(_)), "{bad}: {e}");
+            assert!(e.to_string().contains(bad), "{bad}: {e}");
+            assert!(e.to_string().contains(".cache"), "{bad}: {e}");
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_hub_snapshot_linking_to_its_blobs_passes_the_cache_check() {
+        use std::os::unix::fs::symlink;
+        let t = tempfile::tempdir().unwrap();
+        let blobs = t.path().join("blobs");
+        fs::create_dir_all(&blobs).unwrap();
+        fs::write(blobs.join("w1"), b"weights").unwrap();
+        let snap = t.path().join("snapshots/rev");
+        fs::create_dir_all(snap.join("ir")).unwrap();
+        symlink("../../../blobs/w1", snap.join("ir/policy.bin")).unwrap();
+        symlink("../../blobs/w1", snap.join("manifest.json")).unwrap();
+        // A `.cache` beside it is skipped, and nothing read lies in it.
+        fs::create_dir_all(snap.join(".cache/huggingface")).unwrap();
+        let rels: Vec<PathBuf> = ["manifest.json", "ir/policy.bin", "missing.xml"]
+            .iter()
+            .map(PathBuf::from)
+            .collect();
+        for r in &rels[..2] {
+            assert!(snap
+                .join(r)
+                .canonicalize()
+                .unwrap()
+                .starts_with(blobs.canonicalize().unwrap()));
+        }
+        check_not_skipped(&snap, &rels).unwrap();
     }
 
     #[cfg(unix)]

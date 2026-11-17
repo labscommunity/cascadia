@@ -628,8 +628,11 @@ at one precision send identical bytes; the slowest warmup call appears only in
   named `.cache` (any case; deeper ones and a file of that name still count): `hf download
   --local-dir` writes per-download timestamps under `.cache/huggingface/`, so two servers that
   downloaded one pinned revision would never match. The engine never reads it, because
-  `confine_artifact` refuses a manifest path whose first component is `.cache` (also with NTFS's
-  dropped trailing dots or spaces), and every other file it opens sits beside a manifest artifact.
+  `confine_artifact` refuses a manifest path with an empty or `.` component, or whose first
+  component is `.cache` (also with NTFS's dropped trailing dots or spaces), and every other file it
+  opens sits beside a manifest artifact. As a backstop for names a lexical check cannot see (a
+  symlink, a junction, an NTFS 8.3 name such as `CACHE~1`), `load` canonicalizes every file it
+  opens before reading it and refuses one that resolves into the package's `.cache`.
   `OvPolicyOptions.cache_dir`, when it lies inside the package: the compile cache never changes
   outputs and is written after the digest is taken. And `OvPolicyOptions.digest_ignore`
   (`package_sha256_with(dir, ignore)`), empty by default: top-level file names, no globs and no
