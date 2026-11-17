@@ -96,6 +96,20 @@ Set once at stage startup by the runner.
 | `cascadia_engine_model_load_duration_seconds` | gauge | `model`, `device` | Weight load + engine build (transport connect excluded — it can include waiting for a peer to come up). |
 | `cascadia_engine_warmup_duration_seconds` | gauge | `model`, `device` | `Engine::warmup()` duration. |
 
+## Robot models
+
+Served by `cascadia run --engine ov-policy` (see [engines/ov-policy.md](engines/ov-policy.md)),
+next to the request- and engine-level families above. A refused call also counts in
+`cascadia_api_rejected_total{reason="invalid_request"}`, an engine failure in
+`cascadia_tasks_failed_total`, and a connection refused at capacity in
+`cascadia_api_rejected_total{reason="capacity"}`, as for chat.
+
+| Name | Type | Labels | Description |
+|---|---|---|---|
+| `cascadia_policy_infers_total` | counter | `model`, `result` | Calls from both front ends (WebSocket and Zenoh), by outcome: `ok`, `invalid` (refused, including a request that did not decode) or `error` (the engine failed; `/health` turns `degraded`). |
+| `cascadia_policy_infer_duration_seconds` | histogram | `model` | Engine time of each successful call, the model lock wait excluded. |
+| `cascadia_policy_dropped_total` | counter | `model`, `reason` | Zenoh calls dropped before the model ran them: `superseded` by a newer call of the same kind, or `expired` past their `budget_ms`. |
+
 ## Transport-level
 
 Counted inside `cascadia-transport`, so every engine's inter-stage traffic is
@@ -130,6 +144,7 @@ Calibrated for LLM serving (see `crates/cascadia-metrics/src/lib.rs`):
 - Inter-token: `0.01 0.025 0.05 0.1 0.25 0.5 1 2 5 10`
 - Durations (generation + HTTP): `0.1 0.5 1 5 10 30 60 120 300 600`
 - Transport frames: `0.0001 0.001 0.01 0.05 0.1 0.5 1`
+- Robot-model calls: `0.005 0.01 0.025 0.05 0.1 0.25 0.5 1 2.5 5`
 
 ## Useful queries
 

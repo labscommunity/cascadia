@@ -225,11 +225,9 @@ fn reply_err(query: &Query, code: ErrorCode, seq: i128) {
 }
 
 impl Core {
-    /// `cascadia_policy_infers_total{result}` for a call refused before the engine.
+    /// [`super::server::count_infer`] for a call refused before the engine.
     fn count(&self, result: &str) {
-        cascadia_metrics::POLICY_INFERS_TOTAL
-            .with_label_values(&[self.spec.model.as_str(), result])
-            .inc();
+        super::server::count_infer(self.spec.model.as_str(), result);
     }
 
     fn drop_metric(&self, reason: &str) {
@@ -635,6 +633,18 @@ mod tests {
         ];
         for (make, fault) in cases {
             let policy = SharedPolicy::new(Box::new(Failing(spec(), make)), 1).unwrap();
+            // Chat's counters too; the registry is process-global, so deltas only grow.
+            let rejected = || {
+                cascadia_metrics::API_REJECTED_TOTAL
+                    .with_label_values(&["invalid_request"])
+                    .get()
+            };
+            let failed = || {
+                cascadia_metrics::TASKS_FAILED_TOTAL
+                    .with_label_values(&[policy.spec().model.as_str()])
+                    .get()
+            };
+            let (rejected_before, failed_before) = (rejected(), failed());
             let backend = LocalBackend {
                 _slot: policy.try_slot().unwrap(),
                 policy: policy.clone(),
@@ -655,6 +665,11 @@ mod tests {
                 _ => panic!("{} answered {e_name}", make()),
             }
             assert_eq!(policy.is_ready(), !fault, "{}", make());
+            if fault {
+                assert!(failed() > failed_before, "{}", make());
+            } else {
+                assert!(rejected() > rejected_before, "{}", make());
+            }
         }
     }
 

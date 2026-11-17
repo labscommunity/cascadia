@@ -102,7 +102,7 @@ pub static INFLIGHT_TASKS: LazyLock<IntGauge> = LazyLock::new(|| {
 /// - `engine_error` (500) — the engine itself failed the submit (backend,
 ///   I/O, or an attributed task failure). Read that node's logs.
 /// - `invalid_request` (400/404) — bad config, rejected peer/shard, or an
-///   unknown model id.
+///   unknown model id; also a robot-model call that was refused.
 ///
 /// The engine-raised reasons matter for a specific reason: no `ChunkStream`
 /// exists for a request that fails at submit, so the runner's
@@ -216,7 +216,8 @@ pub static TASKS_CANCELLED_TOTAL: LazyLock<IntCounterVec> = LazyLock::new(|| {
     .expect("register cascadia_tasks_cancelled_total")
 });
 
-/// Generations that ended in an engine failure (final error chunk).
+/// Generations that ended in an engine failure (final error chunk), and
+/// robot-model calls the engine failed.
 pub static TASKS_FAILED_TOTAL: LazyLock<IntCounterVec> = LazyLock::new(|| {
     register_int_counter_vec!(
         "cascadia_tasks_failed_total",

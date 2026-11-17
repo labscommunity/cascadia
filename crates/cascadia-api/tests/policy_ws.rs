@@ -219,10 +219,14 @@ async fn a_bad_request_gets_a_text_error_and_the_socket_stays_open() {
     }
     ws.send(Message::Binary(REQUEST.to_vec())).await.unwrap();
     assert_eq!(next_data(&mut ws).await, Message::Binary(expected_reply()));
-    // Counted as a refused call, as an engine refusal is.
+    // Counted as a refused call, as an engine refusal is, and as chat counts a bad request.
     let m = http_get(addr, "/metrics").await;
     assert!(
         m.contains(r#"cascadia_policy_infers_total{model="mock",result="invalid"}"#),
+        "{m}"
+    );
+    assert!(
+        m.contains(r#"cascadia_api_rejected_total{reason="invalid_request"}"#),
         "{m}"
     );
 }
@@ -499,6 +503,16 @@ async fn health_degrades_after_an_engine_failure_and_recovers() {
     let health = http_get(addr, "/health").await;
     assert!(health.starts_with("HTTP/1.1 503"), "{health}");
     assert!(health.contains(r#"{"status":"degraded"}"#), "{health}");
+    // Counted as chat counts a generation the engine failed.
+    let m = http_get(addr, "/metrics").await;
+    assert!(
+        m.contains(r#"cascadia_policy_infers_total{model="mock",result="error"}"#),
+        "{m}"
+    );
+    assert!(
+        m.contains(r#"cascadia_tasks_failed_total{model="mock"}"#),
+        "{m}"
+    );
     ws.send(Message::Binary(REQUEST.to_vec())).await.unwrap();
     assert_eq!(next_data(&mut ws).await, Message::Binary(expected_reply()));
     let health = http_get(addr, "/health").await;

@@ -140,9 +140,7 @@ impl SharedPolicy {
                 "error"
             }
         };
-        cascadia_metrics::POLICY_INFERS_TOTAL
-            .with_label_values(&[model, result])
-            .inc();
+        count_infer(model, result);
         res
     }
 }
@@ -151,9 +149,23 @@ impl SharedPolicy {
     /// Count a request refused before it reached the engine (it did not
     /// decode, or was too large) as an `invalid` call.
     pub fn count_refused(&self) {
-        cascadia_metrics::POLICY_INFERS_TOTAL
-            .with_label_values(&[self.spec.model.as_str(), "invalid"])
-            .inc();
+        count_infer(self.spec.model.as_str(), "invalid");
+    }
+}
+
+/// One call's `result` in `cascadia_policy_infers_total`, and in chat's counters for the same
+/// outcome: `invalid` in `cascadia_api_rejected_total{reason="invalid_request"}`, `error` in
+/// `cascadia_tasks_failed_total`, so one dashboard covers chat and robot models.
+pub(crate) fn count_infer(model: &str, result: &str) {
+    cascadia_metrics::POLICY_INFERS_TOTAL
+        .with_label_values(&[model, result])
+        .inc();
+    match result {
+        "invalid" => crate::count_rejected("invalid_request"),
+        "error" => cascadia_metrics::TASKS_FAILED_TOTAL
+            .with_label_values(&[model])
+            .inc(),
+        _ => {}
     }
 }
 

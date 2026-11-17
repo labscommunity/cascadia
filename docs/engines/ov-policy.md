@@ -115,10 +115,10 @@ f16, depending on the model; see the design doc's Scope section for each kind).
   `cascadia_http_requests_total` and `cascadia_http_request_duration_seconds`,
   `cascadia_engine_model_load_duration_seconds` and `cascadia_engine_warmup_duration_seconds`, and
   `cascadia_api_rejected_total{reason="capacity"}` for an upgrade refused because the server is
-  full, plus `cascadia_policy_infers_total{model,result}` (`ok`, `invalid` or `error`, from both
-  front ends; `invalid` includes requests that did not decode),
-  `cascadia_policy_infer_duration_seconds{model}` and, for Zenoh calls dropped before the model ran
-  them, `cascadia_policy_dropped_total{model,reason}` (`superseded` or `expired`).
+  full, `cascadia_api_rejected_total{reason="invalid_request"}` for a refused call and
+  `cascadia_tasks_failed_total{model}` for a call the engine failed, plus the robot-model families
+  `cascadia_policy_infers_total`, `cascadia_policy_infer_duration_seconds` and
+  `cascadia_policy_dropped_total`; see [METRICS.md](../METRICS.md#robot-models).
 
 The keys are Cascadia's, so openpi clients are transport-compatible, not drop-in: a client written
 for another server's keys needs a small mapping.
