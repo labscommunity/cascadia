@@ -279,7 +279,10 @@ async fn at_capacity_the_upgrade_gets_503() {
         Err(WsError::Http(resp)) => {
             assert_eq!(resp.status(), 503);
             let e = error_body(resp.body());
-            assert!(e.contains("full"), "{e}");
+            assert_eq!(
+                e,
+                "engine at capacity: 1 connections are open; retry after one closes"
+            );
         }
         other => panic!("expected 503, got {other:?}"),
     }

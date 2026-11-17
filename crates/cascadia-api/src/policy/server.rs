@@ -281,7 +281,7 @@ async fn ws(
         return error_response(
             StatusCode::SERVICE_UNAVAILABLE,
             format!(
-                "the policy server is full: {} connections are open",
+                "engine at capacity: {} connections are open; retry after one closes",
                 st.policy.max_connections()
             ),
         );

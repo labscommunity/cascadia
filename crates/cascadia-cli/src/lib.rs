@@ -1640,8 +1640,8 @@ fn check_policy_bind(host: &str, allow_all_interfaces: bool) -> Result<()> {
     }
     if !allow_all_interfaces {
         return Err(anyhow!(
-            "--api {host}: the policy server has no authentication, so it binds loopback only; \
-             pass --policy-allow-all-interfaces to bind {host}"
+            "--api {host}: the API has no authentication and drives a robot, so it binds \
+             loopback only; pass --policy-allow-all-interfaces to bind {host}"
         ));
     }
     tracing::warn!(
@@ -5117,7 +5117,13 @@ mod tests {
         }
         for host in ["0.0.0.0", "192.0.2.7", "::"] {
             let e = check_policy_bind(host, false).unwrap_err().to_string();
-            assert!(e.contains("--policy-allow-all-interfaces"), "{e}");
+            assert_eq!(
+                e,
+                format!(
+                    "--api {host}: the API has no authentication and drives a robot, so it \
+                     binds loopback only; pass --policy-allow-all-interfaces to bind {host}"
+                )
+            );
             check_policy_bind(host, true).unwrap();
         }
         // The old Zenoh-only spelling is gone (it never shipped in a release).
