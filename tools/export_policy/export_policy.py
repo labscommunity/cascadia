@@ -3,11 +3,12 @@
 The CLI embeds this file, writes it to a temp dir and runs it with the Python of the uv environment it
 manages (tools/export_policy/requirements.txt). Two subcommands:
 
-  preflight --model ID --result FILE
+  preflight --model ID|DIR --result FILE
       Reads only metadata (the repo listing, config.json, the processor JSON files) and writes a JSON
       verdict: policy type, licence, gated-tokenizer access, normalization stats. The CLI decides
-      whether to refuse. Needs only huggingface_hub.
-  export --model ID --preflight FILE --out DIR [--rtc] [--stats FILE] [--verify]
+      whether to refuse. Needs only huggingface_hub. A local checkpoint directory is read in place:
+      revision "local", the licence from its README.md, and no gated-tokenizer check (a note says so).
+  export --model ID|DIR --preflight FILE --out DIR [--rtc] [--stats FILE] [--verify]
       Loads the policy in float32 at the preflight's commit, exports it with physical-ai-studio's
       OpenVINO exporter into a float32 IR, and saves the package's IR from it with fp16 weights.
       DIR is the CLI's staging directory, renamed into place only when everything succeeded.
@@ -42,6 +43,8 @@ STATS_SOURCE = {"state": "state", "action": "action", "prev_chunk_left_over": "a
 IDENTITY_PAD = {"mean": 0.0, "std": 1.0, "q01": -1.0, "q99": 1.0, "min": -1.0, "max": 1.0}
 # The manifest's mode when a step names none (cascadia-engine-openvino's manifest default).
 DEFAULT_MODE = "mean_std"
+# The preflight revision of a local checkpoint directory.
+LOCAL_REVISION = "local"
 
 
 def log(line: str) -> None:
@@ -189,6 +192,30 @@ def copy_package(src: Path, dst: Path, ir: str) -> None:
         shutil.copy2(p, dst / r)
 
 
+def card_license(readme: str) -> str | None:
+    """The `license:` of a model card's YAML front matter, or None."""
+    lines = readme.splitlines()
+    if not lines or lines[0].strip() != "---":
+        return None
+    for line in lines[1:]:
+        if line.strip() == "---":
+            break
+        key, sep, value = line.partition(":")
+        if sep and key.strip() == "license" and value.strip():
+            return value.strip().strip("'\"")
+    return None
+
+
+def local_files(root: Path) -> set[str]:
+    """Every file under a local checkpoint, as repository-relative paths."""
+    return {p.relative_to(root).as_posix() for p in root.rglob("*") if p.is_file()}
+
+
+def _read_local_json(root: Path, filename: str) -> dict | None:
+    path = root / filename
+    return json.loads(path.read_text(encoding="utf-8")) if path.is_file() else None
+
+
 def _read_json(model: str, filename: str, revision: str | None) -> dict | None:
     from huggingface_hub import hf_hub_download
     from huggingface_hub.errors import EntryNotFoundError, LocalEntryNotFoundError
@@ -221,11 +248,21 @@ def _gated_access(repo: str) -> tuple[bool, str]:
 
 
 def preflight(model: str) -> dict:
+    out: dict = {
+        "model": model, "error": None, "gated": None, "stats": None, "revision": None, "notes": [],
+    }
+    files = None
+    local = Path(model) if Path(model).is_dir() else None
+    if local is not None:
+        files = local_files(local)
+        out["revision"] = LOCAL_REVISION
+        readme = local / "README.md"
+        out["license"] = card_license(readme.read_text(encoding="utf-8")) if readme.is_file() else None
+        out["license_files"] = license_files(files)
+        return _preflight_checks(out, files, lambda name: _read_local_json(local, name), local=True)
     from huggingface_hub import model_info
     from huggingface_hub.errors import HfHubHTTPError, HFValidationError, RepositoryNotFoundError
 
-    out: dict = {"model": model, "error": None, "gated": None, "stats": None, "revision": None}
-    files = None
     try:
         info = model_info(model)
         files = {s.rfilename for s in info.siblings or []}
@@ -244,9 +281,14 @@ def preflight(model: str) -> dict:
             return out
         out["revision"], out["license"] = None, None
     out["license_files"] = license_files(files)
-
     revision = out["revision"]
-    config = _read_json(model, "config.json", revision)
+    return _preflight_checks(out, files, lambda name: _read_json(model, name, revision), local=False)
+
+
+def _preflight_checks(out: dict, files: set[str] | None, read, local: bool) -> dict:
+    """The checks shared by a hub and a local checkpoint; `read(name)` loads one JSON file."""
+    model = out["model"]
+    config = read("config.json")
     if config is None:
         out["error"] = f"{model} has no config.json; is it a LeRobot policy checkpoint?"
         return out
@@ -259,11 +301,17 @@ def preflight(model: str) -> dict:
     if kind not in SUPPORTED:
         return out
     gated = GATED_TOKENIZER.get(kind)
-    if gated:
+    if gated and local:
+        out["notes"].append(
+            f"the gated-tokenizer check is skipped for a local checkpoint; the export still loads "
+            f"the tokenizer of {gated}, which needs a Hugging Face login that accepted its licence "
+            f"(or that tokenizer in the Hugging Face cache)"
+        )
+    elif gated:
         ok, detail = _gated_access(gated)
         out["gated"] = {"repo": gated, "ok": ok, "detail": detail}
-    pre = _read_json(model, "policy_preprocessor.json", revision)
-    post = _read_json(model, "policy_postprocessor.json", revision)
+    pre = read("policy_preprocessor.json")
+    post = read("policy_postprocessor.json")
     out["stats_mode"] = package_mode(kind, pre, config)
     problem = stats_problem(pre, post, files)
     out["stats"] = {"ok": problem is None, "detail": problem or "present"}
@@ -272,7 +320,7 @@ def preflight(model: str) -> dict:
 
 def _bind_revision(kind: str, model: str, revision: str | None) -> None:
     """Make the policy loader fetch `model` at the commit the preflight resolved, not `main`."""
-    if not revision:
+    if not revision or revision == LOCAL_REVISION:
         return
     import importlib
 
@@ -418,10 +466,14 @@ def export(args: argparse.Namespace) -> int:
             log(f"STATS OK {name}: {', '.join(replaced)}")
 
     if pre.get("license_files"):
-        from huggingface_hub import hf_hub_download
-
         for name in pre["license_files"]:
-            shutil.copy2(hf_hub_download(args.model, name, revision=revision), out / name)
+            if revision == LOCAL_REVISION:
+                src = Path(args.model) / name
+            else:
+                from huggingface_hub import hf_hub_download
+
+                src = hf_hub_download(args.model, name, revision=revision)
+            shutil.copy2(src, out / name)
         log(f"LICENCE OK copied {', '.join(pre['license_files'])}")
 
     if args.verify:

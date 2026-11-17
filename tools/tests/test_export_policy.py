@@ -78,6 +78,47 @@ class LicenceFiles(unittest.TestCase):
         self.assertEqual(ep.license_files(None), [])
 
 
+class LocalCheckpoint(unittest.TestCase):
+    def test_card_license_reads_the_front_matter(self):
+        self.assertEqual(ep.card_license("---\nlicense: apache-2.0\ntags: [x]\n---\n# m"), "apache-2.0")
+        self.assertEqual(ep.card_license("---\nlicense: 'gemma'\n---\n"), "gemma")
+        self.assertIsNone(ep.card_license("# no front matter\nlicense: mit"))
+        self.assertIsNone(ep.card_license(""))
+
+    def _checkpoint(self, root: Path, kind: str) -> None:
+        (root / "config.json").write_text(json.dumps({"type": kind, "chunk_size": 50}))
+        (root / "policy_preprocessor.json").write_text(json.dumps(_normalizer(STATE)))
+        (root / "policy_postprocessor.json").write_text(json.dumps(_unnormalizer(ACTION)))
+        for name in ("pre_step.safetensors", "post_step.safetensors", "LICENSE"):
+            (root / name).write_text("x")
+        (root / "README.md").write_text("---\nlicense: apache-2.0\n---\n")
+
+    def test_a_local_directory_is_read_in_place(self):
+        with tempfile.TemporaryDirectory() as d:
+            self._checkpoint(Path(d), "smolvla")
+            out = ep.preflight(d)
+        self.assertIsNone(out["error"])
+        self.assertEqual(out["revision"], ep.LOCAL_REVISION)
+        self.assertEqual(out["license"], "apache-2.0")
+        self.assertEqual(out["license_files"], ["LICENSE"])
+        self.assertEqual(out["policy_type"], "smolvla")
+        self.assertTrue(out["stats"]["ok"], out["stats"])
+        self.assertEqual(out["notes"], [])
+
+    def test_a_local_pi05_skips_the_gated_check_with_a_note(self):
+        with tempfile.TemporaryDirectory() as d:
+            self._checkpoint(Path(d), "pi05")
+            out = ep.preflight(d)
+        self.assertIsNone(out["gated"])
+        self.assertEqual(len(out["notes"]), 1)
+        self.assertIn("google/paligemma-3b-pt-224", out["notes"][0])
+
+    def test_a_local_directory_without_config_is_refused(self):
+        with tempfile.TemporaryDirectory() as d:
+            out = ep.preflight(d)
+        self.assertIn("no config.json", out["error"])
+
+
 def _manifest(mode="mean_std", width=8, rtc=False):
     blank = {k: [0.0] * width for k in ("mean", "std", "q01", "q99", "min", "max")}
     pre = {"state": {"name": "state", "shape": [width], "type": "STATE", **blank}}

@@ -11,6 +11,8 @@ use anyhow::{anyhow, Context, Result};
 use clap::Parser;
 use serde::Deserialize;
 
+use crate::host_check::{gib, headroom, GIB};
+
 /// The driver the CLI runs in the export environment.
 const DRIVER: &str = include_str!(concat!(
     env!("CARGO_MANIFEST_DIR"),
@@ -40,7 +42,6 @@ const STAT_KEYS: [&str; 6] = ["mean", "std", "q01", "q99", "min", "max"];
 /// torch and torchvision come from here as CPU wheels; every wheel is checked against its hash.
 const TORCH_CPU_INDEX: &str = "https://download.pytorch.org/whl/cpu";
 const SUPPORTED: [&str; 2] = ["smolvla", "pi05"];
-const GIB: u64 = 1 << 30;
 /// Available RAM plus free swap an export needs: π0.5 peaked at 14.3 GB RSS plus up to 10 GB swap.
 const MIN_AVAILABLE: u64 = 32 * GIB;
 /// Physical RAM floor; a 16 GiB VM reports about 15.6 GiB.
@@ -52,7 +53,9 @@ const GEMMA_PROHIBITED_USE: &str = "https://ai.google.dev/gemma/prohibited_use_p
 /// for `cascadia run --engine ov-policy`.
 #[derive(Parser, Debug, Clone)]
 pub struct ExportPolicyArgs {
-    /// Hugging Face model id of the checkpoint, e.g. `lerobot/smolvla_libero`.
+    /// The checkpoint: a Hugging Face model id, e.g. `lerobot/smolvla_libero`, or a local
+    /// LeRobot checkpoint directory (`config.json`, the weights and the processor files), as
+    /// `cascadia shard` takes a local directory. A directory wins over a same-named model id.
     #[arg(long)]
     pub model: String,
     /// Package directory to write; must not exist or be empty.
@@ -119,6 +122,9 @@ pub(crate) struct Preflight {
     /// The mode the exporter will write into the manifest's normalize steps.
     #[serde(default)]
     pub stats_mode: Option<String>,
+    /// Checks the driver skipped and why, printed before the export.
+    #[serde(default)]
+    pub notes: Vec<String>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -342,10 +348,6 @@ pub(crate) fn uv_install_hint() -> String {
     }
 }
 
-fn gib(bytes: u64) -> String {
-    format!("{:.1} GiB", bytes as f64 / GIB as f64)
-}
-
 /// A host torch 2.11 publishes no CPU wheels for (an Intel Mac, Windows on ARM): the export
 /// environment cannot install there.
 pub(crate) fn platform_refusal(os: &str, arch: &str) -> Option<String> {
@@ -400,7 +402,7 @@ pub(crate) fn host_refusal(f: &HostFacts) -> Option<String> {
                 .into(),
         );
     }
-    let room = f.available_ram.saturating_add(f.free_swap);
+    let room = headroom(f);
     if room < MIN_AVAILABLE {
         return Some(format!(
             "not enough memory to export: {} of available RAM plus free swap, and an export needs \
@@ -419,20 +421,9 @@ pub(crate) fn host_refusal(f: &HostFacts) -> Option<String> {
     serving_process(&f.processes, f.own_pid)
 }
 
-/// A process that serves models on this host: a cascadia node, OVMS, or `cascadia run`/`worker`.
+/// [`crate::host_check::serving_process`] as export-policy's refusal.
 pub(crate) fn serving_process(procs: &[ProcessFacts], own_pid: u32) -> Option<String> {
-    let found = procs.iter().filter(|p| p.pid != own_pid).find_map(|p| {
-        let lower = p.name.to_ascii_lowercase();
-        let name = lower.strip_suffix(".exe").unwrap_or(&lower);
-        match name {
-            "ovms" => Some(format!("OVMS (pid {})", p.pid)),
-            "cascadia-node" => Some(format!("a cascadia node (pid {})", p.pid)),
-            "cascadia" => subcommand(&p.args)
-                .filter(|a| matches!(*a, "run" | "worker" | "run-placement" | "serve"))
-                .map(|a| format!("`cascadia {a}` (pid {})", p.pid)),
-            _ => None,
-        }
-    })?;
+    let found = crate::host_check::serving_process(procs, own_pid)?;
     Some(format!(
         "{found} is serving on this host. An export takes most of the machine's memory for many \
          minutes and would starve it. Export on a disposable Linux machine instead (x86-64, \
@@ -440,22 +431,28 @@ pub(crate) fn serving_process(procs: &[ProcessFacts], own_pid: u32) -> Option<St
     ))
 }
 
-/// The subcommand of a cascadia command line: the first word after the global flags.
-fn subcommand(args: &[String]) -> Option<&str> {
-    let mut it = args.iter().skip(1);
-    while let Some(a) = it.next() {
-        if a == "--log-level" {
-            it.next();
-        } else if !a.starts_with('-') {
-            return Some(a);
-        }
-    }
-    None
+/// Whether `--model` names a local checkpoint directory rather than a model id.
+pub(crate) fn is_local_checkpoint(model: &str) -> bool {
+    Path::new(model).is_dir()
 }
 
 /// Local argument checks that need no network.
 pub(crate) fn check_inputs(args: &ExportPolicyArgs) -> Result<()> {
-    validate_model_id(&args.model)?;
+    if is_local_checkpoint(&args.model) {
+        if !Path::new(&args.model).join("config.json").is_file() {
+            return Err(anyhow!(
+                "{} has no config.json; a local --model must be a LeRobot checkpoint directory",
+                args.model
+            ));
+        }
+    } else {
+        validate_model_id(&args.model).map_err(|e| {
+            anyhow!(
+                "{e}\nIf {} is meant to be a local directory, it does not exist.",
+                args.model
+            )
+        })?;
+    }
     let staging = staging_dir(&args.output_dir)?;
     for p in [staging.clone(), sibling(&staging, ".f32")] {
         if p.exists() {
@@ -548,10 +545,17 @@ pub(crate) fn gemma_terms_apply(p: &Preflight) -> bool {
 
 /// The package's `NOTICE`, which the engine serves as the metadata's `attribution`.
 pub(crate) fn notice_text(p: &Preflight, model: &str) -> String {
+    // A local directory is named by its last component: the full path is the exporting
+    // machine's and would ship inside the package's metadata.
+    let source = if is_local_checkpoint(model) {
+        format!("the local checkpoint directory {}", local_name(model))
+    } else {
+        format!("the Hugging Face checkpoint {model}")
+    };
     let mut n = format!(
-        "This policy package was exported by `cascadia export-policy` from the Hugging Face \
-         checkpoint {model} (revision {}) with physical-ai-studio 8f132416 and the physicalai \
-         runtime e3dd944.\n\nLicence of the checkpoint, from its model card: {}.\n",
+        "This policy package was exported by `cascadia export-policy` from {source} (revision \
+         {}) with physical-ai-studio 8f132416 and the physicalai runtime e3dd944.\n\nLicence \
+         of the checkpoint, from its model card: {}.\n",
         p.revision.as_deref().unwrap_or("unknown"),
         p.license.as_deref().unwrap_or("not stated"),
     );
@@ -570,6 +574,15 @@ pub(crate) fn notice_text(p: &Preflight, model: &str) -> String {
         ));
     }
     n
+}
+
+/// The last path component of a local checkpoint.
+fn local_name(model: &str) -> String {
+    Path::new(model)
+        .canonicalize()
+        .ok()
+        .and_then(|p| p.file_name().map(|n| n.to_string_lossy().into_owned()))
+        .unwrap_or_else(|| model.trim_end_matches(['/', '\\']).to_string())
 }
 
 /// One line per set of terms, printed before the export starts and after it ends.
@@ -613,6 +626,9 @@ pub(crate) fn run_export(args: &ExportPolicyArgs, host: &mut dyn ExportHost) -> 
     let pre = host.preflight(&args.model)?;
     if let Some(why) = preflight_refusal(&pre, &args.model, args.stats.is_some()) {
         return Err(anyhow!(why));
+    }
+    for note in &pre.notes {
+        eprintln!("note: {note}");
     }
     if let Some(path) = &args.stats {
         let doc: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(path)?)?;
@@ -873,41 +889,12 @@ impl UvHost {
 
 impl ExportHost for UvHost {
     fn facts(&mut self) -> HostFacts {
-        use sysinfo::{
-            MemoryRefreshKind, ProcessRefreshKind, ProcessesToUpdate, RefreshKind, System,
-            UpdateKind,
-        };
-        let mut sys = System::new_with_specifics(
-            RefreshKind::nothing().with_memory(MemoryRefreshKind::everything()),
-        );
-        sys.refresh_processes_specifics(
-            ProcessesToUpdate::All,
-            true,
-            ProcessRefreshKind::nothing().with_cmd(UpdateKind::Always),
-        );
-        let processes = sys
-            .processes()
-            .iter()
-            .map(|(pid, p)| ProcessFacts {
-                pid: pid.as_u32(),
-                name: p.name().to_string_lossy().into_owned(),
-                args: p
-                    .cmd()
-                    .iter()
-                    .map(|a| a.to_string_lossy().into_owned())
-                    .collect(),
-            })
-            .collect();
         let (uv, uv_version) = uv_on_path();
         HostFacts {
             uv_version,
             uv,
             git: find_on_path("git"),
-            total_ram: sys.total_memory(),
-            available_ram: sys.available_memory(),
-            free_swap: sys.free_swap(),
-            processes,
-            own_pid: std::process::id(),
+            ..crate::host_check::read_host()
         }
     }
 
@@ -1163,6 +1150,36 @@ mod tests {
             ..roomy()
         };
         assert_eq!(host_refusal(&f), None);
+    }
+
+    /// A local checkpoint directory is taken like `shard` takes one: it needs a config.json,
+    /// and the NOTICE names only its last path component.
+    #[test]
+    fn accepts_a_local_checkpoint_directory() {
+        let root = tempfile::tempdir().unwrap();
+        let ckpt = root.path().join("my_smolvla");
+        std::fs::create_dir(&ckpt).unwrap();
+        let out = root.path().join("pkg");
+        let model = ckpt.to_str().unwrap();
+        let e = check_inputs(&args(model, &out)).unwrap_err().to_string();
+        assert!(e.contains("has no config.json"), "{e}");
+        std::fs::write(ckpt.join("config.json"), "{}").unwrap();
+        check_inputs(&args(model, &out)).unwrap();
+        let p = Preflight {
+            revision: Some("local".into()),
+            ..passing("smolvla")
+        };
+        let n = notice_text(&p, model);
+        assert!(
+            n.contains("the local checkpoint directory my_smolvla (revision local)"),
+            "{n}"
+        );
+        assert!(!n.contains(root.path().to_str().unwrap()), "{n}");
+        // A path that does not exist is still read as a model id, and says so.
+        let e = check_inputs(&args("./no/such/dir", &out))
+            .unwrap_err()
+            .to_string();
+        assert!(e.contains("it does not exist"), "{e}");
     }
 
     #[test]
@@ -1633,7 +1650,7 @@ mod tests {
         for argv in [
             &["cascadia", "--log-level", "debug", "run", "pkg"][..],
             &["cascadia", "--log-level=info", "worker", "--rank", "0"],
-            &["/opt/bin/cascadia", "serve"],
+            &["/opt/bin/cascadia", "run-placement", "p.json"],
         ] {
             let procs = [proc(9, "cascadia", argv)];
             assert!(serving_process(&procs, 1).is_some(), "{argv:?}");

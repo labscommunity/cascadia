@@ -32,6 +32,7 @@ use tracing_subscriber::EnvFilter;
 pub mod discover;
 pub mod doctor;
 pub mod export_policy;
+mod host_check;
 pub mod placement;
 pub mod profile;
 pub mod profile_stage;
@@ -1535,8 +1536,8 @@ async fn cmd_run_policy(args: RunArgs) -> Result<()> {
     // Device and precision errors (NPU, CPU f16) before any file is read.
     compile_config(&args.device, precision)?;
     let dir = PathBuf::from(&args.model);
-    if !dir.is_dir() {
-        return Err(missing_policy_package_error(&args.model));
+    if !dir.join("manifest.json").is_file() {
+        return Err(missing_policy_package_error(&args.model, dir.is_dir()));
     }
     let mut identity = cascadia_api::policy::PackageIdentity::from_package_dir(&dir)
         .with_context(|| format!("reading {}", dir.join("manifest.json").display()))?;
@@ -1607,18 +1608,29 @@ fn policy_load_options(
     }
 }
 
-/// [`missing_model_error`] for a policy package: how to export one.
-fn missing_policy_package_error(model: &str) -> anyhow::Error {
-    let stem = model_stem(model);
+/// [`missing_model_error`] for a policy package: how to export one. `is_dir` says the path is a
+/// directory without a `manifest.json` (a LeRobot checkpoint, most likely).
+fn missing_policy_package_error(model: &str, is_dir: bool) -> anyhow::Error {
+    // `-ov` keeps the suggested output apart from a local checkpoint of the same name.
+    let out = format!("./{}-ov", model_stem(model));
+    let what = if is_dir {
+        format!(
+            "{model} has no manifest.json, so it is not a policy_package. If it is a local \
+             LeRobot checkpoint (SmolVLA or pi0.5)"
+        )
+    } else {
+        format!(
+            "no policy package directory at {model}\n\n\
+             If that is a path, it does not exist. If it is a Hugging Face LeRobot checkpoint \
+             (SmolVLA or pi0.5)"
+        )
+    };
     anyhow!(
-        "no policy package directory at {model}\n\
-         \n\
-         --engine ov-policy takes a local policy_package directory (manifest.json, the policy \
-         IR and the tokenizer IR) and never downloads or converts one. If {model} is a \
-         Hugging Face LeRobot checkpoint (SmolVLA or pi0.5), export it first:\n\
+        "{what}: --engine ov-policy takes a local policy_package directory (manifest.json, the \
+         policy IR and the tokenizer IR) and never downloads or converts one. Export it first:\n\
          \n  \
-         cascadia export-policy --model {model} --output-dir ./{stem}\n    \
-         cascadia run ./{stem} --engine ov-policy\n\
+         cascadia export-policy --model {model} --output-dir {out}\n    \
+         cascadia run {out} --engine ov-policy\n\
          \n\
          Other kinds: see docs/engines/ov-policy.md."
     )
@@ -3550,6 +3562,11 @@ async fn cmd_shard(args: ShardArgs) -> Result<()> {
     {
         eprintln!("warning: --static-seq/--static-context are ignored without --target npu");
     }
+    // The same host checks export-policy refuses on; a shard export's need depends on the
+    // model, so here they only warn.
+    for w in host_check::shard_warnings(&host_check::read_host()) {
+        eprintln!("warning: {w}");
+    }
 
     // `--skip-check` means exactly that: don't import the deps just to pick an
     // interpreter (importing torch costs seconds).
@@ -5035,11 +5052,35 @@ mod tests {
             .unwrap_err()
         );
         assert!(
-            e.contains("cascadia export-policy --model lerobot/smolvla_libero --output-dir ./smolvla_libero"),
+            e.contains("cascadia export-policy --model lerobot/smolvla_libero --output-dir ./smolvla_libero-ov"),
             "{e}"
         );
         assert!(
-            e.contains("cascadia run ./smolvla_libero --engine ov-policy"),
+            e.contains("cascadia run ./smolvla_libero-ov --engine ov-policy"),
+            "{e}"
+        );
+        assert!(e.contains("If that is a path, it does not exist"), "{e}");
+        // A directory without a manifest (a checkpoint) is pointed at export-policy, with an
+        // output that does not collide with it.
+        let ckpt = tempfile::tempdir().unwrap();
+        let path = ckpt.path().to_str().unwrap();
+        let e = format!(
+            "{:#}",
+            cmd_run(run_args(&[
+                path,
+                "--engine",
+                "ov-policy",
+                "--device",
+                "CPU"
+            ]))
+            .await
+            .unwrap_err()
+        );
+        assert!(e.contains("has no manifest.json"), "{e}");
+        assert!(
+            e.contains(&format!(
+                "cascadia export-policy --model {path} --output-dir ./"
+            )),
             "{e}"
         );
     }
