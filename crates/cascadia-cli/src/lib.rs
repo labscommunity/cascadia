@@ -857,8 +857,9 @@ pub struct RunArgs {
     pub api: Option<String>,
 
     /// OV inference precision hint, as for `cascadia worker`: f16, bf16 or
-    /// f32 on chat engines. `--engine ov-policy` takes f16 or f32 (default f16
-    /// on GPU); CPU always runs f32 and refuses f16.
+    /// f32 on the OpenVINO chat engines (refused on mock and sycl-llama).
+    /// `--engine ov-policy` takes f16 or f32 (default f16 on GPU); CPU always
+    /// runs f32 and refuses f16.
     #[arg(long, value_name = "PREC")]
     pub ov_inference_precision: Option<String>,
 
@@ -1406,6 +1407,7 @@ impl RunArgs {
     fn differs_from_default(&self, id: &str) -> Option<bool> {
         let d = RunArgs::try_parse_from(["run", "m"]).expect("run parses with defaults");
         Some(match id {
+            "ov_inference_precision" => self.ov_inference_precision.is_some(),
             "policy_allow_origin" => !self.policy_allow_origin.is_empty(),
             "policy_allow_identity_stats" => self.policy_allow_identity_stats,
             "zenoh" => self.zenoh.is_some(),
@@ -1445,6 +1447,24 @@ const POLICY_FLAGS: [&str; 5] = [
     "--policy-allow-all-interfaces",
 ];
 
+/// The OpenVINO `run` flags, which only the OpenVINO engines read.
+const OV_FLAGS: [&str; 1] = ["--ov-inference-precision"];
+
+/// Whether `engine` reads [`OV_FLAGS`]: its builder applies `ov_perf_properties`, or, for
+/// ov-policy, `policy_precision`.
+fn engine_takes_ov_flags(engine: EngineKind) -> bool {
+    match engine {
+        EngineKind::OvGenai
+        | EngineKind::OvRuntime
+        | EngineKind::OvDistSpec
+        | EngineKind::Gemma4
+        | EngineKind::SparseMoe
+        | EngineKind::Qwen36Moe
+        | EngineKind::OvPolicy => true,
+        EngineKind::Mock | EngineKind::SyclLlama => false,
+    }
+}
+
 /// The sycl-llama-only `run` flags.
 const LLAMA_FLAGS: [&str; 8] = [
     "--llama-mtp",
@@ -1474,6 +1494,14 @@ const ELASTIC_TUNING_FLAGS: [&str; 2] = ["--elastic-vram", "--elastic-share"];
 /// engine, and the chat-only flags on ov-policy. A flag counts when it was
 /// typed, even at its default value.
 fn check_engine_flags(args: &RunArgs) -> Result<()> {
+    if !engine_takes_ov_flags(args.engine) {
+        if let Some(flag) = args.first_given(&OV_FLAGS) {
+            return Err(anyhow!(
+                "{flag} does not apply to --engine {}",
+                engine_name(args.engine)
+            ));
+        }
+    }
     if args.engine == EngineKind::OvPolicy {
         return check_chat_flags_unused(args);
     }
@@ -4898,6 +4926,31 @@ mod tests {
         );
     }
 
+    /// The OpenVINO engines take `--ov-inference-precision`; mock and sycl-llama would ignore
+    /// it, so they refuse it.
+    #[test]
+    fn inference_precision_is_refused_where_nothing_reads_it() {
+        for engine in [
+            "ov-genai",
+            "ov-runtime",
+            "ov-dist-spec",
+            "gemma4",
+            "sparse-moe",
+            "qwen35",
+            "ov-policy",
+        ] {
+            let args = run_args(&["m", "--engine", engine, "--ov-inference-precision", "f16"]);
+            check_engine_flags(&args).unwrap_or_else(|e| panic!("{engine}: {e}"));
+        }
+        for engine in ["mock", "sycl-llama"] {
+            let args = run_args(&["m", "--engine", engine, "--ov-inference-precision", "f16"]);
+            assert_eq!(
+                check_engine_flags(&args).unwrap_err().to_string(),
+                format!("--ov-inference-precision does not apply to --engine {engine}")
+            );
+        }
+    }
+
     /// ov-policy computes at f16 or f32 only; the default is the device's.
     #[test]
     fn ov_policy_takes_f16_or_f32() {
@@ -5099,6 +5152,7 @@ mod tests {
             .collect();
         for flag in POLICY_FLAGS
             .iter()
+            .chain(&OV_FLAGS)
             .chain(&LLAMA_FLAGS)
             .chain(&ELASTIC_TUNING_FLAGS)
             .chain(&CHAT_FLAGS)

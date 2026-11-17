@@ -83,7 +83,7 @@ cascadia run [OPTIONS] <MODEL>
 | `--engine <ENGINE>` | `ov-genai` | Inference engine. Use `ov-runtime` for a `cascadia shard` tree. |
 | `--api <API>` | `:8000`; `127.0.0.1:8000` for `ov-policy` | API bind address. `127.0.0.1:8000` binds loopback only. The API is unauthenticated: a chat engine logs a warning on a non-loopback bind, and `ov-policy` refuses one without `--policy-allow-all-interfaces`. |
 | `--prefix-cache-gb <GB>` | min(16, RAM/4) | `qwen35` only: budget of the in-process prefix cache (system-block + chat-boundary state snapshots, restored for prompts that extend a cached prefix). `0` disables. |
-| `--ov-inference-precision <P>` | the device's | OpenVINO precision hint, as for [`worker`](#cascadia-worker) (`f16` / `bf16` / `f32`). |
+| `--ov-inference-precision <P>` | the device's | OpenVINO precision hint, as for [`worker`](#cascadia-worker) (`f16` / `bf16` / `f32`). Taken by `ov-genai`, `ov-runtime`, `ov-dist-spec`, `gemma4`, `sparse-moe`, `qwen35` and `ov-policy` (`f16` / `f32` only); refused on `mock` and `sycl-llama`. |
 | `--api-max-body-mb <MB>` | `1` | Largest chat-completions request body (MiB); the rendered prompt is capped at the same size (1 MiB ≈ 250K tokens of English). Only `qwen35` also bounds the prompt in tokens against the model window; on other engines this byte cap is the whole guard, so lower it on an exposed endpoint. |
 
 `run` also takes the sycl-llama flags (`--llama-*`, `--elastic`,
@@ -91,8 +91,9 @@ cascadia run [OPTIONS] <MODEL>
 expert-parallel driver flags (`--ep-workers`, `--ep-placement`). A flag the chosen
 engine would ignore is refused: `--llama-*`, `--elastic-vram` and
 `--elastic-share` outside `sycl-llama` (the last two also need `--elastic`),
-`--prefix-cache-gb` outside `qwen35`, `--ep-*` outside `sparse-moe`, and the
-policy flags below outside `ov-policy`.
+`--prefix-cache-gb` outside `qwen35`, `--ep-*` outside `sparse-moe`,
+`--ov-inference-precision` on `mock` and `sycl-llama`, and the policy flags
+below outside `ov-policy`.
 
 Robot models (`--engine ov-policy`, see [engines/ov-policy.md](engines/ov-policy.md)):
 
