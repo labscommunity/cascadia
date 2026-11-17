@@ -23,6 +23,7 @@ use cascadia_engine_sparse_moe::{SparseMoEBuilder, SparseMoEBuilderConfig};
 use cascadia_runner::Runner;
 use cascadia_transport::TransportAddr;
 use cascadia_types::{GenerationTask, PeerEndpoint, PeerLayout, ShardSpec};
+use clap::parser::ValueSource;
 use clap::{CommandFactory, Parser, Subcommand, ValueEnum};
 use clap_complete::Shell;
 use futures::StreamExt;
@@ -160,6 +161,35 @@ pub struct Cli {
     /// Logging level (overrides RUST_LOG).
     #[arg(long, default_value = "info", global = true)]
     pub log_level: String,
+}
+
+impl Cli {
+    /// [`Parser::parse`], also recording which `run` flags were typed.
+    pub fn parse_args() -> Self {
+        Self::try_parse_args_from(std::env::args_os()).unwrap_or_else(|e| e.exit())
+    }
+
+    /// [`Parser::try_parse_from`], also recording which `run` flags were typed.
+    pub fn try_parse_args_from<I, T>(argv: I) -> Result<Self, clap::Error>
+    where
+        I: IntoIterator<Item = T>,
+        T: Into<std::ffi::OsString> + Clone,
+    {
+        let mut cmd = Self::command();
+        let matches = cmd.try_get_matches_from_mut(argv)?;
+        let mut cli = <Self as clap::FromArgMatches>::from_arg_matches(&matches)
+            .map_err(|e| e.format(&mut cmd))?;
+        if let (Command::Run(args), Some(sub)) = (&mut cli.cmd, matches.subcommand_matches("run")) {
+            // Only the command line counts: RunArgs reads no env vars, and a
+            // value equal to its default is still the operator's choice.
+            args.typed = sub
+                .ids()
+                .filter(|id| sub.value_source(id.as_str()) == Some(ValueSource::CommandLine))
+                .map(|id| id.to_string())
+                .collect();
+        }
+        Ok(cli)
+    }
 }
 
 #[derive(Subcommand, Debug)]
@@ -963,6 +993,10 @@ pub struct RunArgs {
     /// sycl-llama only.
     #[arg(long, default_value_t = 1)]
     pub llama_load_retries: u32,
+
+    /// Arg ids typed on the command line; filled by [`Cli::try_parse_args_from`].
+    #[arg(skip)]
+    pub typed: std::collections::BTreeSet<String>,
 }
 
 #[derive(Parser, Debug, Clone)]
@@ -1365,120 +1399,103 @@ impl RunArgs {
     }
 }
 
+impl RunArgs {
+    /// Whether `flag` (`--foo-bar`) was typed on the command line.
+    fn given(&self, flag: &str) -> bool {
+        let id = flag.trim_start_matches("--").replace('-', "_");
+        self.typed.contains(&id)
+    }
+
+    /// The first of `flags` that was typed.
+    fn first_given(&self, flags: &[&'static str]) -> Option<&'static str> {
+        flags.iter().copied().find(|f| self.given(f))
+    }
+}
+
+/// The policy-only `run` flags, refused on a chat engine.
+const POLICY_FLAGS: [&str; 7] = [
+    "--policy-precision",
+    "--policy-allow-origin",
+    "--policy-max-connections",
+    "--policy-allow-identity-stats",
+    "--zenoh",
+    "--zenoh-name",
+    "--policy-allow-all-interfaces",
+];
+
+/// The sycl-llama-only `run` flags.
+const LLAMA_FLAGS: [&str; 8] = [
+    "--llama-mtp",
+    "--llama-bin",
+    "--llama-ctx",
+    "--llama-ngl",
+    "--llama-args",
+    "--llama-host-layers",
+    "--llama-load-timeout",
+    "--llama-load-retries",
+];
+
+/// The chat-engine `run` flags besides [`LLAMA_FLAGS`] and
+/// [`ELASTIC_TUNING_FLAGS`], refused on ov-policy.
+const CHAT_FLAGS: [&str; 5] = [
+    "--prefix-cache-gb",
+    "--ep-workers",
+    "--ep-placement",
+    "--api-max-body-mb",
+    "--elastic",
+];
+
+/// sycl-llama's `--elastic` tuning flags.
+const ELASTIC_TUNING_FLAGS: [&str; 2] = ["--elastic-vram", "--elastic-share"];
+
 /// Refuse a flag the chosen engine would ignore: the policy flags on a chat
-/// engine, and the chat-only flags on ov-policy.
+/// engine, and the chat-only flags on ov-policy. A flag counts when it was
+/// typed, even at its default value.
 fn check_engine_flags(args: &RunArgs) -> Result<()> {
     if args.engine == EngineKind::OvPolicy {
         return check_chat_flags_unused(args);
     }
-    let used = [
-        ("--policy-precision", args.policy_precision.is_some()),
-        (
-            "--policy-allow-origin",
-            !args.policy_allow_origin.is_empty(),
-        ),
-        (
-            "--policy-max-connections",
-            args.policy_max_connections.is_some(),
-        ),
-        (
-            "--policy-allow-identity-stats",
-            args.policy_allow_identity_stats,
-        ),
-        ("--zenoh", args.zenoh.is_some()),
-        ("--zenoh-name", args.zenoh_name.is_some()),
-        (
-            "--policy-allow-all-interfaces",
-            args.policy_allow_all_interfaces,
-        ),
-    ];
-    if let Some((flag, _)) = used.iter().find(|(_, set)| *set) {
+    if let Some(flag) = args.first_given(&POLICY_FLAGS) {
         return Err(anyhow!("{flag} applies to --engine ov-policy only"));
     }
     check_chat_flags_apply(args)
 }
 
-/// The sycl-llama-only `run` flags, each with whether it is set (a flag with
-/// a default counts as set when it differs from it).
-fn llama_flags_used(args: &RunArgs, d: &RunArgs) -> [(&'static str, bool); 8] {
-    [
-        ("--llama-mtp", args.llama_mtp),
-        ("--llama-bin", args.llama_bin.is_some()),
-        ("--llama-ctx", args.llama_ctx != d.llama_ctx),
-        ("--llama-ngl", args.llama_ngl != d.llama_ngl),
-        ("--llama-args", !args.llama_args.is_empty()),
-        ("--llama-host-layers", args.llama_host_layers.is_some()),
-        ("--llama-load-timeout", args.llama_load_timeout.is_some()),
-        (
-            "--llama-load-retries",
-            args.llama_load_retries != d.llama_load_retries,
-        ),
-    ]
-}
-
 /// Refuse an engine-specific chat flag on a chat engine that would ignore it.
 fn check_chat_flags_apply(args: &RunArgs) -> Result<()> {
-    let d = RunArgs::try_parse_from(["run", "m"]).expect("run parses with defaults");
-    let only = |engine: EngineKind, flags: &[(&'static str, bool)]| -> Result<()> {
-        match flags.iter().find(|(_, set)| *set) {
-            Some((flag, _)) if args.engine != engine => Err(anyhow!(
+    let only = |engine: EngineKind, flags: &[&'static str]| -> Result<()> {
+        match args.first_given(flags) {
+            Some(flag) if args.engine != engine => Err(anyhow!(
                 "{flag} applies to --engine {} only",
                 engine_name(engine)
             )),
             _ => Ok(()),
         }
     };
-    let elastic_tuning = [
-        ("--elastic-vram", args.elastic_vram != d.elastic_vram),
-        ("--elastic-share", args.elastic_share.is_some()),
-    ];
-    only(EngineKind::SyclLlama, &llama_flags_used(args, &d))?;
-    only(EngineKind::SyclLlama, &elastic_tuning)?;
-    if let Some((flag, _)) = elastic_tuning.iter().find(|(_, set)| *set) {
+    only(EngineKind::SyclLlama, &LLAMA_FLAGS)?;
+    only(EngineKind::SyclLlama, &ELASTIC_TUNING_FLAGS)?;
+    if let Some(flag) = args.first_given(&ELASTIC_TUNING_FLAGS) {
         if !args.elastic {
             return Err(anyhow!("{flag} needs --elastic"));
         }
     }
-    only(
-        EngineKind::Qwen36Moe,
-        &[("--prefix-cache-gb", args.prefix_cache_gb.is_some())],
-    )?;
-    only(
-        EngineKind::SparseMoe,
-        &[
-            ("--ep-workers", !args.ep_workers.is_empty()),
-            ("--ep-placement", args.ep_placement.is_some()),
-        ],
-    )?;
+    only(EngineKind::Qwen36Moe, &["--prefix-cache-gb"])?;
+    only(EngineKind::SparseMoe, &["--ep-workers", "--ep-placement"])?;
     if args.ep_placement.is_some() && args.ep_workers.is_empty() {
         return Err(anyhow!("--ep-placement needs --ep-workers"));
     }
     Ok(())
 }
 
-/// The chat-only `run` flags, refused on ov-policy. A flag with a default
-/// counts as set when it differs from that default (clap's derive cannot tell
-/// an explicit default from none).
+/// The chat-only `run` flags, refused on ov-policy.
 fn check_chat_flags_unused(args: &RunArgs) -> Result<()> {
-    let d = RunArgs::try_parse_from(["run", "m"]).expect("run parses with defaults");
-    let used = [
-        ("--prefix-cache-gb", args.prefix_cache_gb.is_some()),
-        ("--ep-workers", !args.ep_workers.is_empty()),
-        ("--ep-placement", args.ep_placement.is_some()),
-        (
-            "--api-max-body-mb",
-            args.api_max_body_mb != d.api_max_body_mb,
-        ),
-        ("--elastic", args.elastic),
-        ("--elastic-vram", args.elastic_vram != d.elastic_vram),
-        ("--elastic-share", args.elastic_share.is_some()),
-    ];
-    match used
+    match CHAT_FLAGS
         .iter()
-        .chain(llama_flags_used(args, &d).iter())
-        .find(|(_, set)| *set)
+        .chain(&ELASTIC_TUNING_FLAGS)
+        .chain(&LLAMA_FLAGS)
+        .find(|f| args.given(f))
     {
-        Some((flag, _)) => Err(anyhow!("{flag} does not apply to --engine ov-policy")),
+        Some(flag) => Err(anyhow!("{flag} does not apply to --engine ov-policy")),
         None => Ok(()),
     }
 }
@@ -4785,7 +4802,7 @@ mod tests {
     fn run_args(argv: &[&str]) -> RunArgs {
         let mut full = vec!["cascadia", "run"];
         full.extend_from_slice(argv);
-        match Cli::try_parse_from(full).expect("parse run argv").cmd {
+        match Cli::try_parse_args_from(full).expect("parse run argv").cmd {
             Command::Run(a) => a,
             _ => panic!("expected run"),
         }
@@ -4947,6 +4964,53 @@ mod tests {
                 "2",
             ]))
             .unwrap();
+        }
+    }
+
+    /// A flag typed at its default value is still refused; one left out is not.
+    #[test]
+    fn typed_defaults_are_refused_untyped_are_not() {
+        let refused = |argv: &[&str]| check_engine_flags(&run_args(argv)).unwrap_err().to_string();
+        let e = refused(&["m", "--engine", "ov-genai", "--llama-ctx", "4096"]);
+        assert!(
+            e.contains("--llama-ctx applies to --engine sycl-llama only"),
+            "{e}"
+        );
+        for flag in [&["--api-max-body-mb", "1"][..], &["--llama-ngl", "99"]] {
+            let mut argv = vec!["pkg", "--engine", "ov-policy"];
+            argv.extend_from_slice(flag);
+            let e = refused(&argv);
+            assert!(e.contains(&format!("{} does not apply", flag[0])), "{e}");
+        }
+        let e = refused(&["m", "--engine", "ov-genai", "--policy-max-connections", "4"]);
+        assert!(
+            e.contains("--policy-max-connections applies to --engine ov-policy only"),
+            "{e}"
+        );
+        check_engine_flags(&run_args(&["m", "--engine", "ov-genai"])).unwrap();
+        check_engine_flags(&run_args(&["pkg", "--engine", "ov-policy"])).unwrap();
+        // Typed flags are recorded by arg id.
+        assert!(run_args(&["m", "--llama-ctx", "4096"])
+            .typed
+            .contains("llama_ctx"));
+    }
+
+    /// Every flag the engine checks name is a real `run` flag.
+    #[test]
+    fn engine_flag_lists_name_real_run_flags() {
+        let cmd = RunArgs::command();
+        let ids: Vec<_> = cmd
+            .get_arguments()
+            .map(|a| a.get_id().to_string())
+            .collect();
+        for flag in POLICY_FLAGS
+            .iter()
+            .chain(&LLAMA_FLAGS)
+            .chain(&ELASTIC_TUNING_FLAGS)
+            .chain(&CHAT_FLAGS)
+        {
+            let id = flag.trim_start_matches("--").replace('-', "_");
+            assert!(ids.contains(&id), "{flag}");
         }
     }
 
@@ -5370,7 +5434,7 @@ mod sycl_llama_flag_tests {
     use super::*;
 
     fn run_args(argv: &[&str]) -> RunArgs {
-        let cli = Cli::try_parse_from(argv).expect("parse run argv");
+        let cli = Cli::try_parse_args_from(argv).expect("parse run argv");
         match cli.cmd {
             Command::Run(args) => args,
             _ => panic!("expected run subcommand"),
