@@ -182,11 +182,12 @@ impl Cli {
         if let (Command::Run(args), Some(sub)) = (&mut cli.cmd, matches.subcommand_matches("run")) {
             // Only the command line counts: RunArgs reads no env vars, and a
             // value equal to its default is still the operator's choice.
-            args.typed = sub
-                .ids()
-                .filter(|id| sub.value_source(id.as_str()) == Some(ValueSource::CommandLine))
-                .map(|id| id.to_string())
-                .collect();
+            args.typed = Some(
+                sub.ids()
+                    .filter(|id| sub.value_source(id.as_str()) == Some(ValueSource::CommandLine))
+                    .map(|id| id.to_string())
+                    .collect(),
+            );
         }
         Ok(cli)
     }
@@ -995,8 +996,9 @@ pub struct RunArgs {
     pub llama_load_retries: u32,
 
     /// Arg ids typed on the command line; filled by [`Cli::try_parse_args_from`].
+    /// `None` after a plain clap parse, which falls back to value-vs-default.
     #[arg(skip)]
-    pub typed: std::collections::BTreeSet<String>,
+    pub typed: Option<std::collections::BTreeSet<String>>,
 }
 
 #[derive(Parser, Debug, Clone)]
@@ -1400,10 +1402,46 @@ impl RunArgs {
 }
 
 impl RunArgs {
-    /// Whether `flag` (`--foo-bar`) was typed on the command line.
+    /// Whether `flag` (`--foo-bar`) was given: typed on the command line, or,
+    /// without a typed set, set to a value other than its default. A flag the
+    /// fallback does not know counts as given, so it is refused, not skipped.
     fn given(&self, flag: &str) -> bool {
         let id = flag.trim_start_matches("--").replace('-', "_");
-        self.typed.contains(&id)
+        match &self.typed {
+            Some(typed) => typed.contains(&id),
+            None => self.differs_from_default(&id).unwrap_or(true),
+        }
+    }
+
+    /// Whether the checked flag `id` holds a non-default value; `None` for an
+    /// id this does not cover.
+    fn differs_from_default(&self, id: &str) -> Option<bool> {
+        let d = RunArgs::try_parse_from(["run", "m"]).expect("run parses with defaults");
+        Some(match id {
+            "policy_precision" => self.policy_precision.is_some(),
+            "policy_allow_origin" => !self.policy_allow_origin.is_empty(),
+            "policy_max_connections" => self.policy_max_connections.is_some(),
+            "policy_allow_identity_stats" => self.policy_allow_identity_stats,
+            "zenoh" => self.zenoh.is_some(),
+            "zenoh_name" => self.zenoh_name.is_some(),
+            "policy_allow_all_interfaces" => self.policy_allow_all_interfaces,
+            "llama_mtp" => self.llama_mtp,
+            "llama_bin" => self.llama_bin.is_some(),
+            "llama_ctx" => self.llama_ctx != d.llama_ctx,
+            "llama_ngl" => self.llama_ngl != d.llama_ngl,
+            "llama_args" => !self.llama_args.is_empty(),
+            "llama_host_layers" => self.llama_host_layers.is_some(),
+            "llama_load_timeout" => self.llama_load_timeout.is_some(),
+            "llama_load_retries" => self.llama_load_retries != d.llama_load_retries,
+            "prefix_cache_gb" => self.prefix_cache_gb.is_some(),
+            "ep_workers" => !self.ep_workers.is_empty(),
+            "ep_placement" => self.ep_placement.is_some(),
+            "api_max_body_mb" => self.api_max_body_mb != d.api_max_body_mb,
+            "elastic" => self.elastic,
+            "elastic_vram" => self.elastic_vram != d.elastic_vram,
+            "elastic_share" => self.elastic_share.is_some(),
+            _ => return None,
+        })
     }
 
     /// The first of `flags` that was typed.
@@ -4992,12 +5030,57 @@ mod tests {
         // Typed flags are recorded by arg id.
         assert!(run_args(&["m", "--llama-ctx", "4096"])
             .typed
+            .unwrap()
             .contains("llama_ctx"));
+    }
+
+    /// A plain clap parse has no typed set, so it falls back to value-vs-default
+    /// rather than refusing nothing.
+    #[test]
+    fn plain_clap_parse_falls_back_to_non_default_values() {
+        let plain = |argv: &[&str]| {
+            let mut full = vec!["cascadia", "run"];
+            full.extend_from_slice(argv);
+            match Cli::parse_from(full).cmd {
+                Command::Run(a) => a,
+                _ => panic!("expected run"),
+            }
+        };
+        let args = plain(&["m", "--engine", "ov-genai", "--llama-ctx", "8192"]);
+        assert!(args.typed.is_none());
+        let e = check_engine_flags(&args).unwrap_err().to_string();
+        assert!(
+            e.contains("--llama-ctx applies to --engine sycl-llama only"),
+            "{e}"
+        );
+        let e = check_engine_flags(&plain(&["pkg", "--engine", "ov-policy", "--elastic"]))
+            .unwrap_err()
+            .to_string();
+        assert!(e.contains("--elastic does not apply"), "{e}");
+        let e = check_engine_flags(&plain(&["m", "--engine", "ov-genai", "--zenoh", "h:7447"]))
+            .unwrap_err()
+            .to_string();
+        assert!(
+            e.contains("--zenoh applies to --engine ov-policy only"),
+            "{e}"
+        );
+        // A default value can't be told from an omitted flag without a typed set.
+        check_engine_flags(&plain(&[
+            "m",
+            "--engine",
+            "ov-genai",
+            "--llama-ctx",
+            "4096",
+        ]))
+        .unwrap();
+        check_engine_flags(&plain(&["pkg", "--engine", "ov-policy"])).unwrap();
     }
 
     /// Every flag the engine checks name is a real `run` flag.
     #[test]
     fn engine_flag_lists_name_real_run_flags() {
+        // Each also has a value-vs-default fallback, false at the defaults.
+        let defaults = RunArgs::try_parse_from(["run", "m"]).unwrap();
         let cmd = RunArgs::command();
         let ids: Vec<_> = cmd
             .get_arguments()
@@ -5011,6 +5094,7 @@ mod tests {
         {
             let id = flag.trim_start_matches("--").replace('-', "_");
             assert!(ids.contains(&id), "{flag}");
+            assert!(defaults.differs_from_default(&id) == Some(false), "{flag}");
         }
     }
 
