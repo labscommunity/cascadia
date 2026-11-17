@@ -27,7 +27,7 @@ use super::physicalai::{
     encode_predict_reply, encode_reset_ok, key_prefix, read_seq, ControlError, ErrorCode,
     ServerIdentity, Timings, MAX_REQUEST_BYTES, NO_SEQ,
 };
-use super::server::{infer_guarded, SharedPolicy};
+use super::server::SharedPolicy;
 use super::{check_reply, max_payload_bytes, PackageIdentity};
 
 /// A setup failure: a bad address or name, or Zenoh refusing to open.
@@ -165,7 +165,7 @@ impl Backend for LocalBackend {
         if started > deadline {
             return Err(BackendError::Expired);
         }
-        let res = infer_guarded(&mut **engine, obs);
+        let res = self.policy.infer_guarded(&mut **engine, obs);
         drop(engine);
         match res {
             Ok(chunk) => match check_reply(&chunk) {

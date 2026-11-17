@@ -247,7 +247,7 @@ fn refuse<T>(msg: impl std::fmt::Display) -> EngineResult<T> {
     Err(EngineError::InvalidConfig(format!("policy model: {msg}")))
 }
 
-/// `--precision`: GPU compute precision. CPU always runs f32.
+/// `--policy-precision`: GPU compute precision. CPU always runs f32.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Precision {
     F16,
@@ -264,12 +264,12 @@ pub fn compile_config(
     device: &str,
     precision: Option<Precision>,
 ) -> EngineResult<(String, PluginConfig)> {
-    let dev = device.to_ascii_uppercase();
+    let dev = device.trim().to_ascii_uppercase();
     let family = dev.split('.').next().unwrap_or_default();
     let f32_hint = PluginConfig::new().with("INFERENCE_PRECISION_HINT", "f32");
     let config = match (family, precision) {
         ("CPU", Some(Precision::F16)) => Err(EngineError::InvalidConfig(
-            "--precision f16 is not available on CPU, which always runs f32".into(),
+            "--policy-precision f16 is not available on CPU, which always runs f32".into(),
         )),
         ("CPU", _) => Ok(f32_hint),
         ("GPU", Some(Precision::F32)) => Ok(f32_hint),
@@ -289,7 +289,7 @@ pub fn compile_config(
 /// The precision [`compile_config`] compiles at, as the metadata states it:
 /// CPU is always f32; GPU is f16 unless f32 is asked for.
 pub fn compiled_precision(device: &str, precision: Option<Precision>) -> &'static str {
-    let dev = device.to_ascii_uppercase();
+    let dev = device.trim().to_ascii_uppercase();
     match (dev.split('.').next().unwrap_or_default(), precision) {
         ("GPU", Some(Precision::F32)) | ("CPU", _) => "f32",
         _ => "f16",
@@ -3642,6 +3642,11 @@ mod tests {
         assert_eq!(cpu.0, "CPU", "compile and the spec get the normalized name");
         assert_eq!(hint(&cpu), f32_hint);
         assert_eq!(compile_config("gpu.1", None).unwrap().0, "GPU.1");
+        assert_eq!(
+            compile_config(" gpu.1 ", None).unwrap().0,
+            "GPU.1",
+            "trimmed like chat"
+        );
         assert!(compile_config("CPU", Some(Precision::F16)).is_err());
         assert!(hint(&compile_config("GPU", None).unwrap()).is_empty());
         assert!(hint(&compile_config("GPU", Some(Precision::F16)).unwrap()).is_empty());

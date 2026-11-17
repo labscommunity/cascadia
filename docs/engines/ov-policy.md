@@ -10,7 +10,15 @@ The full design, the package contract and the measurements are in
 [`../design/2026-11-15-vla-policy-engine.md`](../design/2026-11-15-vla-policy-engine.md) (called
 "the design doc" below).
 
-## What it serves
+## When to use
+
+- You run a robot policy (SmolVLA, π0.5, π0, X-VLA, EVO1, VLA-JEPA, XR0, GR00T N1.7, MolmoAct2) on
+  an Intel GPU or CPU and want an openpi-compatible WebSocket, or Intel's physicalai protocol, with
+  no Python on the serving machine.
+- One policy on one machine. For language models use the chat engines; for more than one machine,
+  no policy path exists (`cascadia worker` refuses `ov-policy`).
+
+## Package format
 
 A **`policy_package`** directory: `manifest.json` (`"format": "policy_package"`, version `1.x`,
 runner `SinglePass`, artifact `openvino`), the policy IR (`.xml` + `.bin`) and the tokenizer IR.
@@ -21,7 +29,7 @@ The engine loads nine policy kinds. Where a package for each comes from:
 
 | Kind | Package source |
 |---|---|
-| `smolvla`, `pi05` | Intel publishes LIBERO packages on Hugging Face (`OpenVINO/smolvla-libero-fp16-ov`, `OpenVINO/pi05-libero-fp16-ov`); `cascadia export-policy <hf-model-id> --out <dir>` exports a LeRobot checkpoint of either kind (design doc, "Exporter"). |
+| `smolvla`, `pi05` | Intel publishes LIBERO packages on Hugging Face (`OpenVINO/smolvla-libero-fp16-ov`, `OpenVINO/pi05-libero-fp16-ov`); `cascadia export-policy --model <hf-model-id> --output-dir <dir>` exports a LeRobot checkpoint of either kind (design doc, "Exporter"). |
 | `gr00t_n1d7` | Intel's edge-ai-suites single-IR exporter, run on NVIDIA's checkpoint. |
 | `molmoact2` | Intel's exporter in physical-ai-studio. |
 | `pi0`, `xvla`, `evo1`, `vlajepa`, `xr0` | Exported by hand with Intel's physicalai-train exporter, patched or with LeRobot modules per kind. |
@@ -37,31 +45,41 @@ promised. The current tier of each kind is the table under "Tiers" in the design
 section.
 
 A package whose normalization statistics are identity placeholders (an export that never had
-stats) is refused: its actions would be wrong for any robot. `--allow-identity-stats` serves it
+stats) is refused: its actions would be wrong for any robot. `--policy-allow-identity-stats` serves it
 anyway, for testing only.
 
-## Running it
+## Example
 
 ```bash
-cascadia run /models/smolvla-libero-ov --engine ov-policy
+cascadia export-policy --model lerobot/smolvla_libero --output-dir ./smolvla_libero
+cascadia run ./smolvla_libero --engine ov-policy
 ```
 
 `--engine ov-policy` is required (`run` defaults to `ov-genai`). The server loads the package, runs
-three warmup calls, then listens on **`127.0.0.1:8000`**.
+three warmup calls, then listens on **`127.0.0.1:8000`**. The compile goes through the same
+OpenVINO cache as the chat engines (`cascadia/ov-cache` under the user cache directory), so a
+restart skips it; the cache never changes outputs.
+
+## Flags
 
 | Flag | Default | What it does |
 |---|---|---|
 | `--device GPU\|CPU` | `GPU` | Where the policy IR runs. The tokenizer always runs on CPU. **NPU is refused** for every policy (SmolVLA and π0.5 fail NPU compilation as exported; X-VLA compiles and returns wrong actions). |
-| `--precision f16\|f32` | `f16` on GPU | GPU compute precision. CPU always runs f32 and refuses `f16`. Some large models (π0, XR0, GR00T, MolmoAct2) fail to compile at f32 on a 16 GB integrated GPU; that is a load error naming the IR and the device. |
+| `--policy-precision f16\|f32` | `f16` on GPU | GPU compute precision. CPU always runs f32 and refuses `f16`. Some large models (π0, XR0, GR00T, MolmoAct2) fail to compile at f32 on a 16 GB integrated GPU; that is a load error naming the IR and the device. |
 | `--api HOST:PORT` | `127.0.0.1:8000` | Where the HTTP and WebSocket API listens. See [Security](#security) before changing the host. |
 | `--policy-allow-origin ORIGIN` | none | A browser `Origin` allowed to open the WebSocket (repeatable). |
 | `--policy-max-connections N` | `4` | Concurrent WebSocket connections; one more is refused with HTTP 503. |
-| `--allow-identity-stats` | off | Serve a package with placeholder statistics (testing only). |
+| `--policy-allow-identity-stats` | off | Serve a package with placeholder statistics (testing only). |
 | `--zenoh HOST[:PORT]` | off | Also serve Intel's physicalai remote-inference protocol over Zenoh (below). |
 | `--zenoh-name NAME` | the manifest's policy name | The slot name physicalai clients are given. |
 | `--zenoh-allow-all-interfaces` | off | Let `--zenoh` bind a non-loopback host. |
 
-`cascadia worker` refuses `ov-policy`: a policy is served by one process on one machine.
+The robot-only flags carry the engine's prefix, as the sycl-llama ones carry `--llama-`; the Zenoh
+ones carry their front end's. Each is refused on a chat engine, and the chat-only `run` flags
+(`--prefix-cache-gb`, `--ep-*`, `--api-max-body-mb`, `--elastic*`, `--llama-*`) are refused here.
+`--elastic` in particular is refused rather than ignored: its memory interposer has not been
+measured with a policy. `cascadia worker` refuses `ov-policy`: a policy is served by one process on
+one machine.
 
 ## Front ends
 
@@ -85,8 +103,15 @@ f16, depending on the model; see the design doc's Scope section for each kind).
   Pass the whole URL as `host` and `port=None`; a port argument would be appended after the path.
   On connect the server sends the metadata; each request is a map of `images` (camera name to a
   `uint8` `[H, W, 3]` RGB array), `state`, `prompt` and optional `seed` and `noise`; the reply
-  carries `actions` `[T, D]` and `server_timing.infer_ms`. Errors come back as a text frame.
-- `GET /health`.
+  carries `actions` `[T, D]` and `server_timing.infer_ms`. Errors come back as a text frame. A
+  refused upgrade (a foreign `Origin`, 403; the server full, 503) gets the chat API's
+  `{"error": "..."}` JSON body.
+- `GET /health`: `{"status":"ok"}`, or 503 `{"status":"degraded"}` after the engine failed a call
+  (a refused request does not count), until a call succeeds again, as on the chat engines.
+- `GET /metrics`: the Prometheus registry, as on the chat engines: per-route
+  `cascadia_http_requests_total` and `cascadia_http_request_duration_seconds`, plus
+  `cascadia_policy_infers_total{model,result}` (`ok`, `invalid` or `error`, from both front ends)
+  and `cascadia_policy_infer_duration_seconds{model}`.
 
 The keys are Cascadia's, so openpi clients are transport-compatible, not drop-in: a client written
 for another server's keys needs a small mapping.
@@ -154,7 +179,7 @@ RTC package behaves like a plain one. The metadata's `rtc_chunk_size` is non-nul
 package, and a package without RTC refuses the fields. Details and measurements: the design doc's
 "Real-time chunking" section.
 
-## Limits
+## Limitations
 
 Checked before any work is queued:
 
@@ -169,6 +194,13 @@ Checked before any work is queued:
 - Non-finite actions (possible from f16 overflow on the GPU) are an error, never sent.
 - One model per process; NPU, multi-machine sharding and server-side resize on the WebSocket are
   not supported.
+
+## Doctor
+
+`cascadia doctor` has an `ov-policy` section: it finds the OpenVINO tokenizers extension the engine
+tokenizes prompts with (a miss is a warning naming the paths tried), and checks that uv 0.13.6 or
+newer is on `PATH` for `cascadia export-policy` (a miss is informational, with the install command:
+serving needs no uv).
 
 ## Security
 

@@ -68,15 +68,15 @@ v1:
   own input ports (see "Port layouts"). The `molmoact2` package is Intel's own export, with its own
   runtime steps. The `gr00t_n1d7` package is Intel's edge-ai-suites single-IR export of
   NVIDIA's checkpoint, saved with fp16 weights, static shapes and named ports.
-- Devices: GPU (default, f16 unless `--precision f32`) and CPU (always f32). NPU is refused:
+- Devices: GPU (default, f16 unless `--policy-precision f32`) and CPU (always f32). NPU is refused:
   SmolVLA and π0.5 fail NPU compilation as exported, and X-VLA compiles but returns wrong actions.
 - X-VLA's LIBERO packages flip `image2` on the host (`image_flip`), not in the graph: on the Arc
   140V GPU plugin (OpenVINO 2026.4.1) a flip inside the graph, which exports as a negative-stride
   `Slice`, gives wrong `image2` features even at f32, while the CPU is exact. An exporter must keep
   flips and negative-stride slices out of a GPU graph.
-- π0 on a 16 GB integrated GPU (Arc 140V) runs at f16 only: at `--precision f32` its weights
+- π0 on a 16 GB integrated GPU (Arc 140V) runs at f16 only: at `--policy-precision f32` its weights
   (about 12.5 GB in f32) fail GPU compilation. A failed compile is a load error naming the IR and
-  the device, with a hint to drop `--precision f32` on the GPU; nothing is special-cased per model.
+  the device, with a hint to drop `--policy-precision f32` on the GPU; nothing is special-cased per model.
 - EVO1 (`zuoxingdong/evo1_libero`, InternVL3-1B with 32 flow steps in one graph) on the Arc 140V:
   GPU f16 about 250 ms a call, served actions within 6.4e-4 of LeRobot's, no gripper flips. That
   holds only because the exporter splits the action head's sequence-pooling FC (one MatMul over
@@ -86,7 +86,7 @@ v1:
   thousands of inputs out of an f16 GPU graph.
 - XR0 (`XiaomiRobotics/Xiaomi-Robotics-0-LIBERO`, Qwen3-VL-4B with a DiT, 5 flow steps) on the Arc
   140V: fp16 weights at GPU f16 about 232 ms for a 30-step chunk, within 3.2e-3 of PyTorch f32, no
-  NaN, about 11 GB. At `--precision f32` the GPU compile fails (`CL_INVALID_EVENT`), a load error as
+  NaN, about 11 GB. At `--policy-precision f32` the GPU compile fails (`CL_INVALID_EVENT`), a load error as
   for π0; CPU f32 is about 5.6 s a call and 26 GB.
 - VLA-JEPA (`lerobot/VLA-JEPA-LIBERO`, Qwen3-VL-2B with all four flow steps in one graph) on the Arc
   140V: GPU f16 about 99 ms a call and within 8.2e-4 of PyTorch f32, GPU f32 about 610 ms, CPU f32
@@ -100,13 +100,13 @@ v1:
   OpenVINO matches Intel's PyTorch export wrapper to 3.4e-6; the wrapper itself is 4.7e-3 to
   7.1e-3 off NVIDIA's model, a gap not yet traced; it costs no task success: LIBERO
   `libero_spatial` 27/30 at GPU f16 against 26/30 for NVIDIA's PyTorch model on the same
-  episodes. At `--precision f32` the GPU compile fails (`CL_INVALID_EVENT`), a load error as for
+  episodes. At `--policy-precision f32` the GPU compile fails (`CL_INVALID_EVENT`), a load error as for
   π0. One package per embodiment and camera count.
   NVIDIA's licence notice (the package's `NOTICE`) is served as the metadata's `attribution`.
 - MolmoAct2 (`allenai/MolmoAct2-LIBERO`, 5.4B, 10 flow steps from zeros in one graph) on the Arc
   140V, the IR alone through OpenVINO's Python API: GPU f16 about 0.92 s for a 10-step chunk, within
   1e-3 (normalized) of PyTorch f32, no NaN, about 10 GB (through the engine see the tier table);
-  at `--precision f32` the GPU compile fails (`CL_INVALID_EVENT`), a load error as for π0. LIBERO
+  at `--policy-precision f32` the GPU compile fails (`CL_INVALID_EVENT`), a load error as for π0. LIBERO
   `libero_spatial` 28/30 at GPU f16 against 27/30 for Intel's PyTorch at f32 on the same
   episodes. The x86 CPU at f32 is within 1e-3 of PyTorch (about 35 s a call on a Core Ultra 7);
   OpenVINO 2026.4.1's ARM CPU plugin computes the graph wrong (the IR alone is 0.61 off PyTorch on
@@ -173,7 +173,7 @@ Loading rules:
   `Runtime::input_aliases`, shapes, dtypes) and refuses a mismatch at load, not at the first call.
 - Placeholder statistics refuse the load: a `normalize`/`denormalize` whose every feature has
   mean 0 and std 1 (`mean_std`), or q01 −1 and q99 1 (`quantiles`), or min −1 and max 1
-  (`min_max`), is an export that never had stats (our DROID package). `--allow-identity-stats`
+  (`min_max`), is an export that never had stats (our DROID package). `--policy-allow-identity-stats`
   overrides it for testing.
 
 | Step | Behaviour |
@@ -374,9 +374,12 @@ weights `w` from `inference_delay` and `execution_horizon`, and `v_t -= min(c·r
 ## Serving
 
 `cascadia run --engine ov-policy --model <dir>` takes its own path in `cmd_run`, before
-`WorkerArgs::single_node`: load and warm the engine, then serve the policy router plus `/health`.
-`build_builder` and `cascadia worker` refuse `ov-policy` with an error; the dashboard and the chat
-routes are not served for a policy model. There is no auto-selection: `--engine` defaults to
+`WorkerArgs::single_node`: load and warm the engine, then serve the policy router plus `/health`
+and `/metrics`, which behave as the chat API's (`/health` turns 503 `degraded` after an engine
+failure until a call succeeds again; refused requests do not count). Shutdown closes the engine, as
+chat closes its runner. `build_builder` and `cascadia worker` refuse `ov-policy` with an error; the
+dashboard and the chat routes are not served for a policy model, and the chat-only `run` flags are
+refused. There is no auto-selection: `--engine` defaults to
 `ov-genai`, so the flag is required.
 
 **Unauthenticated, like the chat API** (SECURITY.md: "No client authentication on the HTTP API").
@@ -443,6 +446,8 @@ Two more load options and one reading, for a program that embeds the engine:
   compiling again (SmolVLA on an Apple CPU: 9.9 s uncached, 3.3 s from the cache). The cache never
   changes outputs: a test loads the package without a cache, then twice from one cache directory,
   and checks that the CPU actions are bit-identical all three times. The tokenizer is not cached.
+  `cascadia run` passes the chat engines' default cache (`cascadia/ov-cache` under the user cache
+  directory).
 - `OvPolicyEngine::gpu_memory_bytes() -> Option<u64>`. The GPU memory the compiled policy holds
   now: OpenVINO's `GPU_MEMORY_STATISTICS` (`ov::intel_gpu::memory_statistics`), summed over the
   allocation types. Each engine compiles in its own OpenVINO `Core`, so the figure counts only this
@@ -662,7 +667,7 @@ at one precision send identical bytes; the slowest warmup call appears only in
 | `cascadia-ov-genai-shim` | A `bool` dtype in `dtype_from_code`, `code_from_dtype`, the header defines and Rust `DType` (`from_code`, `bytes_per_element`); a string-tensor input for the tokenizer; a separate CPU runtime handle for the tokenizer, with the `openvino_tokenizers` extension added to that handle's `ov::Core`, and a way to set an infer request's state variable (`truncation`); `cascadia_runtime_has_op_type(handle, type)`, answered from op types recorded off the `ov::Model` before compile. Alias lookup already exists (`input_aliases`). |
 | `cascadia-engine-openvino` | `policy/`: manifest parsing (both component forms, version check, path confinement), port checks, the steps above (one module per family: `gr00t`, `molmoact2`, `qwen_vl`, `vla_jepa`, `xr0`), noise-mode detection, package identity (`package.rs`), `OvPolicyEngine` (`ov.rs`). `build.rs` sets the sha `engine_build` reports. |
 | `cascadia-api` | Policy router on its own state (the chat `AppState` stays untouched), the limits above, `axum` `ws` feature, msgpack with bin keys. The codec is a public module, `cascadia_api::policy`, so other serving layers can reuse it: `decode_request(&[u8], &PolicySpec) -> Result<Observation, RequestError>` (every decoding rule above; `RequestError` carries the client-facing message), `encode_reply(&ActionChunk) -> Vec<u8>`, `encode_metadata(&PolicySpec) -> Vec<u8>`, `metadata_json(&PolicySpec) -> String`, and `max_payload_bytes(&PolicySpec) -> u32` (the WebSocket cap formula). Behind the `zenoh` feature: `physicalai` (Intel's wire codec), `zenoh_server` and `bridge`. |
-| `cascadia-cli` | `EngineKind::OvPolicy`, the policy serve path in `cmd_run`, `RunArgs.api` as `Option<String>`, refusal in `worker`/`build_builder`, `--zenoh` and `policy-bridge` (feature `zenoh`), `export-policy` with its driver script and hashed requirements file embedded by `include_str!` (as `cascadia shard` embeds `EXPORT_REQUIREMENTS`, since a release bundle carries only the binary), a `doctor` check for the tokenizer extension. |
+| `cascadia-cli` | `EngineKind::OvPolicy`, the policy serve path in `cmd_run`, `RunArgs.api` as `Option<String>`, refusal in `worker`/`build_builder`, `--zenoh` and `policy-bridge` (feature `zenoh`), `export-policy` with its driver script and hashed requirements file embedded by `include_str!` (as `cascadia shard` embeds `EXPORT_REQUIREMENTS`, since a release bundle carries only the binary), a `doctor` `ov-policy` section (the tokenizer extension, and uv for `export-policy`). |
 | `tools/` | `vla_reference.py` (the codec's golden msgpack bytes), `vla_libero_client.py` (benchmark adapter, with a reference resize per convention). Sources only; nothing here is read at run time. |
 | `.github/workflows/ai-pc-tests.yml` | Two steps that read the repository variable `CASCADIA_POLICY_PACKAGE_DIR`, check the package's `manifest.json` against the committed fixture and print the hashes of its top-level `.json`, `.xml` and `.bin` files, export `CASCADIA_POLICY_PACKAGE` and run `policy_openvino` with `CASCADIA_POLICY_GPU=1`; both skip when the variable is unset (see "Testing"). |
 | `.github/workflows/ci.yml`, `security.yml`, `release.yml` | A `zenoh` lane: clippy and tests of `cascadia-api` and `cascadia-cli` with `--features zenoh` on Linux, a Windows compile of `cascadia-api --features zenoh`. cargo-deny runs with `--all-features` (stated explicitly). Release bundles build with `openvino,dashboard-embed,zenoh`. |
@@ -670,8 +675,9 @@ at one precision send identical bytes; the slowest warmup call appears only in
 
 ## Exporter: `cascadia export-policy`
 
-`cascadia export-policy <hf-model-id> --out <dir>` runs Intel's `physicalai-train` in **its own
-virtual environment**, created with `uv` under the Cascadia cache. (`cascadia shard` has no such
+`cascadia export-policy --model <hf-model-id> --output-dir <dir>` (`-o <dir>`; the same argument
+names as `cascadia shard`) runs Intel's `physicalai-train` in **its own virtual environment**,
+created with `uv` under the Cascadia cache. (`cascadia shard` has no such
 environment: it uses the caller's Python and prints a `pip install` line; the exporter does not
 follow that, because its dependencies would collide.) Python is needed only on the exporting
 machine.
@@ -720,8 +726,9 @@ machine.
 - **Revision.** The preflight resolves the checkpoint's commit; every later download (config,
   weights, statistics, licence files) is bound to that commit, and `NOTICE` names it.
 - **No half-made package.** The export, `--stats`, the licence files, `NOTICE` and `--verify` all
-  happen in a staging directory beside `--out` (`.<name>.partial-<pid>`, refused if it exists),
-  which is renamed to `--out` only when everything succeeded and removed on any failure.
+  happen in a staging directory beside `--output-dir` (`.<name>.partial-<pid>`, refused if it
+  exists), which is renamed to `--output-dir` only when everything succeeded and removed on any
+  failure.
 - **`--rtc`** exports the RTC port group (SmolVLA and π0.5): the policy's `rtc_enabled` is set and
   `n_action_steps` is the full chunk, so the package has no trimmer.
 - **Refusals before the checkpoint is downloaded.** Memory and a serving box are checked before
@@ -736,7 +743,7 @@ machine.
     `run-placement` or `serve` (found after any global flags), on this host. The message suggests
     a disposable Linux machine.
   - **Bad arguments.** A model id that is not `owner/name` under Hugging Face's rules, or an
-    `--out` with no directory name (`.`, `/`).
+    `--output-dir` with no directory name (`.`, `/`).
   - **Gated files.** No access to `google/paligemma-3b-pt-224` for π0.5, with a message saying
     how to accept the Gemma licence. (`8f132416` exports SmolVLA and π0.5 only; any other policy
     type is refused.)
@@ -811,7 +818,7 @@ What runs where, as shipped. Items marked **not shipped** are planned and not in
   2. End to end against the committed reference with the same `noise` passed in: the served
      actions on CPU within 1e-4, and two CPU calls within 1e-5 of each other. The comparison is on
      the served (denormalized) actions, not before `denormalize`; the reference is the independent
-     Python pipeline above, not Intel's runtime. The GPU at `--precision f32` must stay within 1e-3
+     Python pipeline above, not Intel's runtime. The GPU at `--policy-precision f32` must stay within 1e-3
      of the reference; the GPU at the default f16 must be finite and within 0.5, with its
      differences printed. Whether those matter is decided by the LIBERO comparison below, not by a
      number chosen in advance (see "GPU precision").
@@ -824,7 +831,7 @@ What runs where, as shipped. Items marked **not shipped** are planned and not in
   WebSocket schema and connects through `openpi_client.WebsocketClientPolicy` exactly as
   `docs/engines/ov-policy.md` tells users to (`host="ws://…/v1/policy/ws"`, `port=None`), so an
   accuracy run is also the end-to-end interoperability test. It runs episodes of one suite against
-  our `input`-mode exports and Intel's published packages, at `--precision f16` and `f32` on the
+  our `input`-mode exports and Intel's published packages, at `--policy-precision f16` and `f32` on the
   GPU. Speed and parity do not show that a robot succeeds at a task; this does. Where the simulator
   runs is open question 2. Run for every kind (2026-11-15 and 16); the results are the tier table.
 - **RTC (by hand).** `policy_openvino`'s RTC tests take SmolVLA and π0.5 LIBERO exported with and
@@ -852,7 +859,7 @@ What runs where, as shipped. Items marked **not shipped** are planned and not in
    | default f16 | 0.009 – 0.122 | 0.0013 – 0.0021 | 0 | 143 ms |
    | `INFERENCE_PRECISION_HINT=f32` | ≤ 3.2e-4 | ~1e-6 | 0 | 346 ms |
 
-   The engine defaults to the GPU's f16 and takes `--precision f16|f32`. LIBERO compared task
+   The engine defaults to the GPU's f16 and takes `--policy-precision f16|f32`. LIBERO compared task
    success at both: SmolVLA 23/30 at f16 and at f32 (one episode differs each way), X-VLA 26/30 at
    f16 against 27/30 at f32 (one episode) with f32 4.6 times slower. f16 succeeds as often, so it
    stays the default. CPU is always f32, because bf16 compute is off by up to 0.66

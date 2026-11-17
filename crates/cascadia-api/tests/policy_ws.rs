@@ -219,6 +219,13 @@ async fn an_oversize_message_closes_the_connection() {
     assert!(closed_within(&mut ws, Duration::from_secs(5)).await);
 }
 
+/// The `error` of chat's `{"error": ...}` JSON body.
+fn error_body(body: &Option<Vec<u8>>) -> String {
+    let v: serde_json::Value =
+        serde_json::from_slice(body.as_deref().unwrap_or_default()).expect("a JSON error body");
+    v["error"].as_str().expect("an error string").to_string()
+}
+
 #[tokio::test]
 async fn a_foreign_origin_is_refused() {
     let cfg = PolicyServerConfig {
@@ -230,7 +237,11 @@ async fn a_foreign_origin_is_refused() {
     req.headers_mut()
         .insert("Origin", "http://evil.example".parse().unwrap());
     match connect_async(req).await {
-        Err(WsError::Http(resp)) => assert_eq!(resp.status(), 403),
+        Err(WsError::Http(resp)) => {
+            assert_eq!(resp.status(), 403);
+            let e = error_body(resp.body());
+            assert!(e.contains("--policy-allow-origin"), "{e}");
+        }
         other => panic!("expected 403, got {other:?}"),
     }
     let mut req = url(addr).into_client_request().unwrap();
@@ -250,8 +261,8 @@ async fn at_capacity_the_upgrade_gets_503() {
     match connect_async(url(addr)).await {
         Err(WsError::Http(resp)) => {
             assert_eq!(resp.status(), 503);
-            let body = String::from_utf8(resp.body().clone().unwrap_or_default()).unwrap();
-            assert!(body.contains("full"), "{body}");
+            let e = error_body(resp.body());
+            assert!(e.contains("full"), "{e}");
         }
         other => panic!("expected 503, got {other:?}"),
     }
@@ -441,4 +452,56 @@ async fn slow_request_headers_are_cut_off() {
     let mut buf = Vec::new();
     let read = tokio::time::timeout(Duration::from_secs(3), s.read_to_end(&mut buf)).await;
     assert!(read.is_ok(), "the server kept a half-sent request open");
+}
+
+/// `/health` turns 503 `degraded` after an engine failure, as chat's does, and
+/// back to 200 on the next good call; a refused request leaves it alone.
+#[tokio::test]
+async fn health_degrades_after_an_engine_failure_and_recovers() {
+    let (engine, _) = probe(Duration::ZERO);
+    let addr = start_engine(engine, PolicyServerConfig::default()).await;
+    let mut ws = connect(addr).await;
+    let mut bad = REQUEST.to_vec();
+    bad.pop();
+    ws.send(Message::Binary(bad)).await.unwrap();
+    assert!(matches!(next_data(&mut ws).await, Message::Text(_)));
+    assert!(http_get(addr, "/health").await.starts_with("HTTP/1.1 200"));
+    ws.send(Message::Binary(request_with_prompt("panic           ")))
+        .await
+        .unwrap();
+    assert!(matches!(next_data(&mut ws).await, Message::Text(_)));
+    let health = http_get(addr, "/health").await;
+    assert!(health.starts_with("HTTP/1.1 503"), "{health}");
+    assert!(health.contains(r#"{"status":"degraded"}"#), "{health}");
+    ws.send(Message::Binary(REQUEST.to_vec())).await.unwrap();
+    assert_eq!(next_data(&mut ws).await, Message::Binary(expected_reply()));
+    let health = http_get(addr, "/health").await;
+    assert!(health.starts_with("HTTP/1.1 200"), "{health}");
+    assert!(health.contains(r#"{"status":"ok"}"#), "{health}");
+}
+
+/// `/metrics` serves the Prometheus registry with the policy infer families and
+/// the per-route request counter, as chat's does.
+#[tokio::test]
+async fn metrics_count_requests_and_infers() {
+    let addr = start_default().await;
+    let mut ws = connect(addr).await;
+    ws.send(Message::Binary(REQUEST.to_vec())).await.unwrap();
+    assert_eq!(next_data(&mut ws).await, Message::Binary(expected_reply()));
+    http_get(addr, "/health").await;
+    let m = http_get(addr, "/metrics").await;
+    assert!(m.starts_with("HTTP/1.1 200"), "{m}");
+    assert!(m.contains("text/plain; version=0.0.4"), "{m}");
+    assert!(
+        m.contains(r#"cascadia_policy_infers_total{model="mock",result="ok"}"#),
+        "{m}"
+    );
+    assert!(
+        m.contains(r#"cascadia_policy_infer_duration_seconds_count{model="mock"}"#),
+        "{m}"
+    );
+    assert!(
+        m.contains(r#"cascadia_http_requests_total{endpoint="/health",status="200"}"#),
+        "{m}"
+    );
 }

@@ -41,6 +41,9 @@ pub const DURATION_BUCKETS: &[f64] = &[0.1, 0.5, 1.0, 5.0, 10.0, 30.0, 60.0, 120
 /// Transport frame buckets: loopback microseconds up to a relayed WAN hop.
 pub const TRANSPORT_BUCKETS: &[f64] = &[0.0001, 0.001, 0.01, 0.05, 0.1, 0.5, 1.0];
 
+/// Robot-policy call buckets: a small policy on the GPU up to a large one on CPU.
+pub const POLICY_INFER_BUCKETS: &[f64] = &[0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0, 2.5, 5.0];
+
 // --- Request-level (bumped by cascadia-api) ------------------------------
 
 /// HTTP requests by matched route template and response status code.
@@ -246,6 +249,30 @@ pub static ENGINE_WARMUP_DURATION_SECONDS: LazyLock<GaugeVec> = LazyLock::new(||
     .expect("register cascadia_engine_warmup_duration_seconds")
 });
 
+// --- Robot policy (bumped by cascadia-api's policy front ends) -----------
+
+/// Policy `infer` calls by outcome: `ok`, `invalid` (the request was refused)
+/// or `error` (the engine failed; `/health` turns `degraded`).
+pub static POLICY_INFERS_TOTAL: LazyLock<IntCounterVec> = LazyLock::new(|| {
+    register_int_counter_vec!(
+        "cascadia_policy_infers_total",
+        "Robot-policy infer calls, by outcome.",
+        &["model", "result"]
+    )
+    .expect("register cascadia_policy_infers_total")
+});
+
+/// Engine time of each successful policy `infer` call (the model lock wait excluded).
+pub static POLICY_INFER_DURATION_SECONDS: LazyLock<HistogramVec> = LazyLock::new(|| {
+    register_histogram_vec!(
+        "cascadia_policy_infer_duration_seconds",
+        "Engine time of successful robot-policy infer calls.",
+        &["model"],
+        POLICY_INFER_BUCKETS.to_vec()
+    )
+    .expect("register cascadia_policy_infer_duration_seconds")
+});
+
 // --- Transport-level (bumped by cascadia-transport) ----------------------
 
 /// Bytes sent on the inter-stage activation links (tensor frames + raw
@@ -328,6 +355,8 @@ pub fn init() {
     LazyLock::force(&ENGINE_WARMUP_DURATION_SECONDS);
     LazyLock::force(&TRANSPORT_SENT_BYTES_TOTAL);
     LazyLock::force(&TRANSPORT_RECV_BYTES_TOTAL);
+    LazyLock::force(&POLICY_INFERS_TOTAL);
+    LazyLock::force(&POLICY_INFER_DURATION_SECONDS);
 }
 
 /// Gather the default registry into Prometheus text exposition format.
@@ -388,12 +417,14 @@ mod tests {
         assert_eq!(INTER_TOKEN_BUCKETS.len(), 10);
         assert_eq!(DURATION_BUCKETS.len(), 10);
         assert_eq!(TRANSPORT_BUCKETS.len(), 7);
+        assert_eq!(POLICY_INFER_BUCKETS.len(), 10);
         // Strictly increasing (prometheus requires it; catch typos here).
         for buckets in [
             TTFT_BUCKETS,
             INTER_TOKEN_BUCKETS,
             DURATION_BUCKETS,
             TRANSPORT_BUCKETS,
+            POLICY_INFER_BUCKETS,
         ] {
             assert!(buckets.windows(2).all(|w| w[0] < w[1]));
         }

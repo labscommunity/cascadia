@@ -511,6 +511,52 @@ fn check_tokenizers_extension(r: &mut Report) {
     }
 }
 
+/// `cascadia export-policy` builds its Python environment with uv. Optional, like llama-server:
+/// serving a package needs no uv, so a missing one is a note.
+fn uv_check(
+    found: Option<std::path::PathBuf>,
+    version: Option<(u64, u64, u64)>,
+) -> (Level, String, Vec<String>) {
+    use crate::export_policy::{uv_install_hint, MIN_UV};
+    let need = format!("{}.{}.{}", MIN_UV.0, MIN_UV.1, MIN_UV.2);
+    match (found, version) {
+        (None, _) => (
+            Level::Info,
+            "not found".into(),
+            vec![format!(
+                "needed only for `cascadia export-policy`; install it with: {}",
+                uv_install_hint()
+            )],
+        ),
+        (Some(p), None) => (
+            Level::Warn,
+            format!("{}: could not read `uv --version`", p.display()),
+            vec![format!("`cascadia export-policy` needs uv {need} or newer")],
+        ),
+        (Some(p), Some(v)) if v < MIN_UV => (
+            Level::Warn,
+            format!("{} is uv {}.{}.{}, too old", p.display(), v.0, v.1, v.2),
+            vec![format!(
+                "`cascadia export-policy` needs uv {need} or newer (`uv self update`)"
+            )],
+        ),
+        (Some(p), Some(v)) => (
+            Level::Ok,
+            format!("{} (uv {}.{}.{})", p.display(), v.0, v.1, v.2),
+            Vec::new(),
+        ),
+    }
+}
+
+fn check_export_policy_uv(r: &mut Report) {
+    let (found, version) = crate::export_policy::uv_on_path();
+    let (level, detail, notes) = uv_check(found, version);
+    r.line(level, "uv (export-policy)", &detail);
+    for n in notes {
+        r.note(&n);
+    }
+}
+
 pub fn cmd_doctor(args: DoctorArgs) -> Result<()> {
     println!("cascadia doctor — environment + hardware self-check\n");
 
@@ -524,10 +570,13 @@ pub fn cmd_doctor(args: DoctorArgs) -> Result<()> {
     check_openvino_env(&mut r);
     check_ov_version(&mut r);
     check_ov_devices(&mut r);
-    check_tokenizers_extension(&mut r);
 
     println!("\nsycl-llama:");
     check_sycl_llama(&mut r);
+
+    println!("\nov-policy:");
+    check_tokenizers_extension(&mut r);
+    check_export_policy_uv(&mut r);
 
     println!();
     match r.worst {
@@ -593,6 +642,23 @@ mod tests {
             "{notes}"
         );
         assert!(notes.contains("INTEL_OPENVINO_DIR"), "{notes}");
+    }
+
+    #[test]
+    fn uv_check_lines() {
+        let (level, _, notes) = uv_check(None, None);
+        assert!(level == Level::Info);
+        assert!(notes.join("\n").contains("export-policy"));
+        let p = || Some(std::path::PathBuf::from("/usr/bin/uv"));
+        assert!(uv_check(p(), None).0 == Level::Warn);
+        let (level, detail, notes) = uv_check(p(), Some((0, 13, 5)));
+        assert!(level == Level::Warn);
+        assert!(detail.contains("0.13.5"), "{detail}");
+        assert!(notes.join("\n").contains("0.13.6"));
+        let (level, detail, notes) = uv_check(p(), Some((0, 13, 6)));
+        assert!(level == Level::Ok);
+        assert_eq!(detail, "/usr/bin/uv (uv 0.13.6)");
+        assert!(notes.is_empty());
     }
 
     /// A child that writes past the ~64 KiB pipe buffer must not deadlock

@@ -954,14 +954,14 @@ impl PolicyManifest {
         if molmo_identity {
             return refuse(
                 "molmoact2 stats are identity placeholders (the export had no normalization \
-                 stats); re-export with real stats, or pass --allow-identity-stats for testing",
+                 stats); re-export with real stats, or pass --policy-allow-identity-stats for testing",
             );
         }
         if xr0_identity {
             return refuse(
                 "xr0_denormalize stats are identity placeholders (the export had no \
                  normalization stats); re-export with real stats, or pass \
-                 --allow-identity-stats for testing",
+                 --policy-allow-identity-stats for testing",
             );
         }
         for (kind, step) in steps {
@@ -969,7 +969,7 @@ impl PolicyManifest {
                 return refuse(format!(
                     "{kind} stats are identity placeholders (the export had no \
                      normalization stats); re-export with real stats, or pass \
-                     --allow-identity-stats for testing"
+                     --policy-allow-identity-stats for testing"
                 ));
             }
         }
@@ -3122,7 +3122,7 @@ mod tests {
             e.contains("normalize stats are identity placeholders"),
             "{e}"
         );
-        assert!(e.contains("--allow-identity-stats"), "{e}");
+        assert!(e.contains("--policy-allow-identity-stats"), "{e}");
         let m = PolicyManifest::parse(
             DROID,
             LoadOptions {

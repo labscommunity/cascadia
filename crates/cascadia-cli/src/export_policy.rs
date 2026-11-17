@@ -35,7 +35,7 @@ pub(crate) const BUILD_CONSTRAINTS: &str = include_str!(concat!(
 /// The interpreter of both environments, a uv-managed CPython (uv 0.13.6 is the first to ship it).
 const PYTHON_VERSION: &str = "3.12.16";
 /// `--require-build-hashes` arrived in uv 0.13.0 and CPython 3.12.16 in 0.13.6.
-const MIN_UV: (u64, u64, u64) = (0, 13, 6);
+pub(crate) const MIN_UV: (u64, u64, u64) = (0, 13, 6);
 const STAT_KEYS: [&str; 6] = ["mean", "std", "q01", "q99", "min", "max"];
 /// torch and torchvision come from here as CPU wheels; every wheel is checked against its hash.
 const TORCH_CPU_INDEX: &str = "https://download.pytorch.org/whl/cpu";
@@ -53,10 +53,11 @@ const GEMMA_PROHIBITED_USE: &str = "https://ai.google.dev/gemma/prohibited_use_p
 #[derive(Parser, Debug, Clone)]
 pub struct ExportPolicyArgs {
     /// Hugging Face model id of the checkpoint, e.g. `lerobot/smolvla_libero`.
+    #[arg(long)]
     pub model: String,
     /// Package directory to write; must not exist or be empty.
-    #[arg(long, value_name = "DIR")]
-    pub out: PathBuf,
+    #[arg(long, short = 'o', value_name = "DIR")]
+    pub output_dir: PathBuf,
     /// Export the real-time chunking ports (SmolVLA and π0.5): the package serves the whole chunk.
     #[arg(long)]
     pub rtc: bool,
@@ -295,11 +296,11 @@ pub(crate) fn check_exported_chunk(m: &serde_json::Value, p: &Preflight, rtc: bo
     }
 }
 
-/// Where the package is built before it is renamed to `--out`: beside it, named by our pid.
+/// Where the package is built before it is renamed to `--output-dir`: beside it, named by our pid.
 pub(crate) fn staging_dir(out: &Path) -> Result<PathBuf> {
     let name = out
         .file_name()
-        .ok_or_else(|| anyhow!("--out {} has no directory name", out.display()))?;
+        .ok_or_else(|| anyhow!("--output-dir {} has no directory name", out.display()))?;
     let parent = match out.parent() {
         Some(p) if !p.as_os_str().is_empty() => p,
         _ => Path::new("."),
@@ -455,7 +456,7 @@ fn subcommand(args: &[String]) -> Option<&str> {
 /// Local argument checks that need no network.
 pub(crate) fn check_inputs(args: &ExportPolicyArgs) -> Result<()> {
     validate_model_id(&args.model)?;
-    let staging = staging_dir(&args.out)?;
+    let staging = staging_dir(&args.output_dir)?;
     for p in [staging.clone(), sibling(&staging, ".f32")] {
         if p.exists() {
             return Err(anyhow!(
@@ -464,13 +465,17 @@ pub(crate) fn check_inputs(args: &ExportPolicyArgs) -> Result<()> {
             ));
         }
     }
-    if args.out.exists() {
-        let mut entries = std::fs::read_dir(&args.out)
-            .with_context(|| format!("--out {}: not a readable directory", args.out.display()))?;
+    if args.output_dir.exists() {
+        let mut entries = std::fs::read_dir(&args.output_dir).with_context(|| {
+            format!(
+                "--output-dir {}: not a readable directory",
+                args.output_dir.display()
+            )
+        })?;
         if entries.next().is_some() {
             return Err(anyhow!(
-                "--out {} is not empty; pick a new directory",
-                args.out.display()
+                "--output-dir {} is not empty; pick a new directory",
+                args.output_dir.display()
             ));
         }
     }
@@ -618,7 +623,7 @@ pub(crate) fn run_export(args: &ExportPolicyArgs, host: &mut dyn ExportHost) -> 
     print_terms(&pre);
     host.prepare_export()?;
 
-    let dir = staging_dir(&args.out)?;
+    let dir = staging_dir(&args.output_dir)?;
     if let Some(parent) = dir.parent() {
         std::fs::create_dir_all(parent)
             .with_context(|| format!("creating {}", parent.display()))?;
@@ -637,21 +642,40 @@ pub(crate) fn run_export(args: &ExportPolicyArgs, host: &mut dyn ExportHost) -> 
     check_exported_chunk(&manifest, &pre, args.rtc)?;
     std::fs::write(dir.join("NOTICE"), notice_text(&pre, &args.model))
         .with_context(|| format!("writing {}", dir.join("NOTICE").display()))?;
-    if args.out.exists() {
-        std::fs::remove_dir(&args.out)
-            .with_context(|| format!("--out {} is no longer empty", args.out.display()))?;
+    if args.output_dir.exists() {
+        std::fs::remove_dir(&args.output_dir).with_context(|| {
+            format!(
+                "--output-dir {} is no longer empty",
+                args.output_dir.display()
+            )
+        })?;
     }
-    std::fs::rename(&dir, &args.out)
-        .with_context(|| format!("renaming {} to {}", dir.display(), args.out.display()))?;
+    std::fs::rename(&dir, &args.output_dir).with_context(|| {
+        format!(
+            "renaming {} to {}",
+            dir.display(),
+            args.output_dir.display()
+        )
+    })?;
     staging.committed = true;
     let _ = std::fs::remove_dir_all(sibling(&dir, ".f32"));
-    eprintln!("\nPackage written to {}.", args.out.display());
+    eprintln!("\nPackage written to {}.", args.output_dir.display());
     print_terms(&pre);
     eprintln!(
         "Serve it with:\n  cascadia run {} --engine ov-policy",
-        args.out.display()
+        args.output_dir.display()
     );
     Ok(())
+}
+
+/// uv on `PATH` and its version, as the export reads them.
+pub(crate) fn uv_on_path() -> (Option<PathBuf>, Option<(u64, u64, u64)>) {
+    let uv = find_on_path("uv");
+    let version = uv.as_deref().and_then(|uv| {
+        let out = uv_command(uv).arg("--version").output().ok()?;
+        parse_uv_version(&String::from_utf8_lossy(&out.stdout))
+    });
+    (uv, version)
 }
 
 fn find_on_path(name: &str) -> Option<PathBuf> {
@@ -874,12 +898,10 @@ impl ExportHost for UvHost {
                     .collect(),
             })
             .collect();
+        let (uv, uv_version) = uv_on_path();
         HostFacts {
-            uv_version: find_on_path("uv").and_then(|uv| {
-                let out = uv_command(&uv).arg("--version").output().ok()?;
-                parse_uv_version(&String::from_utf8_lossy(&out.stdout))
-            }),
-            uv: find_on_path("uv"),
+            uv_version,
+            uv,
             git: find_on_path("git"),
             total_ram: sys.total_memory(),
             available_ram: sys.available_memory(),
@@ -970,7 +992,7 @@ mod tests {
     fn args(model: &str, out: &Path) -> ExportPolicyArgs {
         ExportPolicyArgs {
             model: model.into(),
-            out: out.into(),
+            output_dir: out.into(),
             rtc: false,
             stats: None,
             verify: false,
@@ -1041,8 +1063,9 @@ mod tests {
         let cli = parse(&[
             "cascadia",
             "export-policy",
+            "--model",
             "lerobot/smolvla_libero",
-            "--out",
+            "--output-dir",
             "pkg",
             "--rtc",
             "--stats",
@@ -1054,20 +1077,21 @@ mod tests {
             panic!("not export-policy")
         };
         assert_eq!(a.model, "lerobot/smolvla_libero");
-        assert_eq!(a.out, PathBuf::from("pkg"));
+        assert_eq!(a.output_dir, PathBuf::from("pkg"));
         assert!(a.rtc && a.verify);
         assert_eq!(a.stats, Some(PathBuf::from("s.json")));
     }
 
     #[test]
-    fn defaults_and_required_out() {
-        let cli = parse(&["cascadia", "export-policy", "m/x", "--out", "p"]).unwrap();
+    fn defaults_and_required_args() {
+        let cli = parse(&["cascadia", "export-policy", "--model", "m/x", "-o", "p"]).unwrap();
         let crate::Command::ExportPolicy(a) = cli.cmd else {
             panic!("not export-policy")
         };
         assert!(!a.rtc && !a.verify && a.stats.is_none());
-        assert!(parse(&["cascadia", "export-policy", "m/x"]).is_err());
-        assert!(parse(&["cascadia", "export-policy", "--out", "p"]).is_err());
+        assert!(parse(&["cascadia", "export-policy", "--model", "m/x"]).is_err());
+        assert!(parse(&["cascadia", "export-policy", "-o", "p"]).is_err());
+        assert!(parse(&["cascadia", "export-policy", "m/x", "-o", "p"]).is_err());
     }
 
     #[test]
@@ -1383,7 +1407,7 @@ mod tests {
         calls: Vec<&'static str>,
         manifest: String,
         fail: bool,
-        /// The staging directory the export was given, and whether --out existed meanwhile.
+        /// The staging directory the export was given, and whether --output-dir existed meanwhile.
         staged: Option<(PathBuf, bool)>,
     }
 
@@ -1406,7 +1430,10 @@ mod tests {
         }
         fn export(&mut self, a: &ExportPolicyArgs, _p: &Preflight, dir: &Path) -> Result<()> {
             self.calls.push("export");
-            self.staged = Some((dir.to_path_buf(), a.out.join("manifest.json").exists()));
+            self.staged = Some((
+                dir.to_path_buf(),
+                a.output_dir.join("manifest.json").exists(),
+            ));
             std::fs::create_dir_all(dir.join("sub"))?;
             std::fs::create_dir_all(sibling(dir, ".f32"))?;
             std::fs::write(dir.join("manifest.json"), &self.manifest)?;
@@ -1621,7 +1648,7 @@ mod tests {
         let procs = [proc(
             9,
             "cascadia",
-            &["cascadia", "export-policy", "m/x", "--out", "run"],
+            &["cascadia", "export-policy", "--model", "m/x", "-o", "run"],
         )];
         assert_eq!(serving_process(&procs, 1), None);
     }
@@ -1664,7 +1691,7 @@ mod tests {
             let err = check_inputs(&args("m/x", Path::new(out)))
                 .unwrap_err()
                 .to_string();
-            assert!(err.contains("--out"), "{out}: {err}");
+            assert!(err.contains("--output-dir"), "{out}: {err}");
         }
     }
 
@@ -1740,17 +1767,17 @@ mod tests {
         let (r, host) = run_host(roomy(), passing("smolvla"), &a, manifest(None, 50), false);
         r.unwrap();
         let (staged, out_seen) = host.staged.unwrap();
-        assert_eq!(staged, staging_dir(&a.out).unwrap());
-        assert!(!out_seen, "--out existed while exporting");
-        assert_eq!(entries(&a.out), ["NOTICE", "manifest.json", "sub"]);
+        assert_eq!(staged, staging_dir(&a.output_dir).unwrap());
+        assert!(!out_seen, "--output-dir existed while exporting");
+        assert_eq!(entries(&a.output_dir), ["NOTICE", "manifest.json", "sub"]);
         assert_eq!(entries(dir.path()), ["pkg"]);
-        // an existing empty --out is replaced
+        // an existing empty --output-dir is replaced
         let a2 = args("lerobot/smolvla_libero", &dir.path().join("empty"));
-        std::fs::create_dir(&a2.out).unwrap();
+        std::fs::create_dir(&a2.output_dir).unwrap();
         run_host(roomy(), passing("smolvla"), &a2, manifest(None, 50), false)
             .0
             .unwrap();
-        assert!(a2.out.join("NOTICE").is_file());
+        assert!(a2.output_dir.join("NOTICE").is_file());
     }
 
     #[test]
@@ -1768,7 +1795,7 @@ mod tests {
     fn never_touches_an_existing_staging_name() {
         let dir = tempfile::tempdir().unwrap();
         let a = args("lerobot/smolvla_libero", &dir.path().join("pkg"));
-        let staging = staging_dir(&a.out).unwrap();
+        let staging = staging_dir(&a.output_dir).unwrap();
         std::fs::create_dir(&staging).unwrap();
         std::fs::write(staging.join("keep"), "x").unwrap();
         let (r, calls) = run_fake(roomy(), passing("smolvla"), &a);
@@ -1814,7 +1841,7 @@ mod tests {
             let (r, calls) = run_fake(roomy(), pre, &a);
             assert!(r.is_err());
             assert_eq!(calls, ["facts", "prepare_preflight", "preflight"]);
-            assert!(!a.out.exists());
+            assert!(!a.output_dir.exists());
         }
     }
 
@@ -1837,7 +1864,7 @@ mod tests {
                 "export"
             ]
         );
-        let notice = std::fs::read_to_string(a.out.join("NOTICE")).unwrap();
+        let notice = std::fs::read_to_string(a.output_dir.join("NOTICE")).unwrap();
         assert!(notice.contains("Gemma Terms of Use"), "{notice}");
     }
 }

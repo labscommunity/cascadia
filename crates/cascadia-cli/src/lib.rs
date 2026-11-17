@@ -169,7 +169,9 @@ pub enum Command {
     Doctor(DoctorArgs),
     /// Run a model on a single machine (sugar for a one-stage worker with an
     /// OpenAI API). Takes a local model directory — a whole-model OpenVINO IR,
-    /// or a `cascadia shard` tree. See `cascadia run --help`.
+    /// or a `cascadia shard` tree — or, with `--engine ov-policy`, a robot
+    /// policy package served over an openpi-compatible WebSocket. See
+    /// `cascadia run --help`.
     Run(RunArgs),
     /// Run a pipeline-stage worker.
     Worker(WorkerArgs),
@@ -253,7 +255,7 @@ pub enum EngineKind {
     OvPolicy,
 }
 
-/// `--precision` for `--engine ov-policy`.
+/// `--policy-precision` for `--engine ov-policy`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, clap::ValueEnum)]
 pub enum PolicyPrecision {
     F16,
@@ -793,17 +795,23 @@ pub struct WorkerArgs {
 /// it serves an OpenAI-compatible API, no rank/total/listen bookkeeping.
 /// It maps onto a one-stage [`WorkerArgs`]. For multi-machine pipeline
 /// parallelism, use `cascadia worker` directly.
+///
+/// `--engine ov-policy` serves a robot policy instead: a local
+/// `policy_package` (`cascadia export-policy`) behind `/v1/policy/ws`,
+/// `/v1/policy/metadata`, `/health` and `/metrics`, with no chat routes.
 #[derive(Parser, Debug, Clone)]
 pub struct RunArgs {
     /// Local model directory: a whole-model OpenVINO IR (`optimum-cli export
-    /// openvino`, or a pre-exported `*-int4-ov` download) or a `cascadia shard`
-    /// tree. Not an HF repo id — `run` does not download or convert models.
+    /// openvino`, or a pre-exported `*-int4-ov` download), a `cascadia shard`
+    /// tree, or for `--engine ov-policy` a `policy_package` directory. Not an
+    /// HF repo id — `run` does not download or convert models.
     pub model: String,
 
-    /// Device hint: GPU / CPU / NPU. Defaults to GPU — run `cascadia
-    /// doctor` first to confirm the iGPU is visible to OpenVINO.
-    /// Also accepts indexed/compound OpenVINO forms (GPU.N, AUTO,
-    /// MULTI:, HETERO:, BATCH:) — see `cascadia worker --help`.
+    /// Device hint. Defaults to GPU — run `cascadia doctor` first to confirm
+    /// the iGPU is visible to OpenVINO. Chat engines: GPU / CPU / NPU, and the
+    /// indexed/compound OpenVINO forms (GPU.N, AUTO, MULTI:, HETERO:, BATCH:) —
+    /// see `cascadia worker --help`. ov-policy: GPU (or GPU.N) or CPU; NPU and
+    /// the compound forms are refused.
     #[arg(long, default_value = "GPU")]
     pub device: String,
 
@@ -822,7 +830,7 @@ pub struct RunArgs {
     /// `--engine ov-policy` only: GPU compute precision (default f16). CPU
     /// always runs f32 and refuses f16.
     #[arg(long, value_enum)]
-    pub precision: Option<PolicyPrecision>,
+    pub policy_precision: Option<PolicyPrecision>,
 
     /// `--engine ov-policy` only: a browser `Origin` allowed to open the
     /// WebSocket (repeatable). Requests without an `Origin` header (robots,
@@ -838,7 +846,7 @@ pub struct RunArgs {
     /// `--engine ov-policy` only: serve a package whose normalization stats
     /// are identity placeholders. For testing; actions from it are not usable.
     #[arg(long)]
-    pub allow_identity_stats: bool,
+    pub policy_allow_identity_stats: bool,
 
     /// `--engine ov-policy` only: also serve physicalai's remote-inference
     /// protocol over Zenoh, so `physicalai.inference.RemoteInferenceModel`
@@ -1263,16 +1271,8 @@ impl OvExecutionMode {
 /// so `main` can call it while the process is still single-threaded — env
 /// mutation and `execv` are only safe there.
 pub fn activate_elastic_if_requested(cli: &Cli) {
-    // sycl-llama's --elastic is the child's own device-side streaming
-    // (GGML_STREAM_WEIGHTS); the host interposer would only intercept the
-    // tiny cascadia parent's allocations and must not be inherited by
-    // llama-server (its staging buffer needs plain anonymous pages).
-    let (min_mb, pool_mb) = match &cli.cmd {
-        Command::Worker(a) if a.elastic && a.engine != EngineKind::SyclLlama => {
-            (a.elastic_min_mb, a.elastic_pool_mb)
-        }
-        Command::Run(a) if a.elastic && a.engine != EngineKind::SyclLlama => (1, 8192),
-        _ => return,
+    let Some((min_mb, pool_mb)) = elastic_request(cli) else {
+        return;
     };
     if cascadia_elastic::is_active() {
         eprintln!("cascadia: elastic posture active (min={min_mb}MB pool={pool_mb}MB)");
@@ -1322,6 +1322,27 @@ pub async fn run(cli: Cli) -> Result<()> {
     }
 }
 
+/// The interposer's `(min_mb, pool_mb)` when this command line asks for it.
+fn elastic_request(cli: &Cli) -> Option<(u32, u32)> {
+    // sycl-llama's --elastic is the child's own device-side streaming
+    // (GGML_STREAM_WEIGHTS); the host interposer would only intercept the
+    // tiny cascadia parent's allocations and must not be inherited by
+    // llama-server (its staging buffer needs plain anonymous pages).
+    // ov-policy refuses --elastic (`check_engine_flags`), so it must not
+    // re-exec first.
+    match &cli.cmd {
+        Command::Worker(a) if a.elastic && a.engine != EngineKind::SyclLlama => {
+            Some((a.elastic_min_mb, a.elastic_pool_mb))
+        }
+        Command::Run(a)
+            if a.elastic && !matches!(a.engine, EngineKind::SyclLlama | EngineKind::OvPolicy) =>
+        {
+            Some((1, 8192))
+        }
+        _ => None,
+    }
+}
+
 impl RunArgs {
     /// `--api`, or when absent: loopback for the unauthenticated policy API,
     /// all interfaces for the chat engines. Resolved per engine because clap
@@ -1337,13 +1358,14 @@ impl RunArgs {
     }
 }
 
-/// Refuse the policy flags on any other engine rather than ignore them.
-fn check_policy_flags(args: &RunArgs) -> Result<()> {
+/// Refuse a flag the chosen engine would ignore: the policy flags on a chat
+/// engine, and the chat-only flags on ov-policy.
+fn check_engine_flags(args: &RunArgs) -> Result<()> {
     if args.engine == EngineKind::OvPolicy {
-        return Ok(());
+        return check_chat_flags_unused(args);
     }
     let used = [
-        ("--precision", args.precision.is_some()),
+        ("--policy-precision", args.policy_precision.is_some()),
         (
             "--policy-allow-origin",
             !args.policy_allow_origin.is_empty(),
@@ -1352,7 +1374,10 @@ fn check_policy_flags(args: &RunArgs) -> Result<()> {
             "--policy-max-connections",
             args.policy_max_connections.is_some(),
         ),
-        ("--allow-identity-stats", args.allow_identity_stats),
+        (
+            "--policy-allow-identity-stats",
+            args.policy_allow_identity_stats,
+        ),
         ("--zenoh", args.zenoh.is_some()),
         ("--zenoh-name", args.zenoh_name.is_some()),
         (
@@ -1366,9 +1391,43 @@ fn check_policy_flags(args: &RunArgs) -> Result<()> {
     }
 }
 
+/// The chat-only `run` flags, refused on ov-policy. A flag with a default
+/// counts as set when it differs from that default (clap's derive cannot tell
+/// an explicit default from none).
+fn check_chat_flags_unused(args: &RunArgs) -> Result<()> {
+    let d = RunArgs::try_parse_from(["run", "m"]).expect("run parses with defaults");
+    let used = [
+        ("--prefix-cache-gb", args.prefix_cache_gb.is_some()),
+        ("--ep-workers", !args.ep_workers.is_empty()),
+        ("--ep-placement", args.ep_placement.is_some()),
+        (
+            "--api-max-body-mb",
+            args.api_max_body_mb != d.api_max_body_mb,
+        ),
+        ("--elastic", args.elastic),
+        ("--elastic-vram", args.elastic_vram != d.elastic_vram),
+        ("--elastic-share", args.elastic_share.is_some()),
+        ("--llama-mtp", args.llama_mtp),
+        ("--llama-bin", args.llama_bin.is_some()),
+        ("--llama-ctx", args.llama_ctx != d.llama_ctx),
+        ("--llama-ngl", args.llama_ngl != d.llama_ngl),
+        ("--llama-args", !args.llama_args.is_empty()),
+        ("--llama-host-layers", args.llama_host_layers.is_some()),
+        ("--llama-load-timeout", args.llama_load_timeout.is_some()),
+        (
+            "--llama-load-retries",
+            args.llama_load_retries != d.llama_load_retries,
+        ),
+    ];
+    match used.iter().find(|(_, set)| *set) {
+        Some((flag, _)) => Err(anyhow!("{flag} does not apply to --engine ov-policy")),
+        None => Ok(()),
+    }
+}
+
 async fn cmd_run(args: RunArgs) -> Result<()> {
     info!(model = %args.model, device = %args.device, engine = ?args.engine, "cascadia run (single machine)");
-    check_policy_flags(&args)?;
+    check_engine_flags(&args)?;
     if args.engine == EngineKind::OvPolicy {
         return cmd_run_policy(args).await;
     }
@@ -1400,18 +1459,19 @@ async fn cmd_run(args: RunArgs) -> Result<()> {
     cmd_worker(worker).await
 }
 
+/// How long shutdown waits for an engine's `close` before exiting anyway.
+const SHUTDOWN_CLOSE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+
 /// `cascadia run --engine ov-policy`: load and warm the package, then serve
 /// the policy router (no chat routes, no dashboard).
 async fn cmd_run_policy(args: RunArgs) -> Result<()> {
     use cascadia_engine::PolicyEngine;
-    use cascadia_engine_openvino::policy::{
-        compile_config, LoadOptions, OvPolicyEngine, OvPolicyOptions, Precision,
-    };
+    use cascadia_engine_openvino::policy::{compile_config, OvPolicyEngine, Precision};
 
     let api = args.api_addr();
     check_api_addr_is_tcp(Some(&api))?;
     let (host, port) = parse_addr(&api, "0.0.0.0")?;
-    let precision = args.precision.map(|p| match p {
+    let precision = args.policy_precision.map(|p| match p {
         PolicyPrecision::F16 => Precision::F16,
         PolicyPrecision::F32 => Precision::F32,
     });
@@ -1419,24 +1479,12 @@ async fn cmd_run_policy(args: RunArgs) -> Result<()> {
     compile_config(&args.device, precision)?;
     let dir = PathBuf::from(&args.model);
     if !dir.is_dir() {
-        return Err(anyhow!(
-            "no policy package directory at {}\n\
-             --engine ov-policy takes a local policy_package directory (manifest.json, \
-             the policy IR and the tokenizer IR); see docs/engines/ov-policy.md",
-            args.model
-        ));
+        return Err(missing_policy_package_error(&args.model));
     }
     let mut identity = cascadia_api::policy::PackageIdentity::from_package_dir(&dir)
         .with_context(|| format!("reading {}", dir.join("manifest.json").display()))?;
     let zenoh = zenoh_plan(&args, &identity)?;
-    let opts = OvPolicyOptions {
-        device: args.device.clone(),
-        precision,
-        manifest: LoadOptions {
-            allow_identity_stats: args.allow_identity_stats,
-        },
-        ..OvPolicyOptions::default()
-    };
+    let opts = policy_load_options(&args, precision);
     let (engine, ms) =
         tokio::task::spawn_blocking(move || -> Result<(Box<dyn PolicyEngine>, Vec<u32>)> {
             let mut engine = OvPolicyEngine::load(&dir, &opts)
@@ -1455,6 +1503,41 @@ async fn cmd_run_policy(args: RunArgs) -> Result<()> {
         .with_context(|| format!("bind {host}:{port}"))?;
     let shutdown = install_shutdown_signal_handler().context("install_shutdown_signal_handler")?;
     serve_policy_engine(listener, engine, cfg, zenoh, shutdown).await
+}
+
+/// How `run` loads a package: chat's default compile cache, so a restart
+/// skips the compile (the cache never changes outputs).
+fn policy_load_options(
+    args: &RunArgs,
+    precision: Option<cascadia_engine_openvino::policy::Precision>,
+) -> cascadia_engine_openvino::policy::OvPolicyOptions {
+    use cascadia_engine_openvino::policy::{LoadOptions, OvPolicyOptions};
+    OvPolicyOptions {
+        device: args.device.clone(),
+        precision,
+        manifest: LoadOptions {
+            allow_identity_stats: args.policy_allow_identity_stats,
+        },
+        cache_dir: resolve_ov_cache_dir(None).map(PathBuf::from),
+        ..OvPolicyOptions::default()
+    }
+}
+
+/// [`missing_model_error`] for a policy package: how to export one.
+fn missing_policy_package_error(model: &str) -> anyhow::Error {
+    let stem = model_stem(model);
+    anyhow!(
+        "no policy package directory at {model}\n\
+         \n\
+         --engine ov-policy takes a local policy_package directory (manifest.json, the policy \
+         IR and the tokenizer IR) and never downloads or converts one. If {model} is a \
+         Hugging Face LeRobot checkpoint (SmolVLA or pi0.5), export it first:\n\
+         \n  \
+         cascadia export-policy --model {model} --output-dir ./{stem}\n    \
+         cascadia run ./{stem} --engine ov-policy\n\
+         \n\
+         Other kinds: see docs/engines/ov-policy.md."
+    )
 }
 
 /// Where `--zenoh` listens and under which slot name.
@@ -1572,25 +1655,38 @@ async fn serve_policy_engine(
             "--zenoh needs a cascadia built with `--features zenoh`"
         ));
     }
-    let app = shared_policy_router(policy, cfg);
+    let app = shared_policy_router(policy.clone(), cfg);
     let addr = listener.local_addr()?;
     info!(
+        host = %addr.ip(),
+        port = addr.port(),
         model = %spec.model,
         device = %spec.device,
         cameras = ?spec.cameras,
         chunk = ?spec.chunk,
-        "serving policy at ws://{addr}/v1/policy/ws (metadata: http://{addr}/v1/policy/metadata)"
+        "policy serving at ws://{addr}/v1/policy/ws (metadata: http://{addr}/v1/policy/metadata)"
     );
     let res = tokio::select! {
         res = serve_policy(listener, app, HEADER_READ_TIMEOUT) => res.context("serve_policy"),
         sig = shutdown => {
-            info!(signal = %sig, "shutdown signal received");
+            info!(signal = %sig, "shutdown signal received; closing the policy engine");
             Ok(())
         }
     };
     #[cfg(feature = "zenoh")]
     if let Some(z) = zenoh {
         z.stop().await;
+    }
+    // As chat closes its runner: off the runtime (the lock waits for a call in
+    // flight) and bounded, so a stuck engine cannot hold the exit.
+    let close = tokio::task::spawn_blocking(move || policy.lock().close());
+    match tokio::time::timeout(SHUTDOWN_CLOSE_TIMEOUT, close).await {
+        Ok(Ok(())) => info!("policy engine closed"),
+        Ok(Err(e)) => tracing::warn!(error = %e, "policy engine close panicked"),
+        Err(_) => tracing::warn!(
+            timeout_s = SHUTDOWN_CLOSE_TIMEOUT.as_secs(),
+            "policy engine close exceeded timeout; abandoning teardown"
+        ),
     }
     res
 }
@@ -1672,8 +1768,8 @@ fn cmd_engines() -> Result<()> {
     println!("  gemma4         Gemma 4 multi-stage (per-layer-type attn, KV-sharing, PLI, sliding window); gemma4_cached_v1.x shards");
     println!("  sparse-moe     sparse mixture-of-experts on CPU: Kimi K2.6 (AVX-512 int4 GEMM), MiniMax-M2 (OV-IR shells), GLM-5 / DeepSeek-V4 / Inkling (Rust shells + int4 mmap experts, N-rank pipeline)");
     println!("  sycl-llama     external llama.cpp SYCL server (GGUF, spawned subprocess); bin via --llama-bin / CASCADIA_LLAMA_BIN / PATH; --elastic = GGML_STREAM_WEIGHTS device-side streaming (needs a streaming build, scripts/build-llama-stream.sh)");
-    println!("  ov-policy      robot policy (VLA): SmolVLA / pi0.5 / pi0 / X-VLA / EVO1 / VLA-JEPA / XR0 / GR00T N1.7 / MolmoAct2 policy_package on GPU or CPU, openpi-compatible WebSocket; `cascadia run` only");
     println!("  qwen35         Qwen3.5-family staged chain (GatedDeltaNet; 3.5/3.6 MoE or 3.8 dense); qwen3_5* IR-surgery shards (alias: qwen36-moe)");
+    println!("  ov-policy      robot policy (VLA): SmolVLA / pi0.5 / pi0 / X-VLA / EVO1 / VLA-JEPA / XR0 / GR00T N1.7 / MolmoAct2 policy_package on GPU or CPU, openpi-compatible WebSocket; `cascadia run` only");
     Ok(())
 }
 
@@ -3078,7 +3174,6 @@ async fn cmd_worker(args: WorkerArgs) -> Result<()> {
         // can actually fire, then await with a deadline. On timeout we
         // log loudly and return — the process exit will SIGKILL any
         // straggler threads, which is the right outcome at that point.
-        const SHUTDOWN_CLOSE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
         let r = runner.clone();
         let close_task = tokio::task::spawn_blocking(move || r.close());
         match tokio::time::timeout(SHUTDOWN_CLOSE_TIMEOUT, close_task).await {
@@ -4594,7 +4689,7 @@ mod tests {
     #[test]
     fn policy_flags_are_refused_on_other_engines() {
         for flags in [
-            &["--precision", "f32"][..],
+            &["--policy-precision", "f32"][..],
             &["--policy-allow-origin", "http://x"],
             &["--policy-max-connections", "2"],
             &["--zenoh", "127.0.0.1"],
@@ -4602,16 +4697,22 @@ mod tests {
             &["--zenoh-allow-all-interfaces"],
             // The default value itself is still an explicit flag.
             &["--policy-max-connections", "4"],
-            &["--allow-identity-stats"],
+            &["--policy-allow-identity-stats"],
         ] {
             let mut argv = vec!["m"];
             argv.extend_from_slice(flags);
-            let e = check_policy_flags(&run_args(&argv))
+            let e = check_engine_flags(&run_args(&argv))
                 .unwrap_err()
                 .to_string();
             assert!(e.contains("ov-policy only"), "{e}");
             argv.extend(["--engine", "ov-policy"]);
-            check_policy_flags(&run_args(&argv)).unwrap();
+            check_engine_flags(&run_args(&argv)).unwrap();
+        }
+        // The pre-rename spellings are gone (nothing shipped them).
+        for old in [&["--precision", "f32"][..], &["--allow-identity-stats"]] {
+            let mut argv = vec!["cascadia", "run", "pkg", "--engine", "ov-policy"];
+            argv.extend_from_slice(old);
+            assert!(Cli::try_parse_from(argv).is_err(), "{old:?}");
         }
         assert!(
             Cli::try_parse_from(["cascadia", "run", "m", "--policy-max-connections", "0"]).is_err()
@@ -4629,6 +4730,91 @@ mod tests {
         assert_eq!(policy_server_config(&two).max_connections, 2);
     }
 
+    #[test]
+    fn chat_flags_are_refused_on_ov_policy() {
+        for flags in [
+            &["--prefix-cache-gb", "4"][..],
+            &["--ep-workers", "127.0.0.1:9201"],
+            &["--ep-placement", "p.json"],
+            &["--api-max-body-mb", "8"],
+            &["--elastic"],
+            &["--elastic-vram", "0"],
+            &["--elastic-share", "2"],
+            &["--llama-mtp"],
+            &["--llama-bin", "llama-server"],
+            &["--llama-ctx", "8192"],
+            &["--llama-ngl", "10"],
+            &["--llama-args", "-fa on"],
+            &["--llama-host-layers", "x"],
+            &["--llama-load-timeout", "5"],
+            &["--llama-load-retries", "3"],
+        ] {
+            let mut argv = vec!["m"];
+            argv.extend_from_slice(flags);
+            check_engine_flags(&run_args(&argv)).unwrap();
+            argv.extend(["--engine", "ov-policy"]);
+            let e = check_engine_flags(&run_args(&argv))
+                .unwrap_err()
+                .to_string();
+            assert!(e.contains(flags[0]), "{e}");
+            assert!(e.contains("does not apply to --engine ov-policy"), "{e}");
+        }
+        check_engine_flags(&run_args(&["pkg", "--engine", "ov-policy"])).unwrap();
+    }
+
+    /// `run --engine ov-policy --elastic` is refused, so `main` must not re-exec
+    /// into the memory interposer before that refusal runs.
+    #[test]
+    fn elastic_is_not_activated_for_ov_policy() {
+        let cli = |argv: &[&str]| Cli::try_parse_from(argv).unwrap();
+        assert_eq!(
+            elastic_request(&cli(&["cascadia", "run", "m", "--elastic"])),
+            Some((1, 8192))
+        );
+        assert_eq!(
+            elastic_request(&cli(&[
+                "cascadia",
+                "run",
+                "m",
+                "--engine",
+                "ov-policy",
+                "--elastic"
+            ])),
+            None
+        );
+    }
+
+    /// `run` serves the policy from the same default compile cache as chat.
+    #[test]
+    fn ov_policy_uses_the_default_compile_cache() {
+        let args = run_args(&["pkg", "--engine", "ov-policy", "--device", "CPU"]);
+        let opts = policy_load_options(&args, None);
+        assert_eq!(opts.device, "CPU");
+        assert_eq!(
+            opts.cache_dir,
+            resolve_ov_cache_dir(None).map(PathBuf::from)
+        );
+        if dirs::cache_dir().is_some() {
+            assert!(opts.cache_dir.unwrap().ends_with("cascadia/ov-cache"));
+        }
+    }
+
+    #[test]
+    fn run_help_describes_ov_policy_and_its_devices() {
+        let mut cmd = Cli::command();
+        let run = cmd.find_subcommand_mut("run").unwrap();
+        let help = run.render_long_help().to_string();
+        assert!(help.contains("policy_package"), "{help}");
+        assert!(help.contains("ov-policy: GPU (or GPU.N) or CPU"), "{help}");
+        let about = Cli::command()
+            .find_subcommand("run")
+            .unwrap()
+            .get_about()
+            .unwrap()
+            .to_string();
+        assert!(about.contains("robot policy"), "{about}");
+    }
+
     #[tokio::test]
     async fn ov_policy_refuses_bad_devices_and_precisions_before_loading() {
         let dir = tempfile::tempdir().unwrap();
@@ -4641,7 +4827,7 @@ mod tests {
                     "ov-policy",
                     "--device",
                     "CPU",
-                    "--precision",
+                    "--policy-precision",
                     "f16",
                 ],
                 "always runs f32",
@@ -4657,8 +4843,25 @@ mod tests {
         ] {
             let e = format!("{:#}", cmd_run(run_args(&argv)).await.unwrap_err());
             assert!(e.contains(want), "{e}");
-            assert!(!e.contains("\n "), "stray indentation in {e:?}");
         }
+        let e = format!(
+            "{:#}",
+            cmd_run(run_args(&[
+                "lerobot/smolvla_libero",
+                "--engine",
+                "ov-policy"
+            ]))
+            .await
+            .unwrap_err()
+        );
+        assert!(
+            e.contains("cascadia export-policy --model lerobot/smolvla_libero --output-dir ./smolvla_libero"),
+            "{e}"
+        );
+        assert!(
+            e.contains("cascadia run ./smolvla_libero --engine ov-policy"),
+            "{e}"
+        );
     }
 
     #[tokio::test]
@@ -4712,12 +4915,37 @@ mod tests {
             server_resize: None,
             rtc_chunk_size: None,
         };
+        /// The mock, recording `close`.
+        struct Closing(cascadia_engine::MockPolicyEngine, Arc<AtomicBool>);
+        impl cascadia_engine::PolicyEngine for Closing {
+            fn spec(&self) -> &PolicySpec {
+                self.0.spec()
+            }
+            fn warmup(&mut self) -> cascadia_engine::EngineResult<Vec<u32>> {
+                self.0.warmup()
+            }
+            fn infer(
+                &mut self,
+                obs: &cascadia_types::Observation,
+            ) -> cascadia_engine::EngineResult<cascadia_types::ActionChunk> {
+                self.0.infer(obs)
+            }
+            fn close(&mut self) {
+                self.1.store(true, Ordering::SeqCst);
+            }
+        }
+        use std::sync::atomic::{AtomicBool, Ordering};
+        use std::sync::Arc;
+        let closed = Arc::new(AtomicBool::new(false));
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
         let (stop_tx, stop_rx) = tokio::sync::oneshot::channel::<()>();
         let server = tokio::spawn(serve_policy_engine(
             listener,
-            Box::new(cascadia_engine::MockPolicyEngine::new(spec.clone())),
+            Box::new(Closing(
+                cascadia_engine::MockPolicyEngine::new(spec.clone()),
+                closed.clone(),
+            )),
             Default::default(),
             None,
             async move {
@@ -4741,8 +4969,14 @@ mod tests {
         let body = meta.split("\r\n\r\n").nth(1).unwrap();
         assert_eq!(serde_json::from_str::<PolicySpec>(body).unwrap(), spec);
         assert!(get("/v1/models").await.starts_with("HTTP/1.1 404"));
+        assert!(get("/metrics").await.starts_with("HTTP/1.1 200"));
+        assert!(!closed.load(Ordering::SeqCst));
         stop_tx.send(()).unwrap();
         server.await.unwrap().unwrap();
+        assert!(
+            closed.load(Ordering::SeqCst),
+            "shutdown did not close the engine"
+        );
     }
 
     /// The engine renamed from `qwen36-moe` to `qwen35`; the old spelling is

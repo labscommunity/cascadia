@@ -202,8 +202,8 @@ fn compile_failed(
     match e {
         EngineError::Backend(m) => {
             let hint = if device.starts_with("GPU") && precision == Some(Precision::F32) {
-                "; --precision f32 needs about twice the GPU memory of the f16 default, \
-                 which may not fit an integrated GPU: try without --precision f32"
+                "; --policy-precision f32 needs about twice the GPU memory of the f16 default, \
+                 which may not fit an integrated GPU: try without --policy-precision f32"
             } else {
                 ""
             };
@@ -252,7 +252,7 @@ mod tests {
             m.contains("compiling pkg/pi0.xml on GPU failed: [GPU] ProgramBuilder"),
             "{m}"
         );
-        assert!(m.contains("try without --precision f32"), "{m}");
+        assert!(m.contains("try without --policy-precision f32"), "{m}");
         for (device, precision) in [
             ("GPU", None),
             ("CPU", None),
@@ -260,7 +260,7 @@ mod tests {
         ] {
             let m = compile_failed(xml, device, precision, e()).to_string();
             assert!(m.contains(&format!("on {device} failed")), "{m}");
-            assert!(!m.contains("--precision"), "{m}");
+            assert!(!m.contains("--policy-precision"), "{m}");
         }
         assert!(matches!(
             compile_failed(xml, "GPU", None, EngineError::InvalidConfig("x".into())),

@@ -1,16 +1,17 @@
-//! The policy HTTP surface: `GET /health`, `GET /v1/policy/metadata` and
-//! `WS /v1/policy/ws`, on their own state (the chat `AppState` is not involved),
-//! plus the hyper serve loop that lets the WebSocket upgrade.
+//! The policy HTTP surface: `GET /health`, `GET /metrics`, `GET /v1/policy/metadata`
+//! and `WS /v1/policy/ws`, on their own state (the chat `AppState` is not
+//! involved), plus the hyper serve loop that lets the WebSocket upgrade.
 
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use axum::extract::ws::{Message, WebSocket, WebSocketUpgrade};
 use axum::extract::State;
 use axum::http::{header, HeaderMap, StatusCode};
 use axum::response::{IntoResponse, Response};
 use axum::routing::get;
-use axum::Router;
+use axum::{Json, Router};
 use cascadia_engine::{payload_cap, EngineError, EngineResult, PolicyEngine};
 use cascadia_types::{ActionChunk, PolicySpec};
 use futures::{SinkExt, StreamExt};
@@ -63,6 +64,9 @@ pub struct SharedPolicy {
     spec: Arc<PolicySpec>,
     slots: Arc<Semaphore>,
     max_connections: usize,
+    /// Cleared by an engine failure and set by the next good call, as chat's
+    /// `/health` tracks its pipeline.
+    ready: Arc<AtomicBool>,
 }
 
 impl SharedPolicy {
@@ -81,7 +85,13 @@ impl SharedPolicy {
             spec: Arc::new(spec),
             slots: Arc::new(Semaphore::new(max_connections)),
             max_connections,
+            ready: Arc::new(AtomicBool::new(true)),
         })
+    }
+
+    /// False since an engine failure, until a call succeeds again.
+    pub fn is_ready(&self) -> bool {
+        self.ready.load(Ordering::Relaxed)
     }
 
     pub fn spec(&self) -> &PolicySpec {
@@ -101,20 +111,41 @@ impl SharedPolicy {
     pub fn lock(&self) -> parking_lot::MutexGuard<'_, Box<dyn PolicyEngine>> {
         self.engine.lock()
     }
-}
 
-/// One `infer` call; a panicking engine becomes an error, so every caller
-/// still gets an answer.
-pub fn infer_guarded(
-    engine: &mut dyn PolicyEngine,
-    obs: &cascadia_types::Observation,
-) -> EngineResult<ActionChunk> {
-    std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| engine.infer(obs))).unwrap_or_else(
-        |_| {
-            tracing::error!("policy engine panicked during infer");
-            Err(EngineError::Backend("internal error".into()))
-        },
-    )
+    /// One `infer` call on the engine from [`Self::lock`]; a panicking engine
+    /// becomes an error, so every caller still gets an answer. Counts the call
+    /// and, but for a refused request (`InvalidConfig`), sets readiness from it.
+    pub fn infer_guarded(
+        &self,
+        engine: &mut dyn PolicyEngine,
+        obs: &cascadia_types::Observation,
+    ) -> EngineResult<ActionChunk> {
+        let started = Instant::now();
+        let res = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| engine.infer(obs)))
+            .unwrap_or_else(|_| {
+                tracing::error!("policy engine panicked during infer");
+                Err(EngineError::Backend("internal error".into()))
+            });
+        let model = self.spec.model.as_str();
+        let result = match &res {
+            Ok(_) => {
+                cascadia_metrics::POLICY_INFER_DURATION_SECONDS
+                    .with_label_values(&[model])
+                    .observe(started.elapsed().as_secs_f64());
+                self.ready.store(true, Ordering::Relaxed);
+                "ok"
+            }
+            Err(EngineError::InvalidConfig(_)) => "invalid",
+            Err(_) => {
+                self.ready.store(false, Ordering::Relaxed);
+                "error"
+            }
+        };
+        cascadia_metrics::POLICY_INFERS_TOTAL
+            .with_label_values(&[model, result])
+            .inc();
+        res
+    }
 }
 
 #[derive(Clone)]
@@ -149,15 +180,30 @@ pub fn shared_policy_router(policy: SharedPolicy, cfg: PolicyServerConfig) -> Ro
         max_payload,
         cfg: Arc::new(cfg),
     };
+    cascadia_metrics::init();
     Router::new()
         .route("/health", get(health))
+        .route("/metrics", get(crate::metrics))
         .route("/v1/policy/metadata", get(metadata))
         .route("/v1/policy/ws", get(ws))
         .with_state(state)
+        .layer(axum::middleware::from_fn(crate::track_http_metrics))
 }
 
-async fn health() -> impl IntoResponse {
-    axum::Json(serde_json::json!({ "status": "ok" }))
+async fn health(State(st): State<PolicyState>) -> impl IntoResponse {
+    if st.policy.is_ready() {
+        (StatusCode::OK, Json(serde_json::json!({ "status": "ok" })))
+    } else {
+        (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(serde_json::json!({ "status": "degraded" })),
+        )
+    }
+}
+
+/// Chat's `{"error": ...}` shape for a refused upgrade.
+fn error_response(status: StatusCode, msg: String) -> Response {
+    (status, Json(serde_json::json!({ "error": msg }))).into_response()
 }
 
 async fn metadata(State(st): State<PolicyState>) -> impl IntoResponse {
@@ -177,11 +223,10 @@ async fn ws(
             .to_str()
             .is_ok_and(|o| st.cfg.allow_origins.iter().any(|a| a == o));
         if !ok {
-            return (
+            return error_response(
                 StatusCode::FORBIDDEN,
-                "this Origin may not open the policy socket (see --policy-allow-origin)",
-            )
-                .into_response();
+                "this Origin may not open the policy socket (see --policy-allow-origin)".into(),
+            );
         }
     }
     let upgrade = match upgrade {
@@ -189,14 +234,13 @@ async fn ws(
         Err(rejection) => return rejection.into_response(),
     };
     let Some(permit) = st.policy.try_slot() else {
-        return (
+        return error_response(
             StatusCode::SERVICE_UNAVAILABLE,
             format!(
                 "the policy server is full: {} connections are open",
                 st.policy.max_connections()
             ),
-        )
-            .into_response();
+        );
     };
     upgrade
         .max_message_size(st.max_payload)
@@ -255,8 +299,16 @@ async fn serve_socket(socket: WebSocket, st: PolicyState, slot: OwnedSemaphorePe
                                 return;
                             }
                             // openpi has no receive timeout, so a panic must still answer.
-                            let res = infer_guarded(&mut **engine, &obs).map_err(client_message);
+                            let res = policy.infer_guarded(&mut **engine, &obs);
                             drop(engine);
+                            match &res {
+                                Err(EngineError::InvalidConfig(m)) => {
+                                    tracing::info!(reason = %m, "policy request refused");
+                                }
+                                Err(e) => tracing::warn!(error = %e, "policy engine failed a request"),
+                                Ok(_) => {}
+                            }
+                            let res = res.map_err(client_message);
                             let _ = done.blocking_send(res);
                         });
                         None
