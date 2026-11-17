@@ -74,6 +74,21 @@ impl Engine for MockEngine {
                 Chunk::error(task.task_id, "mock injected engine failure"),
             )]);
         }
+        // Same for a request the engine refuses after accepting it.
+        for (sentinel, err) in [
+            (
+                "__invalid_request__",
+                EngineError::InvalidConfig("mock refused request".into()),
+            ),
+            (
+                "__prompt_too_long__",
+                EngineError::PromptTooLong("mock context is full".into()),
+            ),
+        ] {
+            if task.prompt.contains(sentinel) {
+                return Ok(vec![(task.task_id.clone(), err.to_chunk(task.task_id))]);
+            }
+        }
         let max = task.max_tokens.max(1) as usize;
         let words: Vec<&str> = task.prompt.split_whitespace().collect();
         if emitted >= max || emitted >= words.len() {

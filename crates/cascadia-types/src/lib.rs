@@ -14,7 +14,7 @@ pub mod shard;
 pub mod stats;
 pub mod task;
 
-pub use chunk::{Chunk, FinishReason, TokenLogprobs, TopLogprob};
+pub use chunk::{Chunk, ChunkErrorKind, FinishReason, TokenLogprobs, TopLogprob};
 pub use error::Error;
 pub use load::LoadProgress;
 pub use peer::{PeerEndpoint, PeerLayout};

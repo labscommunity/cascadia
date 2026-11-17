@@ -2332,6 +2332,13 @@ mod holdback_tests {
 mod tests {
     use super::*;
 
+    /// An interior NUL is the caller's string, reported as `Utf8` so the
+    /// engines answer it with a 400.
+    #[test]
+    fn interior_nul_is_a_utf8_error() {
+        assert!(matches!(cstr("a\0b"), Err(Error::Utf8(_))));
+    }
+
     #[cfg(not(feature = "openvino"))]
     #[test]
     fn stub_construct_returns_error() {
