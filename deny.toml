@@ -27,6 +27,16 @@ ignore = [
     # `insert_json5` keys (cascadia-api policy/zenoh_server.rs `secure_config`) and never read a config file or ZENOH_CONFIG.
     # Revisit on the zenoh bump above.
     "RUSTSEC-2024-0449",
+    # humantime 2.4.0 (unmaintained, no vulnerability) via uhlc 0.8.2 and zenoh-util 1.9.0, `zenoh` feature only; both require it
+    # unconditionally (`humantime ^2.2` / `^2.3`) and every humantime release is covered, so no bump clears it under `zenoh = "=1.9.0"`.
+    # Low exposure: it only formats and parses RFC 3339 timestamps inside zenoh (uhlc NTP64 Display/FromStr, zenoh-util time ranges);
+    # our code never hands it a time string. Revisit on the zenoh bump above, or when uhlc/zenoh-util drop humantime.
+    "RUSTSEC-2026-0542",
+    # chrono 0.4.44 (unmaintained, no vulnerability; every release covered, so no upgrade) — direct dep, also on main.
+    # Used only for wall-clock reads: `Utc::now().timestamp()` (cascadia-api response `created`, cascadia-download `pulled_at`)
+    # and `Utc::now().format(..)` in the chat-template `strftime_now` (cascadia-api); nothing parses untrusted input with it.
+    # cascadia-topology declares it but does not use it. Revisit by moving these call sites to jiff (already in the tree) or std time.
+    "RUSTSEC-2026-0543",
 ]
 # Never ship a version that has been yanked from the registry.
 yanked = "deny"
