@@ -202,8 +202,8 @@ pub enum Command {
     Doctor(DoctorArgs),
     /// Run a model on a single machine (sugar for a one-stage worker with an
     /// OpenAI API). Takes a local model directory — a whole-model OpenVINO IR,
-    /// or a `cascadia shard` tree — or, with `--engine ov-policy`, a robot
-    /// policy package served over an openpi-compatible WebSocket. See
+    /// or a `cascadia shard` tree — or, with `--engine ov-policy`, an exported
+    /// robot model served over an openpi-compatible WebSocket. See
     /// `cascadia run --help`.
     Run(RunArgs),
     /// Run a pipeline-stage worker.
@@ -245,8 +245,8 @@ pub enum Command {
     /// `cascadia completions --help`.
     Completions(CompletionsArgs),
     /// Serve physicalai's remote-inference protocol on loopback and forward
-    /// each call to an openpi policy server (`cascadia run --engine ov-policy`,
-    /// or a gateway in front of one). One bridge per physicalai client.
+    /// each call to a robot model's openpi WebSocket (`cascadia run --engine
+    /// ov-policy`, or a gateway in front of one). One bridge per physicalai client.
     /// Needs a build with `--features zenoh`.
     PolicyBridge(PolicyBridgeArgs),
 }
@@ -281,9 +281,9 @@ pub enum EngineKind {
     /// weight streaming (disk-tier O1), orthogonal to the host interposer.
     #[value(name = "sycl-llama")]
     SyclLlama,
-    /// Robot policy (VLA) engine: serves a `policy_package` (SmolVLA, pi0.5, pi0, X-VLA, EVO1,
-    /// VLA-JEPA, XR0, GR00T N1.7, MolmoAct2) over an openpi-compatible WebSocket. `cascadia run`
-    /// only.
+    /// Robot model (VLA policy) engine: serves an exported robot model (SmolVLA, pi0.5, pi0,
+    /// X-VLA, EVO1, VLA-JEPA, XR0, GR00T N1.7, MolmoAct2) over an openpi-compatible WebSocket.
+    /// `cascadia run` only.
     #[value(name = "ov-policy")]
     OvPolicy,
 }
@@ -824,14 +824,14 @@ pub struct WorkerArgs {
 /// It maps onto a one-stage [`WorkerArgs`]. For multi-machine pipeline
 /// parallelism, use `cascadia worker` directly.
 ///
-/// `--engine ov-policy` serves a robot policy instead: a local
-/// `policy_package` (`cascadia export-policy`) behind `/v1/policy/ws`,
+/// `--engine ov-policy` serves a robot model instead: a local export
+/// (`cascadia export-policy`) behind `/v1/policy/ws`,
 /// `/v1/policy/metadata`, `/health` and `/metrics`, with no chat routes.
 #[derive(Parser, Debug, Clone)]
 pub struct RunArgs {
     /// Local model directory: a whole-model OpenVINO IR (`optimum-cli export
     /// openvino`, or a pre-exported `*-int4-ov` download), a `cascadia shard`
-    /// tree, or for `--engine ov-policy` a `policy_package` directory. Not an
+    /// tree, or for `--engine ov-policy` an exported robot model. Not an
     /// HF repo id — `run` does not download or convert models.
     pub model: String,
 
@@ -868,14 +868,14 @@ pub struct RunArgs {
     #[arg(long, value_name = "ORIGIN")]
     pub policy_allow_origin: Vec<String>,
 
-    /// `--engine ov-policy` only: serve a package whose normalization stats
+    /// `--engine ov-policy` only: serve a robot model whose normalization stats
     /// are identity placeholders. For testing; actions from it are not usable.
     #[arg(long)]
     pub policy_allow_identity_stats: bool,
 
     /// `--engine ov-policy` only: also serve physicalai's remote-inference
     /// protocol over Zenoh, so `physicalai.inference.RemoteInferenceModel`
-    /// can drive the policy. `HOST:PORT`, or `HOST` for physicalai's
+    /// can drive the model. `HOST:PORT`, or `HOST` for physicalai's
     /// name-derived port. Unauthenticated: loopback only unless
     /// `--policy-allow-all-interfaces`. Needs a build with `--features zenoh`.
     #[arg(long, value_name = "HOST[:PORT]")]
@@ -996,7 +996,7 @@ pub struct PolicyBridgeArgs {
     #[arg(long, value_name = "HOST[:PORT]")]
     pub zenoh: String,
 
-    /// The upstream policy socket, e.g. `ws://127.0.0.1:8000/v1/policy/ws`.
+    /// The upstream robot model's socket, e.g. `ws://127.0.0.1:8000/v1/policy/ws`.
     #[arg(long, value_name = "URL")]
     pub upstream: String,
 
@@ -1593,7 +1593,7 @@ async fn cmd_run_policy(args: RunArgs) -> Result<()> {
         tokio::task::spawn_blocking(move || -> Result<(Box<dyn PolicyEngine>, Vec<u32>)> {
             let started = std::time::Instant::now();
             let mut engine = OvPolicyEngine::load(&dir, &opts)
-                .with_context(|| format!("loading policy package {}", dir.display()))?;
+                .with_context(|| format!("loading robot model {}", dir.display()))?;
             let load = started.elapsed();
             let started = std::time::Instant::now();
             let ms = engine.warmup().context("policy warmup")?;
@@ -1930,7 +1930,7 @@ fn cmd_engines() -> Result<()> {
     println!("  sparse-moe     sparse mixture-of-experts on CPU: Kimi K2.6 (AVX-512 int4 GEMM), MiniMax-M2 (OV-IR shells), GLM-5 / DeepSeek-V4 / Inkling (Rust shells + int4 mmap experts, N-rank pipeline)");
     println!("  sycl-llama     external llama.cpp SYCL server (GGUF, spawned subprocess); bin via --llama-bin / CASCADIA_LLAMA_BIN / PATH; --elastic = GGML_STREAM_WEIGHTS device-side streaming (needs a streaming build, scripts/build-llama-stream.sh)");
     println!("  qwen35         Qwen3.5-family staged chain (GatedDeltaNet; 3.5/3.6 MoE or 3.8 dense); qwen3_5* IR-surgery shards (alias: qwen36-moe)");
-    println!("  ov-policy      robot policy (VLA): SmolVLA / pi0.5 / pi0 / X-VLA / EVO1 / VLA-JEPA / XR0 / GR00T N1.7 / MolmoAct2 policy_package on GPU or CPU, openpi-compatible WebSocket; `cascadia run` only");
+    println!("  ov-policy      robot models (VLA policies): SmolVLA / pi0.5 / pi0 / X-VLA / EVO1 / VLA-JEPA / XR0 / GR00T N1.7 / MolmoAct2 on GPU or CPU, openpi-compatible WebSocket; `cascadia run` only");
     Ok(())
 }
 
@@ -5189,7 +5189,7 @@ mod tests {
         let mut cmd = Cli::command();
         let run = cmd.find_subcommand_mut("run").unwrap();
         let help = run.render_long_help().to_string();
-        assert!(help.contains("policy_package"), "{help}");
+        assert!(help.contains("an exported robot model"), "{help}");
         assert!(help.contains("ov-policy: GPU (or GPU.N) or CPU"), "{help}");
         let about = Cli::command()
             .find_subcommand("run")
@@ -5197,7 +5197,7 @@ mod tests {
             .get_about()
             .unwrap()
             .to_string();
-        assert!(about.contains("robot policy"), "{about}");
+        assert!(about.contains("robot model"), "{about}");
     }
 
     #[tokio::test]

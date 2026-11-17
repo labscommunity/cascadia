@@ -13,8 +13,8 @@ llama.cpp engine are documented here:
 - [`sycl-llama.md`](./sycl-llama.md) — external llama.cpp SYCL engine
   (GGUF via a spawned `llama-server`); `--elastic` = device-side weight
   streaming.
-- [`ov-policy.md`](./ov-policy.md) — robot policies (VLA): one
-  `policy_package` per process, `cascadia run` only, behind the sibling
+- [`ov-policy.md`](./ov-policy.md) — robot models (VLA policies): one
+  model per process, `cascadia run` only, behind the sibling
   `PolicyEngine` trait rather than `Engine`; serves
   `/v1/policy/metadata`, the openpi WebSocket `/v1/policy/ws` and,
   with `--zenoh`, Intel's physicalai protocol.

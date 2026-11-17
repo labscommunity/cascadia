@@ -19,11 +19,11 @@ on every subcommand. `--version` is only accepted on the top-level command.
 | Command | What it does |
 |---|---|
 | [`doctor`](#cascadia-doctor) | Check environment + hardware. **Run this first.** |
-| [`run`](#cascadia-run) | Serve a model on one machine (OpenAI API). |
+| [`run`](#cascadia-run) | Serve a model on one machine (OpenAI API, or a robot model with `--engine ov-policy`). |
 | [`worker`](#cascadia-worker) | Run one stage of a distributed pipeline. |
 | [`shard`](#cascadia-shard) | Export a model into per-stage OpenVINO IRs. |
 | [`export-policy`](#cascadia-export-policy) | Export a LeRobot SmolVLA or π0.5 checkpoint to a `policy_package`. |
-| [`policy-bridge`](#cascadia-policy-bridge) | Serve physicalai on loopback, forwarding to an openpi policy server. |
+| [`policy-bridge`](#cascadia-policy-bridge) | Serve physicalai on loopback, forwarding to a robot model's openpi WebSocket. |
 | [`engines`](#cascadia-engines) | List registered inference engines. |
 | [`discover`](#cascadia-discover) | List Cascadia peers on the LAN. |
 | [`profile-devices`](#cascadia-profile-devices) | Benchmark each OV device against one model. |
@@ -34,9 +34,9 @@ on every subcommand. `--version` is only accepted on the top-level command.
 
 **Models are never downloaded at run time.** `run` and `worker` take a *local
 directory*: a whole-model OpenVINO IR, a `cascadia shard` tree, or (for
-`--engine ov-policy`) a `policy_package`. Only the exporters fetch from
+`--engine ov-policy`) an exported robot model. Only the exporters fetch from
 HuggingFace: `cascadia shard` for language models and `cascadia export-policy`
-for robot policies. Passing an HF repo id to `run` or `worker` is an error.
+for robot models. Passing an HF repo id to `run` or `worker` is an error.
 
 Both exporters read `--model` the same way: written as a path (absolute, or
 starting with `./` or `../`), or not a valid `owner/name` id, it is a local
@@ -94,7 +94,7 @@ engine would ignore is refused: `--llama-*`, `--elastic-vram` and
 `--prefix-cache-gb` outside `qwen35`, `--ep-*` outside `sparse-moe`, and the
 policy flags below outside `ov-policy`.
 
-Robot policies (`--engine ov-policy`, see [engines/ov-policy.md](engines/ov-policy.md)):
+Robot models (`--engine ov-policy`, see [engines/ov-policy.md](engines/ov-policy.md)):
 
 | Flag | Default | Meaning |
 |---|---|---|
@@ -447,7 +447,7 @@ cascadia policy-bridge --zenoh <HOST[:PORT]> --upstream <URL> [OPTIONS]
 | Flag | Default | Meaning |
 |---|---|---|
 | `--zenoh <HOST[:PORT]>` | *required* | Loopback address the physicalai client connects to; no port means physicalai's name-derived one. |
-| `--upstream <URL>` | *required* | The policy socket, e.g. `ws://127.0.0.1:8000/v1/policy/ws`. |
+| `--upstream <URL>` | *required* | The robot model's socket, e.g. `ws://127.0.0.1:8000/v1/policy/ws`. |
 | `--token-file <PATH>` | none | A bearer token for the upstream, sent only over `wss://` or to loopback. |
 | `--ca-file <PEM>` | public roots | CA certificates to check a `wss://` upstream against, instead of the public web roots. |
 | `--zenoh-name <NAME>` | the upstream's policy name | The slot name the physicalai client is given, as on `run`. |
@@ -622,7 +622,7 @@ OpenVINO GPU plugin can see.
 | `gemma4` | `gemma4_cached_v1.x` shards | Per-layer-type asymmetric attention, KV-sharing, baked softcap; v1.1 masks sliding layers to their window (v1 trees warn at load). |
 | `sparse-moe` | `manifest.json` + expert tree | Top-k expert routing through an AVX-512 int4 GEMM. CPU-targeted; single-stage or pipeline-parallel (`--total >= 2`). |
 | `sycl-llama` | GGUF file | Spawns a llama.cpp SYCL `llama-server` and proxies its OpenAI API. Single-stage, batch=1. `--elastic` streams weights from the device side. |
-| `ov-policy` | `policy_package` | A robot policy (VLA) behind an openpi-compatible WebSocket, `/v1/policy/metadata`, `/health` and `/metrics`; no chat routes. `cascadia run` only; binds `127.0.0.1:8000` by default. |
+| `ov-policy` | `policy_package` | A robot model (VLA policy) behind an openpi-compatible WebSocket, `/v1/policy/metadata`, `/health` and `/metrics`; no chat routes. `cascadia run` only; binds `127.0.0.1:8000` by default. |
 | `qwen35` (alias `qwen36-moe`) | Qwen3.5-family surgery output (Qwen3.6 MoE, dense Qwen3.8) | Greedy-only, batch=1. CPU or iGPU decode. In-process prefix cache (`--prefix-cache-gb`, default min(16 GiB, RAM/4), 0 = off): system-block + chat-boundary state snapshots restored for prompts that extend a cached prefix. |
 
 Per-engine deep dives: [engines/](engines/). Per-family export notes:

@@ -280,7 +280,8 @@ async fn ws(
         if !ok {
             return error_response(
                 StatusCode::FORBIDDEN,
-                "this Origin may not open the policy socket (see --policy-allow-origin)".into(),
+                "this Origin may not open the robot model's socket (see --policy-allow-origin)"
+                    .into(),
             );
         }
     }

@@ -1,8 +1,8 @@
-# `ov-policy` — robot policies (VLA)
+# `ov-policy` — robot models
 
-`ov-policy` serves a vision-language-action (VLA) robot policy on one machine: one observation in
-(camera frames, robot state, an instruction), one action chunk `[T, D]` out. It runs OpenVINO
-`policy_package` exports on the OpenVINO runtime Cascadia already links, with no Python on the
+`ov-policy` serves a robot model (a vision-language-action, or VLA, policy) on one machine: one
+observation in (camera frames, robot state, an instruction), one action chunk `[T, D]` out. It runs
+robot models exported to OpenVINO (the `policy_package` format) on the OpenVINO runtime Cascadia already links, with no Python on the
 serving machine. It is not a chat engine: there is no `/v1/chat/completions`, no dashboard, and it
 runs only under `cascadia run`.
 
@@ -12,11 +12,11 @@ The full design, the package contract and the measurements are in
 
 ## When to use
 
-- You run a robot policy (SmolVLA, π0.5, π0, X-VLA, EVO1, VLA-JEPA, XR0, GR00T N1.7, MolmoAct2) on
+- You run a robot model (SmolVLA, π0.5, π0, X-VLA, EVO1, VLA-JEPA, XR0, GR00T N1.7, MolmoAct2) on
   an Intel GPU or CPU and want an openpi-compatible WebSocket, or Intel's physicalai protocol, with
   no Python on the serving machine.
-- One policy on one machine. For language models use the chat engines; for more than one machine,
-  no policy path exists (`cascadia worker` refuses `ov-policy`).
+- One robot model on one machine. For language models use the chat engines; for more than one
+  machine, no robot-model path exists (`cascadia worker` refuses `ov-policy`).
 
 ## Package format
 
@@ -55,7 +55,7 @@ cascadia export-policy --model lerobot/smolvla_libero --output-dir ./smolvla_lib
 cascadia run ./smolvla_libero --engine ov-policy
 ```
 
-`--engine ov-policy` is required (`run` defaults to `ov-genai`). The server loads the package, runs
+`--engine ov-policy` is required (`run` defaults to `ov-genai`). The server loads the model, runs
 three warmup calls, then listens on **`127.0.0.1:8000`**. The compile goes through the same
 OpenVINO cache as the chat engines (`cascadia/ov-cache` under the user cache directory), so a
 restart skips it; the cache never changes outputs.
@@ -81,8 +81,8 @@ as each chat engine refuses another engine's flags. Settings shared with chat ke
 connections across the WebSocket and Zenoh front ends (default 4, since a robot keeps its socket
 open); one more WebSocket is refused with HTTP 503.
 `--elastic` in particular is refused rather than ignored: its memory interposer has not been
-measured with a policy. `cascadia worker` refuses `ov-policy`: a policy is served by one process on
-one machine.
+measured with a robot model. `cascadia worker` refuses `ov-policy`: a robot model is served by one
+process on one machine.
 
 ## Front ends
 
@@ -92,7 +92,7 @@ f16, depending on the model; see the design doc's Scope section for each kind).
 
 ### openpi WebSocket
 
-- `GET /v1/policy/metadata`: the policy's spec as JSON (camera names, frame size, state length,
+- `GET /v1/policy/metadata`: the model's spec as JSON (camera names, frame size, state length,
   chunk `[T, D]`, noise mode, resize convention, RTC chunk size, package digests, precision,
   device).
 - `WS /v1/policy/ws`: openpi's framing (msgpack with `msgpack_numpy` arrays), so
@@ -124,15 +124,15 @@ The keys are Cascadia's, so openpi clients are transport-compatible, not drop-in
 for another server's keys needs a small mapping.
 
 **Frames are sent at the model's resolution.** The WebSocket does not resize: the client resizes on
-the robot with the package's convention, which the metadata states as `resize` (`center`,
+the robot with the model's convention, which the metadata states as `resize` (`center`,
 `top_left` or `stretch`). Sending a frame resized with the wrong padding gives silently wrong
 actions, not an error. `tools/vla_libero_client.py` has a reference resize for each convention.
 
 ### physicalai over Zenoh
 
-Intel's `physicalai` runtime runs a policy on another process or machine through
+Intel's `physicalai` runtime runs a robot model on another process or machine through
 `RemoteInferenceModel`. With `--zenoh`, Cascadia serves that protocol next to the WebSocket, so code
-written against `RemoteInferenceModel` drives a Cascadia policy unchanged:
+written against `RemoteInferenceModel` drives a Cascadia robot model unchanged:
 
 ```bash
 cascadia run /models/smolvla-libero-ov --engine ov-policy --zenoh 127.0.0.1
@@ -140,7 +140,7 @@ cascadia run /models/smolvla-libero-ov --engine ov-policy --zenoh 127.0.0.1
 
 Without a port, the server listens on physicalai's name-derived port, which the client dials when
 it is given none. This front end resizes frames for its clients (physicalai sends frames at the
-camera's resolution) where the package's resize is ported exactly, and otherwise refuses a frame of
+camera's resolution) where the model's resize is ported exactly, and otherwise refuses a frame of
 another size with a message naming the size to send. One physicalai client is served at a time,
 with physicalai's budget and superseding rules.
 
@@ -171,19 +171,19 @@ cascadia policy-bridge --zenoh 127.0.0.1:7447 \
 - `--zenoh-name` sets the slot name, as on `run`; it defaults to the upstream's policy name.
 
 One bridge serves one physicalai client. It ships in the same builds as `--zenoh`. Its loopback
-port has no authentication: any process on the same host can call the remote policy through it,
+port has no authentication: any process on the same host can call the remote model through it,
 with the bridge's token. Run it only on a host you trust, such as the robot's own machine.
 
 ## Real-time chunking (RTC)
 
-A package exported with RTC (SmolVLA and π0.5 first) takes four more request fields:
+A model exported with RTC (SmolVLA and π0.5 first) takes four more request fields:
 `prev_chunk_left_over` (the not-yet-executed part of the previous chunk, `[T, D]`),
 `inference_delay`, `execution_horizon` and `max_guidance_weight`, all four or none. The robot keeps
 executing while the next chunk is computed, and the new chunk is pinned to what it has not executed
 yet, which removes most of the jump between chunks. The server keeps no state: the client sends the
 leftover with every call, so any call can go to any server. Without the fields (or at weight 0) an
-RTC package behaves like a plain one. The metadata's `rtc_chunk_size` is non-null for an RTC
-package, and a package without RTC refuses the fields. Details and measurements: the design doc's
+RTC model behaves like a plain one. The metadata's `rtc_chunk_size` is non-null for an RTC
+model, and a model without RTC refuses the fields. Details and measurements: the design doc's
 "Real-time chunking" section.
 
 ## Limitations
@@ -213,8 +213,8 @@ with the install or update command: serving needs no uv).
 
 ## Security
 
-The policy API has **no authentication and no TLS**, like the chat API (see
-[`../../SECURITY.md`](../../SECURITY.md)). A policy drives a robot, so the defaults are narrower:
+The robot model API has **no authentication and no TLS**, like the chat API (see
+[`../../SECURITY.md`](../../SECURITY.md)). A robot model drives a robot, so the defaults are narrower:
 
 - **Loopback only, unless you opt in.** `--engine ov-policy` binds `127.0.0.1:8000` unless `--api`
   is given, and both `--api` and `--zenoh` refuse a non-loopback host unless
@@ -229,11 +229,11 @@ The policy API has **no authentication and no TLS**, like the chat API (see
   `--policy-allow-origin` (empty by default) is refused, so a web page in a browser on the same
   machine cannot open the socket. Clients that send no `Origin` (robots, scripts) are always
   allowed: it is a guard against browsers, not authentication.
-- **Packages are code-adjacent: load them only from sources you trust.** A package is not
+- **Model files: load them only from sources you trust**, as for chat models. A robot model is not
   executable code, but its IRs are parsed and compiled by OpenVINO and the tokenizer extension, which
   are not hardened against hostile files, and its manifest decides how observations are transformed
-  and how actions are scaled. A tampered package can make the robot move wrongly with no error.
-  The metadata's `package_sha256` covers every file in the package except a top-level `.cache`
+  and how actions are scaled. A tampered model can make the robot move wrongly with no error.
+  The metadata's `package_sha256` covers every file in the model's folder except a top-level `.cache`
   folder (the per-download timestamps `hf download --local-dir` writes, so two servers that
-  downloaded one revision match); compare it with the digest of the package you vetted. A manifest
+  downloaded one revision match); compare it with the digest of the model you vetted. A manifest
   that names a path under `.cache` is refused at load, so nothing the engine reads is left out.

@@ -256,7 +256,7 @@ fn refused_text(e: EngineError) -> EngineError {
 }
 
 fn refuse<T>(msg: impl std::fmt::Display) -> EngineResult<T> {
-    Err(EngineError::InvalidConfig(format!("policy model: {msg}")))
+    Err(EngineError::InvalidConfig(format!("robot model: {msg}")))
 }
 
 /// `--ov-inference-precision` on ov-policy: GPU compute precision. CPU always runs f32.
@@ -1224,7 +1224,7 @@ impl PolicyPipeline {
                 host.embodied_positions(&tokenizer.tokenize(&text)?.ids)
                     .map_err(|e| match e {
                         EngineError::InvalidConfig(m) => {
-                            EngineError::InvalidConfig(format!("policy model: the empty task: {m}"))
+                            EngineError::InvalidConfig(format!("robot model: the empty task: {m}"))
                         }
                         other => other,
                     })?;

@@ -584,7 +584,7 @@ pub fn cmd_doctor(args: DoctorArgs) -> Result<()> {
         Level::Ok | Level::Info => {
             println!(
                 "All good. Try:  cascadia run <model-dir>   (export one first: cascadia shard \
-                 --help, or for a robot policy cascadia export-policy --help)"
+                 --help, or for a robot model cascadia export-policy --help)"
             );
         }
         Level::Warn => {
