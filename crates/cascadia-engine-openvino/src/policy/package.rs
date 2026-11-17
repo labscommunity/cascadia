@@ -118,8 +118,8 @@ pub(crate) fn check_not_skipped(dir: &Path, rels: &[PathBuf]) -> Result<(), Engi
             .and_then(|r| r.components().next());
         if first.is_some_and(|c| c.as_os_str().eq_ignore_ascii_case(SKIPPED_DIR)) {
             return Err(EngineError::InvalidConfig(format!(
-                "package file {} resolves into the top-level .cache directory, which \
-                 package_sha256 skips",
+                "model file {} resolves into the top-level .cache folder, which the model's \
+                 identity (package_sha256) skips",
                 rel.display()
             )));
         }
@@ -184,7 +184,7 @@ pub fn check_digest_ignore(
         {
             return Err(EngineError::InvalidConfig(format!(
                 "digest_ignore names {n:?}, which the engine may read; it must stay in the \
-                 package identity"
+                 model's identity"
             )));
         }
     }
@@ -225,13 +225,13 @@ fn hex(b: &[u8]) -> String {
 }
 
 fn at(rel: &str, e: std::io::Error) -> std::io::Error {
-    std::io::Error::new(e.kind(), format!("package file {rel}: {e}"))
+    std::io::Error::new(e.kind(), format!("model file {rel}: {e}"))
 }
 
 fn refuse(rel: &str, why: &str) -> std::io::Error {
     std::io::Error::new(
         std::io::ErrorKind::InvalidData,
-        format!("package entry {rel} {why}; the package identity cannot cover it"),
+        format!("model file {rel} {why}; the model's identity (package_sha256) cannot cover it"),
     )
 }
 
@@ -560,8 +560,14 @@ mod tests {
         for bad in ["linked/m.xml", "m.xml"] {
             let e = check_not_skipped(&a, &rels(&["manifest.json", bad])).unwrap_err();
             assert!(matches!(e, EngineError::InvalidConfig(_)), "{bad}: {e}");
-            assert!(e.to_string().contains(bad), "{bad}: {e}");
-            assert!(e.to_string().contains(".cache"), "{bad}: {e}");
+            assert_eq!(
+                e.to_string(),
+                format!(
+                    "invalid configuration: model file {bad} resolves into the top-level .cache folder, \
+                     which the model's identity (package_sha256) skips"
+                ),
+                "{bad}"
+            );
         }
     }
 
@@ -671,6 +677,15 @@ mod tests {
         use cascadia_engine::EngineError;
         let dir = Path::new("pkg");
         let refusal = refuse("x", "is a dangling symlink");
+        assert_eq!(
+            refusal.to_string(),
+            "model file x is a dangling symlink; the model's identity (package_sha256) cannot \
+             cover it"
+        );
+        assert_eq!(
+            at("ir/policy.bin", std::io::Error::other("busy")).to_string(),
+            "model file ir/policy.bin: busy"
+        );
         assert!(matches!(
             digest_error(dir, refusal),
             EngineError::InvalidConfig(_)
@@ -780,7 +795,13 @@ mod tests {
         ] {
             let e = check_digest_ignore(&m, &[read.to_string()]).unwrap_err();
             assert!(matches!(e, EngineError::InvalidConfig(_)), "{read}");
-            assert!(e.to_string().contains("engine"), "{read}: {e}");
+            assert!(
+                e.to_string().ends_with(&format!(
+                    "digest_ignore names {read:?}, which the engine may read; it must stay in the \
+                     model's identity"
+                )),
+                "{read}: {e}"
+            );
         }
         check_digest_ignore(&m, &[".staging-sha256".into()]).unwrap();
         // Not a plain name: refused the same way.

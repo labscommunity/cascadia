@@ -1057,7 +1057,7 @@ pub fn confine_artifact(path: &str) -> EngineResult<String> {
         // `C:x` and `C:\x` are drive paths; `a:b` is an NTFS stream.
         Some("has a drive letter or stream (':')")
     } else if path.split(['/', '\\']).any(|c| c == "..") {
-        Some("escapes the package directory ('..')")
+        Some("escapes the model folder ('..')")
     } else if path.split(['/', '\\']).any(|c| c.is_empty() || c == ".") {
         // So the first component is the directory `Path::join` opens.
         Some("has an empty or '.' component")
@@ -1072,7 +1072,7 @@ pub fn confine_artifact(path: &str) -> EngineResult<String> {
     {
         // The package identity skips it; reading it would let two packages
         // that compute different actions match.
-        Some("is under the top-level .cache directory, which package_sha256 skips")
+        Some("is under the top-level .cache folder, which the model's identity (package_sha256) skips")
     } else {
         None
     };
@@ -3307,7 +3307,15 @@ mod tests {
 
         let mut v = base();
         v["model"]["artifacts"]["openvino"] = json!("../pi05.xml");
-        assert!(err(&v).contains("escapes"));
+        assert!(err(&v).contains("escapes the model folder ('..')"));
+        let e = confine_artifact(".cache/x.xml").unwrap_err().to_string();
+        assert!(
+            e.contains(
+                "is under the top-level .cache folder, which the model's identity \
+                 (package_sha256) skips"
+            ),
+            "{e}"
+        );
         let mut v = base();
         v["model"]["preprocessors"][2]["artifact"] = json!("/tmp/tokenizer.xml");
         assert!(err(&v).contains("absolute"));
