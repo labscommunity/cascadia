@@ -78,8 +78,11 @@ set +u
 source "$ONEAPI_ROOT/setvars.sh" --force >/dev/null
 set -u
 
+# GGML_NATIVE=OFF: the bundle must run on any x86-64 CPU, not just the builder.
+# A runner with AVX-512 produces libggml-cpu.so that dies with SIGILL elsewhere.
 cmake -B build \
     -DGGML_SYCL=ON \
+    -DGGML_NATIVE=OFF \
     -DCMAKE_C_COMPILER=icx \
     -DCMAKE_CXX_COMPILER=icpx \
     -DCMAKE_BUILD_TYPE=Release
