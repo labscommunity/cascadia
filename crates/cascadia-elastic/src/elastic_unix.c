@@ -25,6 +25,8 @@
  *
  * Env:  ELASTIC_MIN_MB   threshold in MB (default 1)
  *       ELASTIC_DIR      backing dir for the tmpfiles (default $TMPDIR or /tmp)
+ *       ELASTIC_ALLOW_TMPFS=1  keep a tmpfs/ramfs backing dir (only correct
+ *                        where the host can swap shmem out)
  *       ELASTIC_POOL_MB  max retained-mapping bytes (default 8192; 0 = no pool)
  *       ELASTIC_LOG=1    print counters at exit
  *
@@ -103,6 +105,103 @@ static void *boot_alloc(size_t sz) {
 }
 
 static pthread_once_t init_once = PTHREAD_ONCE_INIT;
+/* Backing-dir resolution. Runs inside do_init/pthread_once, where an allocation
+ * re-enters the hook and deadlocks, so this uses only calls that never allocate
+ * in glibc: statfs/open/ftruncate/close/getenv/strcmp/strnlen/snprintf/write.
+ *
+ * tmpfs/ramfs must be escaped: its O_TMPFILE pages are shmem, so under MemoryMax
+ * without swap they are never reclaimed and --elastic does nothing while RssAnon
+ * still collapses. g_dir feeds both legs; an explicit ELASTIC_DIR is escaped too.
+ * (overlayfs over tmpfs reports OVERLAYFS_SUPER_MAGIC and is not detected.) */
+static int dir_is_memory_backed(const char *dir) {   /* -1 unknown, 1 = memory */
+    struct statfs st;
+    if (!dir || statfs(dir, &st) != 0)
+        return errno == EOVERFLOW ? 0 : -1;   /* 32-bit huge fs: usable */
+    return st.f_type == TMPFS_MAGIC || st.f_type == RAMFS_MAGIC;
+}
+
+/* Probes the calls both allocation paths need (mmap is the third); also rejects
+ * NFS/FUSE without O_TMPFILE and unwritable dirs. */
+static int dir_usable(const char *dir) {
+    if (!dir) return 0;
+    int fd = open(dir, O_TMPFILE | O_RDWR | O_EXCL, 0600);
+    if (fd < 0) return 0;
+    int ok = ftruncate(fd, (off_t)(1UL << 20)) == 0;
+    close(fd);
+    return ok;
+}
+
+static unsigned long long dir_free_bytes(const char *dir) {
+    struct statfs st;
+    if (!dir || statfs(dir, &st) != 0) return 0;
+    return (unsigned long long)st.f_bavail * (unsigned long long)st.f_frsize;
+}
+
+static void warn_write(const char *msg, size_t cap) {   /* write(), not fprintf() */
+    size_t n = strnlen(msg, cap);
+    if (n) (void)!write(STDERR_FILENO, msg, n);
+}
+
+/* Fallback needs free space for the unlinked pool extents plus 1 GB headroom.
+ * Whole GB in the message: no %f inside do_init. */
+static void resolve_backing_dir(void) {
+    static char home_cache[PATH_MAX];
+    static char m[4 * PATH_MAX + 320];    /* static: do_init may be a shallow thread */
+    int mem = dir_is_memory_backed(g_dir);
+
+    if (mem < 0) {
+        snprintf(m, sizeof m, "cascadia: elastic WARNING: backing dir %s is"
+            " missing or unreadable, so big allocations fall back to anonymous"
+            " memory and --elastic does nothing. Set ELASTIC_DIR.\n", g_dir);
+        warn_write(m, sizeof m);
+        return;
+    }
+    if (!mem) {                           /* disk-backed: must still be usable */
+        if (dir_usable(g_dir)) return;
+        snprintf(m, sizeof m, "cascadia: elastic WARNING: backing dir %s cannot"
+            " hold an O_TMPFILE (unwritable, read-only, or unsupported), so big"
+            " allocations fall back to anonymous memory and --elastic does"
+            " nothing. Set ELASTIC_DIR to a usable dir.\n", g_dir);
+        warn_write(m, sizeof m);
+        return;
+    }
+    const char *allow = getenv("ELASTIC_ALLOW_TMPFS");
+    if (allow && *allow == '1') {
+        snprintf(m, sizeof m, "cascadia: elastic WARNING: %s is tmpfs/ramfs;"
+            " those pages are shmem, so under MemoryMax without swap --elastic"
+            " gives no protection. Allowed by ELASTIC_ALLOW_TMPFS=1.\n", g_dir);
+        warn_write(m, sizeof m);
+        return;
+    }
+
+    home_cache[0] = '\0';
+    const char *h = getenv("HOME");
+    if (h && *h) snprintf(home_cache, sizeof home_cache, "%s/.cache", h);
+    const char *cand[] = { "/var/tmp", home_cache, NULL };
+    unsigned long long need = (unsigned long long)g_pool_cap + (1ULL << 30);
+
+    for (int i = 0; cand[i]; i++) {
+        if (!*cand[i] || strcmp(cand[i], g_dir) == 0) continue;
+        if (dir_is_memory_backed(cand[i]) != 0) continue;
+        if (!dir_usable(cand[i])) continue;
+        if (dir_free_bytes(cand[i]) < need) continue;
+        snprintf(m, sizeof m, "cascadia: elastic: %s is tmpfs/ramfs, so"
+            " --elastic would give no protection; using %s instead."
+            " Set ELASTIC_DIR to choose, or ELASTIC_ALLOW_TMPFS=1 to keep %s.\n",
+            g_dir, cand[i], g_dir);
+        warn_write(m, sizeof m);
+        g_dir = cand[i];
+        return;
+    }
+
+    snprintf(m, sizeof m, "cascadia: elastic WARNING: %s is tmpfs/ramfs and"
+        " no disk-backed dir with O_TMPFILE and %u GB free was found, so"
+        " --elastic gives no protection under MemoryMax without swap."
+        " Set ELASTIC_DIR or ELASTIC_ALLOW_TMPFS=1.\n",
+        g_dir, (unsigned)(need >> 30));
+    warn_write(m, sizeof m);
+}
+
 static void do_init(void) {
     g_in_init = 1;
     real_malloc         = dlsym(RTLD_NEXT, "malloc");
@@ -122,22 +221,15 @@ static void do_init(void) {
     if ((v = getenv("ELASTIC_DIR")) && *v) g_dir = v;
     else if ((v = getenv("TMPDIR")) && *v) g_dir = v;
     g_pool_cap = 8UL << 30;
-    if ((v = getenv("ELASTIC_POOL_MB")) && atol(v) >= 0)
-        g_pool_cap = (size_t)atol(v) << 20;
+    if ((v = getenv("ELASTIC_POOL_MB")) && atol(v) >= 0) {
+        unsigned long long mb = strtoull(v, NULL, 10);
+        if (mb > (1ULL << 20)) mb = 1ULL << 20;      /* clamp at 1 TiB */
+        g_pool_cap = (size_t)mb << 20;
+    }
     g_log = (v = getenv("ELASTIC_LOG")) && *v == '1';
     g_mmap_on = !((v = getenv("ELASTIC_MMAP")) && *v == '0');
-    /* Fail-loud guard: on tmpfs/ramfs the written pages can never reach a
-     * disk, so the posture silently gives no survival benefit under a
-     * memory cap (measured: dies at the same caps as stock while RssAnon
-     * still collapses). A user who asked for --elastic deserves the warn. */
-    struct statfs st;
-    if (statfs(g_dir, &st) == 0
-        && (st.f_type == TMPFS_MAGIC || st.f_type == RAMFS_MAGIC))
-        fprintf(stderr,
-                "cascadia: elastic WARNING: backing dir %s is on tmpfs/ramfs —"
-                " pages cannot be written back, so --elastic gives NO OOM"
-                " protection. Point ELASTIC_DIR at a disk-backed dir"
-                " (ext4/xfs).\n", g_dir);
+    /* A memory-backed dir makes the posture a no-op under a cap: escape it. */
+    resolve_backing_dir();
     /* Same warning, different failure mode: on a rotational device the
      * mechanism still works, but the page-ins are seek-bound, so "slow but
      * alive" degrades into "dead". Decode re-reads every weight on every
