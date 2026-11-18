@@ -29,6 +29,7 @@
 #include <openvino/genai/tokenizer.hpp>
 #include <openvino/genai/visual_language/pipeline.hpp>
 #include <openvino/genai/continuous_batching_pipeline.hpp>
+#include <openvino/genai/scheduler_config.hpp>
 #include <openvino/genai/chat_history.hpp>
 #include <openvino/genai/version.hpp>
 #include <openvino/core/version.hpp>
@@ -248,6 +249,17 @@ int32_t cascadia_debug_property_int64_kind(
 
 // ===================== LLMPipeline (genai) =====================
 
+// GenAI 2026.4.1 asserts `!m_scheduler->get_config().enable_prefix_caching` inside its
+// draft-model (speculative) and prompt-lookup continuous-batching implementations, while the
+// LLMPipeline's default SchedulerConfig has prefix caching ON — so the SECOND request with the
+// same prompt (a prefix-cache hit) died on that Check. Those pipeline kinds get an explicit
+// SchedulerConfig with prefix caching off (dynamic_split_fuse / cache_size at their defaults).
+static ov::genai::SchedulerConfig speculative_scheduler_config() {
+    ov::genai::SchedulerConfig sched;
+    sched.enable_prefix_caching = false;
+    return sched;
+}
+
 int32_t cascadia_pipeline_create(
     const char* model_path, const char* device,
     const char* const* properties_kv, size_t properties_count,
@@ -284,6 +296,7 @@ int32_t cascadia_pipeline_create_with_draft(
         auto draft_kv = ov::genai::draft_model(
             std::filesystem::path(draft_model_path), draft_dev);
         props.emplace(draft_kv.first, draft_kv.second);
+        props[ov::genai::scheduler_config.name()] = speculative_scheduler_config();
         auto pipe = std::make_unique<ov::genai::LLMPipeline>(
             std::filesystem::path(model_path), std::string(device), props);
         *out_handle = new cascadia_pipeline_t{std::move(pipe)};
@@ -306,6 +319,7 @@ int32_t cascadia_pipeline_create_with_prompt_lookup(
     try {
         auto props = collect_properties(properties_kv, properties_count);
         props[ov::genai::prompt_lookup.name()] = true;
+        props[ov::genai::scheduler_config.name()] = speculative_scheduler_config();
         auto pipe = std::make_unique<ov::genai::LLMPipeline>(
             std::filesystem::path(model_path), std::string(device), props);
         *out_handle = new cascadia_pipeline_t{std::move(pipe)};
@@ -329,6 +343,8 @@ int32_t cascadia_pipeline_create_vlm(
         auto props = collect_properties(properties_kv, properties_count);
         if (enable_prompt_lookup) {
             props[ov::genai::prompt_lookup.name()] = true;
+            // Same GenAI 2026.4.1 assertion as the LLM path: prompt lookup refuses prefix caching.
+            props[ov::genai::scheduler_config.name()] = speculative_scheduler_config();
         }
         auto vlm = std::make_unique<ov::genai::VLMPipeline>(
             std::filesystem::path(model_path), std::string(device), props);

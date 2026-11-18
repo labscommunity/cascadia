@@ -32,6 +32,13 @@ silently. See docs/architectures/qwen35-gptq-ir-builder.md.
    `--skip-nonexpert --skip-aux --layers 0,1` with an official IR as `--template` splices GPTQ experts
    into Intel's IR for A/B tests. `--dry-map` reports the constant mapping only.
 
+   **GPU-served trees need `--expert-sym`.** The OpenVINO 2026.4.1 GPU plugin's MoE fusion
+   (`MOECompressed`) rejects the u4 + uniform-zero-point expert constants above (the CPU plugin takes
+   them). With `--expert-sym` the expert stacks are emitted as signed i4 without a zero point —
+   `i4 [E,out,groups,128] → Convert → Multiply(scale) → Reshape`, packed bytes = the u4 bytes XOR 0x88 —
+   which carries exactly the same values (NNCF's INT4_SYM pattern; `i4pack.py`, unit-tested in
+   `tools/tests/test_gptq_expert_sym.py`). Non-expert weights and the default output are unchanged.
+
 3. **Check**: `gen_check.py <ir_dir>` (greedy text), `compare_irs.py <ir_A> <ir_B>` (logits + greedy parity),
    or OpenVINO GenAI `VLMPipeline` for image+text. Then `../export_qwen36_moe.py --model <ir_dir> --out
    <stages> --total N --validate` cuts stage shards for `cascadia run --engine qwen36-moe`.

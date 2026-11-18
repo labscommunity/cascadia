@@ -405,10 +405,22 @@ fn check_ov_version(r: &mut Report) {
     }
 }
 
+/// `GPU_DEVICE_TOTAL_MEM_SIZE` of an OpenVINO GPU device, in bytes (`None` when the plugin
+/// does not report a bare byte count — or in a stub build).
+fn gpu_total_mem(device: &str) -> Option<u64> {
+    cascadia_ov_genai_shim::device_property(device, "GPU_DEVICE_TOTAL_MEM_SIZE")
+        .ok()?
+        .trim()
+        .parse()
+        .ok()
+}
+
 /// The heart of `doctor`: what devices can the OpenVINO runtime in THIS
 /// binary actually reach? Only meaningful when built with the openvino
-/// feature; the stub build reports that it can't check.
-fn check_ov_devices(r: &mut Report) {
+/// feature; the stub build reports that it can't check. Returns each GPU
+/// device's `GPU_DEVICE_TOTAL_MEM_SIZE` for the WDDM budget check.
+fn check_ov_devices(r: &mut Report) -> Vec<(String, u64)> {
+    let mut gpu_totals: Vec<(String, u64)> = Vec::new();
     if !cfg!(feature = "openvino") {
         r.line(
             Level::Info,
@@ -417,7 +429,7 @@ fn check_ov_devices(r: &mut Report) {
         );
         r.note("OpenVINO engines need --features openvino; `mock` and `sycl-llama` do not.");
         r.note("For GGUF inference, build the patched SYCL child and check the sycl-llama section below. See INSTALL.md.");
-        return;
+        return gpu_totals;
     }
 
     match cascadia_ov_genai_shim::list_devices() {
@@ -440,6 +452,17 @@ fn check_ov_devices(r: &mut Report) {
             for d in &devices {
                 if let Ok(full) = cascadia_ov_genai_shim::device_full_name(d) {
                     r.note(&format!("{d}: {full}"));
+                }
+                // The GPU plugin's own idea of the device's memory. On Windows the WDDM check
+                // that follows says whether that much can actually be resident.
+                if d.starts_with("GPU") {
+                    if let Some(total) = gpu_total_mem(d) {
+                        r.note(&format!(
+                            "{d}: GPU_DEVICE_TOTAL_MEM_SIZE {:.2} GiB",
+                            crate::wddm::gib(total)
+                        ));
+                        gpu_totals.push((d.clone(), total));
+                    }
                 }
             }
             if !has_accel {
@@ -473,7 +496,83 @@ fn check_ov_devices(r: &mut Report) {
             r.note("  source $INTEL_OPENVINO_DIR/setupvars.sh   (sets LD_LIBRARY_PATH)");
         }
     }
+    gpu_totals
 }
+
+/// Windows: what WDDM will actually let a process keep resident on each GPU, next to what
+/// OpenVINO reports. On Intel iGPUs the two can disagree — `GPU_DEVICE_TOTAL_MEM_SIZE` follows
+/// the driver's GMM pinning limit, residency follows dxgkrnl's per-process budget (see
+/// `crate::wddm`) — and a stage sized to the OpenVINO number pages.
+#[cfg(windows)]
+fn check_gpu_budget(r: &mut Report, ov_gpu_totals: &[(String, u64)]) {
+    use crate::wddm::{self, gib};
+    let budgets = match wddm::query_gpu_budgets() {
+        Ok(b) => b,
+        Err(e) => {
+            r.line(Level::Info, "WDDM GPU budget", &format!("unavailable: {e}"));
+            return;
+        }
+    };
+    if budgets.is_empty() {
+        r.line(
+            Level::Info,
+            "WDDM GPU budget",
+            "no hardware display adapter reported",
+        );
+        return;
+    }
+    for b in &budgets {
+        r.line(
+            Level::Ok,
+            "WDDM GPU budget",
+            &format!(
+                "adapter {}: shared segment {:.2} GiB, per-process budget {:.2} GiB \
+                 ({:.2} GiB in use by this process)",
+                b.luid,
+                gib(b.shared_system_bytes),
+                gib(b.budget_bytes),
+                gib(b.current_usage_bytes)
+            ),
+        );
+    }
+    let Some(budget) = wddm::largest_budget(&budgets) else {
+        return;
+    };
+    for (dev, total) in ov_gpu_totals {
+        if *total > budget {
+            r.line(
+                Level::Warn,
+                &format!("{dev} memory"),
+                &format!(
+                    "OpenVINO total {:.2} GiB exceeds the WDDM per-process budget {:.2} GiB",
+                    gib(*total),
+                    gib(budget)
+                ),
+            );
+            r.note("GPU_DEVICE_TOTAL_MEM_SIZE follows the Intel driver's GMM pinning limit, but residency");
+            r.note("is capped by dxgkrnl's per-process budget: a stage sized to the OpenVINO number pages");
+            r.note("(measured 17x slower decode). Raise the budget (DWORD, percent of RAM; Intel's INF");
+            r.note("installs 57; 85 is the measured setting for 32 GB boxes), then reboot:");
+            r.note(
+                r"  HKLM\SYSTEM\CurrentControlSet\Control\GraphicsDrivers\MemoryManager\SystemPartitionCommitLimitPercentage",
+            );
+        } else {
+            r.line(
+                Level::Ok,
+                &format!("{dev} memory"),
+                &format!(
+                    "OpenVINO total {:.2} GiB within the WDDM per-process budget {:.2} GiB",
+                    gib(*total),
+                    gib(budget)
+                ),
+            );
+        }
+    }
+}
+
+/// WDDM is Windows-only; elsewhere the OpenVINO total is the only number there is.
+#[cfg(not(windows))]
+fn check_gpu_budget(_r: &mut Report, _ov_gpu_totals: &[(String, u64)]) {}
 
 pub fn cmd_doctor(args: DoctorArgs) -> Result<()> {
     println!("cascadia doctor — environment + hardware self-check\n");
@@ -487,7 +586,8 @@ pub fn cmd_doctor(args: DoctorArgs) -> Result<()> {
     println!("\nOpenVINO:");
     check_openvino_env(&mut r);
     check_ov_version(&mut r);
-    check_ov_devices(&mut r);
+    let gpu_totals = check_ov_devices(&mut r);
+    check_gpu_budget(&mut r, &gpu_totals);
 
     println!("\nsycl-llama:");
     check_sycl_llama(&mut r);

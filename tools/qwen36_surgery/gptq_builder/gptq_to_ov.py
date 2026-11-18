@@ -10,6 +10,10 @@ Inputs
 Expert weights: GPTQ (sym, group 128, zp=8, trivial g_idx) nibbles are repacked into Intel's layout
   u4 [E, out, groups, 128]  ->  Convert(f16) -> Subtract(zp u4=8 -> f16) -> Multiply(scales f16 [E,out,groups,1]) -> Reshape [E,out,in]
 exactly the decompression pattern of the official OpenVINO/Qwen3.5-*-int4-ov IRs. No re-quantization.
+With --expert-sym the expert stacks are emitted as signed i4 WITHOUT a zero point instead:
+  i4 [E, out, groups, 128]  ->  Convert(f16) -> Multiply(scales) -> Reshape        (packed bytes = u4 bytes XOR 0x88, see i4pack.py)
+Same values, no Subtract. Required for the OpenVINO 2026.4.1 GPU plugin, whose MoE fusion (MOECompressed) rejects the
+uniform-zero-point form; the CPU plugin takes both. The default output is unchanged.
 Non-expert weights (attention, linear-attn, norms, router, shared expert, embeddings, lm_head, vision) are copied bf16->f16 1:1 and,
 with --compress int4|int8, compressed afterwards by nncf (per Intel's recipe) while the already-integer expert constants are left alone.
 """
@@ -17,6 +21,8 @@ import argparse, json, os, re, shutil, struct, sys, time
 import numpy as np
 import openvino as ov
 from openvino import opset13 as ops
+
+from i4pack import u4_to_i4_packed
 
 # ----------------------------------------------------------------------------- safetensors (no torch)
 DT = {"F16": np.float16, "BF16": np.uint16, "F32": np.float32, "I32": np.int32, "I64": np.int64, "U8": np.uint8, "I8": np.int8}
@@ -113,16 +119,40 @@ def u4_constant(packed_bytes, shape, name):
     return c
 
 
+EXPERT_SYM = False  # --expert-sym: emit the expert stacks as signed i4 without a zero point instead of u4 + zp=8
+
+
+def i4_constant(packed_u4_bytes, shape, name, zp=8):
+    """GPTQ sym nibbles (zp=8) as a signed i4 Constant with the same per-weight values as u4_constant + a zero point of 8:
+    the two's-complement nibble of (q - 8) is q ^ 0x8, so the packed stream is the u4 stream XOR 0x88 (i4pack.py)."""
+    arr = u4_to_i4_packed(packed_u4_bytes, zp)
+    _KEEP.append(arr)  # as for u4_constant: the Constant shares this buffer, which must outlive the model
+    t = ov.Tensor(arr, ov.Shape(list(shape)), ov.Type.i4)
+    c = ov.op.Constant(t, shared_memory=True)
+    c.set_friendly_name(name)
+    return c
+
+
 def decompression_chain(packed, scales, shape, name, zp=8):
     E, out, inn = shape
     G = scales.shape[2]
-    w = u4_constant(packed, (E, out, G, 128), name)
-    zpb = np.full((E * out * G + 1) // 2, (zp << 4) | zp, dtype=np.uint8)
-    z = u4_constant(zpb, (E, out, G, 1), name + "/zero_point")
     scales = np.ascontiguousarray(scales)
     _KEEP.append(scales)
     s = ov.op.Constant(scales, shared_memory=True)
     s.set_friendly_name(name + "/scale")
+    if EXPERT_SYM:
+        # The OpenVINO GPU plugin's MoE fusion (MOECompressed, 2026.4.1) fails on the u4 + uniform-zero-point form of these
+        # constants; the symmetric i4 form (Convert -> Multiply, no Subtract) is NNCF's INT4_SYM pattern with the same values.
+        w = i4_constant(packed, (E, out, G, 128), name, zp)
+        cw = ops.convert(w, ov.Type.f16)
+        mul = ops.multiply(cw, s)
+        mul.set_friendly_name(name + "/fq_weights_1")
+        rs = ops.reshape(mul, ops.constant(np.array([E, out, inn], dtype=np.int64)), special_zero=False)
+        rs.set_friendly_name(name + "/fq_weights_1/reshape")
+        return rs, [w, s]
+    w = u4_constant(packed, (E, out, G, 128), name)
+    zpb = np.full((E * out * G + 1) // 2, (zp << 4) | zp, dtype=np.uint8)
+    z = u4_constant(zpb, (E, out, G, 1), name + "/zero_point")
     cw = ops.convert(w, ov.Type.f16)
     cz = ops.convert(z, ov.Type.f16)
     sub = ops.subtract(cw, cz)
@@ -435,6 +465,9 @@ def main():
     ap.add_argument("--ckpt", required=True)
     ap.add_argument("--out", required=True)
     ap.add_argument("--compress", choices=["none", "int8", "int4"], default="int4", help="nncf mode for the non-expert weights")
+    ap.add_argument("--expert-sym", action="store_true",
+                    help="emit the expert stacks as signed i4 without zero points (packed bytes = u4 XOR 0x88, Convert->Multiply, same values); "
+                         "required for the OpenVINO 2026.4.1 GPU plugin, whose MoE fusion rejects the u4 + zero-point form. Default: Intel's u4 + zp pattern")
     ap.add_argument("--layers", default=None, help="comma list of layer indices to rebuild (debug); default all")
     ap.add_argument("--skip-vision", action="store_true")
     ap.add_argument("--skip-nonexpert", action="store_true", help="keep the template's non-expert constants (use when the template is an official IR); experts still rebuilt from GPTQ")
@@ -442,6 +475,10 @@ def main():
     ap.add_argument("--dry-map", action="store_true", help="only report the non-expert constant mapping and exit")
     ap.add_argument("--skip-aux", action="store_true", help="do not rebuild embeddings/vision/tokenizer, just copy them from the template dir")
     a = ap.parse_args()
+    global EXPERT_SYM
+    EXPERT_SYM = bool(a.expert_sym)
+    if EXPERT_SYM:
+        print("[lm] expert stacks: signed i4, no zero point (--expert-sym)", flush=True)
     os.makedirs(a.out, exist_ok=True)
     ck = Checkpoint(a.ckpt)
     cfg = json.load(open(os.path.join(a.ckpt, "config.json")))

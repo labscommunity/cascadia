@@ -199,3 +199,21 @@ A `Dockerfile` bundles the OpenVINO + Level-Zero stack so you can skip the host 
 ## Troubleshooting
 
 Run `cascadia doctor` first — it diagnoses most of these. See also the README's **Troubleshooting** section for runtime issues (config.json, peer connect timeouts, Windows SSH).
+
+### Windows: GPU memory budget on 32 GB AI PCs
+
+On an Intel iGPU two different settings decide how much model a process can hold on the GPU, and the one OpenVINO reports is not the one that is enforced:
+
+| registry value (DWORD, percent of RAM) | read by | what it changes |
+|---|---|---|
+| `HKLM\SYSTEM\CurrentControlSet\Control\Class\{4d36e968-e325-11ce-bfc1-08002be10318}\<adapter index>\GMM\GpuSystemMemoryPinninglimit` | Intel's user-mode driver / compute runtime | what OpenVINO *reports* as `GPU_DEVICE_TOTAL_MEM_SIZE` |
+| `HKLM\SYSTEM\CurrentControlSet\Control\GraphicsDrivers\MemoryManager\SystemPartitionCommitLimitPercentage` | dxgkrnl's video memory manager | the WDDM shared segment and the per-process video-memory **budget** — what can actually be resident |
+
+Intel's INF installs the second one at 57; the Intel Graphics Software "Shared GPU Memory Override" slider writes both. A box that had only the GMM key raised reports a 24.8 GiB OpenVINO total while WDDM lets a process keep 17.2 GiB resident, and a model sized to the OpenVINO number pages: Qwen3.6-35B whole decoded at 1.7–1.9 tok/s inside the 17.2 GiB budget and at 30–34 tok/s once the budget was 26 GiB. **85 is the measured setting for 32 GB boxes** (26.8 GiB segment / 26.1 GiB budget, 4.8 GB left for Windows); set the commit-limit value, then **reboot** — the segment is sized at boot:
+
+```powershell
+# Run as Administrator, then reboot.
+reg add "HKLM\SYSTEM\CurrentControlSet\Control\GraphicsDrivers\MemoryManager" /v SystemPartitionCommitLimitPercentage /t REG_DWORD /d 85 /f
+```
+
+`cascadia doctor` reports the result: per GPU it prints the WDDM shared segment and per-process budget next to OpenVINO's `GPU_DEVICE_TOTAL_MEM_SIZE`, and warns (`⚠ GPU memory — OpenVINO total … exceeds the WDDM per-process budget …`) with the registry value above when the two disagree. `cascadia profile-stages` places against the smaller of the two numbers on Windows, so a placement never assumes more GPU residency than the budget allows.

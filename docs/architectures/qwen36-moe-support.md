@@ -430,6 +430,72 @@ single-box envelope, wire p50 ~21 ms / p95 ~24 ms. A 3-stage chain
 with a real middle rank measured per-hop-additive wire (~2× single
 hop) and parity exact — 2-node remains the perf-reference config.
 
+### 6.1 GPU keep-alive between pipeline steps (`--gpu-keepalive-ms`)
+
+On Intel iGPUs the lockstep hop structure itself costs most of the token:
+on the 122B 3-rank pipeline (one stage per 32 GB Panther Lake box) a stage
+infer is p50 ~33 ms but p95 250–550 ms on every rank, and the medians add
+up to ~105 ms per token while the measured step was ~330 ms. A standalone
+OpenVINO loop on the same stage never stalls (p99 57 ms); inserting a
+70 ms pause between infers — what a rank in a 3-stage chain sees while the
+other two run — reproduces it (16% of steps take ~570 ms, pinned clock or
+not), and filling the pause with a ~1.7 ms infer every few ms removes the
+stalls (p99 68 ms). An idle device holding a 20–25 GB stage is charged
+~0.5 s on its next real infer.
+
+`cascadia worker --gpu-keepalive-ms <N>` (default 0 = off; the
+`CASCADIA_QWEN36_GPU_KEEPALIVE_MS` env var is the fallback when the flag
+is 0; `qwen36_keepalive.rs`): every pipeline rank compiles a tiny
+synthetic IR (`Parameter f32 [1,16] → Add → Result`, written to a temp
+dir; fallback: the tree's text-embeddings IR with a `[1,1]` lookup) on
+its own device with the stages' PluginConfig, runs it once at load, and
+starts one worker thread that infers it every `N` ms while the rank is
+blocked on the network — a relay waiting for its next upstream frame or
+for its downstream TOKEN, rank 0 waiting for the downstream token — and
+parks otherwise, so it never overlaps a stage infer on the same device.
+A wait longer than 2 s (idle between tasks) silences the worker until the
+next wait. Never started on `--total 1`.
+
+**Measured effect (122B 3-stage chain, 2.5 GbE, all ranks on iGPUs):
+3.0 → 10.6 tok/s** at every prompt length with `--gpu-keepalive-ms 2`
+(last-rank step p50 31.9 / p95 33.2 ms; GPU busy 93–95%, the keep-alive
+kernels fill the waits). 5 ms alone gave 5.1 tok/s (the stalls are gone
+but the clock settles low between the tiny kernels), 25 ms gave 3.6
+tok/s, so **2 is the setting**; no frequency pinning is needed with it.
+
+Log lines: `qwen35 GPU keep-alive on` at load (`period_ms`, `model`
+synthetic/embeddings, `device`, `rank`); `keepalive_infers=` on
+`qwen36 task done` (rank 0) and on the relay RESET line
+`qwen36 relay GPU keep-alive infers since the previous RESET`; the
+profile key `ka.infer` (below) is the synthetic infer's own time.
+
+### 6.2 Per-token profiling (`CASCADIA_QWEN36_PROFILE=1`)
+
+Set the env var on any rank (`qwen36_profile.rs`; read once at build,
+zero overhead when unset). Per decode step the engine records, in µs:
+
+| key | rank | meaning |
+|---|---|---|
+| `embed` | 0 / single-box | token embedding lookup |
+| `s<j>.set` / `s<j>.infer` / `s<j>.out` | all | local stage `j`: `set_input` copies, `infer`, output copy |
+| `down.rtt` / `down.wire` | 0 and middle | FORWARD→TOKEN round trip to the downstream peer, and that minus the peer-reported infer time |
+| `wire.net` | 0 | the step's chain-wide wire share (the gate-4 histogram's sample) |
+| `up.wait` | relays | blocked on the next upstream frame |
+| `sample` | 0 / last / single-box | argmax |
+| `ka.infer` | all (keep-alive on) | one synthetic keep-alive infer |
+
+Every 32 decode steps an info line `qwen36 profile (p50/p95 per decode
+step)` prints `key=p50/p95us` for every key, and `qwen36 profile (task)`
+does the same at task end (rank 0 / single-box) or at each RESET
+(relays, for the span since the previous RESET; `steps=` counts the
+decode steps on every rank). With the stages compiled under
+`--ov-config PERF_COUNT=YES`, one per-stage OpenVINO per-op summary
+(`qwen36 ov profile:` — total real vs cpu time, executed node count, top
+12 node types by real time) is logged after the 8th decode step of a
+task, the same aggregation as the single-model engine's
+`CASCADIA_PERF_DUMP`. Timings inflate under `PERF_COUNT`; use it for
+attribution between node kinds, not for tok/s.
+
 ## 7. Out of scope (v1, regardless of strategy)
 
 Vision tower; MTP/speculative decoding; batching/multi-stream (priced
