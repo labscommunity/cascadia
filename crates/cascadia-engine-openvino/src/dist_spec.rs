@@ -1404,6 +1404,8 @@ pub struct OvDistSpecEngine {
     target: DistributedMaskedReq,
     draft: MaskedReq,
     tokenizer: Arc<Tokenizer>,
+    /// The model's window, which `submit` refuses a longer prompt against.
+    prompt_window: Option<u32>,
     /// All EOS token ids configured for the model. Generation truncates
     /// at the first token that matches ANY of these.
     eos_token_ids: Vec<u32>,
@@ -1472,6 +1474,7 @@ impl Engine for OvDistSpecEngine {
                 cap: MAX_PENDING_TASKS,
             });
         }
+        crate::refuse_over_model_window(Some(&self.tokenizer), &task.prompt, self.prompt_window)?;
         self.pending.push(task);
         Ok(())
     }
@@ -2124,6 +2127,13 @@ impl Builder for OvDistSpecBuilder {
             kv_model_id: self.pipeline_dir.to_string_lossy().into_owned(),
             target,
             draft: masked_draft,
+            // The tail returns f16 logits per prompt token, far wider than the hidden frame out.
+            prompt_window: crate::forwarded_prompt_window(
+                crate::pipeline_model_window(&self.pipeline_dir),
+                crate::pipeline_config_value(&self.pipeline_dir, "vocab_size").unwrap_or(0)
+                    as usize
+                    * 2,
+            ),
             tokenizer,
             eos_token_ids: self.eos_token_ids.clone(),
             k: self.k as usize,
