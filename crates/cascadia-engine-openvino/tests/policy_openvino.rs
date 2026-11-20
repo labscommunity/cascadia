@@ -1878,8 +1878,8 @@ fn xr0_spec_prompt_limit_and_cpu_parity() {
     engine.infer(&obs).unwrap();
 }
 
-/// XR0 on the GPU: f16 within 1e-2 of PyTorch f32, measured on the Arc
-/// (TODO(remeasure): 3.2e-3 / 4.5e-3 was the unmasked 30-row package).
+/// XR0 on the GPU: f16 within 1e-2 of PyTorch f32, measured on the Arc 140V
+/// (1.2e-3 / 9.4e-4 served).
 /// At `--ov-inference-precision f32` the GPU compile fails (`CL_INVALID_EVENT`), which must
 /// be a load error; that runs in a child process, as π0's does.
 #[test]

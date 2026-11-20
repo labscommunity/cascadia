@@ -89,11 +89,11 @@ v1:
   thousands of inputs out of an f16 GPU graph.
 - XR0 (`XiaomiRobotics/Xiaomi-Robotics-0-LIBERO`, Qwen3-VL-4B with a DiT, 5 flow steps) on the Arc
   140V: fp16 weights for a 10-step chunk (Xiaomi's native length; its LIBERO evaluator executes 10
-  per call), within 5.5e-4 (normalized) of Xiaomi's model (f32) on CPU f32 with fp16 weights. GPU f16 latency,
-  accuracy and memory, the GPU f32 load error and CPU f32 time and memory are TODO(remeasure) on this
-  package (the unmasked 30-step one: GPU f16 about 232 ms within 3.2e-3, no NaN, about 11 GB; at
-  `--ov-inference-precision f32` the GPU compile failed (`CL_INVALID_EVENT`), a load error as for
-  π0; CPU f32 about 5.6 s a call and 26 GB).
+  per call), within 5.5e-4 (normalized) of Xiaomi's model (f32) on CPU f32 with fp16 weights. GPU f16
+  about 216 ms a call (the LIBERO server), within 1.2e-3 of Xiaomi's model (f32), no NaN, about 9.5 GB
+  of GPU memory (12.3 GB process peak at load). At `--ov-inference-precision f32` the GPU compile fails
+  (`CL_INVALID_EVENT`), a load error as for π0; CPU f32 is about 5.5 s a call (7.2 s the first) and
+  23 GB, within 2.1e-4.
 - VLA-JEPA (`lerobot/VLA-JEPA-LIBERO`, Qwen3-VL-2B with all four flow steps in one graph) on the Arc
   140V: GPU f16 about 99 ms a call and within 8.2e-4 of PyTorch f32, GPU f32 about 610 ms, CPU f32
   about 3 s, no gripper flips. The GPU f16 default holds: LIBERO `libero_spatial` 29/30 at GPU f16,
@@ -143,11 +143,11 @@ included, and differences are against PyTorch f32 unless stated.
 | `vlajepa` | 29/30 | 29/30 (LeRobot, CPU f32) | `125dd23d0` | engine: GPU f16 ~107 ms (the LIBERO server); CPU f32 3.0 s within 1.65e-4 through OpenVINO's Python API, the engine's CPU path within 1.65e-4 on macOS | supported |
 | `evo1` | 28/30 | 28/30 (LeRobot, CPU f32) | `125dd23d0` | engine: GPU f16 ~330 ms, within 6.4e-4; CPU f32 6.1 s, within 3.6e-4 | supported |
 | `gr00t_n1d7` | 27/30 | 26/30 (NVIDIA's model, CPU bf16) | `125dd23d0` | engine at `7a6b19e5a`: GPU f16 ~240 ms, within 4.8e-3; CPU f32 3.5–4.3 s, within 3.3e-3 | supported |
-| `xr0` | TODO(remeasure) | TODO(remeasure) | TODO(remeasure) | TODO(remeasure) for the masked 10-row package; the unmasked 30-row package scored 27/30 against Intel's 27/30 (CPU f32) at `125dd23d0`, GPU f16 ~231 ms within 3.2e-3, CPU f32 5.6 s within 8.3e-4, through OpenVINO's Python API | supported |
+| `xr0` | 27/30 (26/30 with Xiaomi's task format, `task.capitalize() + "."`) | 27/30 (Intel's port, CPU f32, run on the earlier package that denoised all 32 dims) | `666562fcd` | engine: GPU f16 ~216 ms, within 1.2e-3; CPU f32 5.5 s, within 2.1e-4 | supported |
 | `molmoact2` | 28/30 | 27/30 (Intel's, CPU f32) | `8da6f67c2` | engine at `7a6b19e5a`: GPU f16 ~990 ms, within 4.0e-4; CPU f32 35 s, within 3.6e-4 | supported |
 
 Every v1 kind meets the rule; π0 only just. No run had an error frame or a non-finite action. For
-VLA-JEPA and XR0 the Windows CPU run is the package through OpenVINO's Python API, not the engine.
+VLA-JEPA the Windows CPU run is the package through OpenVINO's Python API, not the engine.
 The `gr00t_n1d7` and `molmoact2` engine runs were repeated at `7a6b19e5a`, after RTC and the
 package digest landed, and gave the same differences as at their LIBERO builds.
 
