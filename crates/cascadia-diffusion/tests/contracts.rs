@@ -81,3 +81,17 @@ fn artifact_tampering_missing_files_and_traversal_fail_closed() {
         manifest.files.remove(path);
     }
 }
+#[test]
+fn ir_pair_strips_each_suffix_once() {
+    let mut manifest: Manifest =
+        serde_json::from_str(include_str!("fixtures/manifest.json")).unwrap();
+    let artifact = manifest.files.values().next().unwrap().clone();
+    manifest
+        .files
+        .insert("u/a.xml.xml".into(), artifact.clone());
+    manifest.files.insert("u/a.bin".into(), artifact);
+    let unet = manifest.components.get_mut("unet").unwrap();
+    unet.xml = "u/a.xml.xml".into();
+    unet.weights = "u/a.bin".into();
+    assert!(manifest.validate().is_err());
+}

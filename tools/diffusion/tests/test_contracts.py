@@ -1,5 +1,6 @@
 import copy
 import json
+import os
 from pathlib import Path
 import shutil
 import struct
@@ -78,5 +79,25 @@ class Contracts(unittest.TestCase):
             (root/'tokenizer_config.json').unlink()
             (root/'unet/model.bin').write_bytes(b'bad')
             with self.assertRaises(ValueError): verify_bundle(root,mid,['unet'])
+
+    def test_ir_pair_strips_each_suffix_once(self):
+        manifest = parse_json((FIXTURES/'manifest.json').read_bytes())
+        artifact = next(iter(manifest['files'].values()))
+        manifest['files'] |= {'u/a.xml.xml': artifact, 'u/a.bin': artifact}
+        manifest['components']['unet'] |= {'xml': 'u/a.xml.xml', 'weights': 'u/a.bin'}
+        with self.assertRaisesRegex(ValueError, 'invalid IR pair'): validate_manifest(manifest)
+
+    @unittest.skipUnless(hasattr(os, 'mkfifo'), 'needs os.mkfifo')
+    def test_bundle_rejects_nonregular_entries(self):
+        with tempfile.TemporaryDirectory() as folder:
+            root=Path(folder)
+            shutil.copy(FIXTURES/'manifest.json',root/'manifest.json')
+            (root/'unet').mkdir()
+            (root/'unet/model.xml').write_bytes(b'xml')
+            (root/'unet/model.bin').write_bytes(b'bin')
+            mid=(FIXTURES/'manifest.sha256').read_text().strip()
+            verify_bundle(root,mid,['unet'])
+            os.mkfifo(root/'pipe')
+            with self.assertRaisesRegex(ValueError, 'nonregular artifact'): verify_bundle(root,mid,['unet'])
 
 if __name__ == '__main__': unittest.main()
