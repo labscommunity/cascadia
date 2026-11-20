@@ -8,6 +8,7 @@ from http.server import BaseHTTPRequestHandler, HTTPServer
 import json
 import os
 from pathlib import Path
+import socket
 import socketserver
 import threading
 import urllib.error
@@ -30,8 +31,16 @@ class BoundedServer(socketserver.ThreadingMixIn, HTTPServer):
     daemon_threads=False
     block_on_close=True
     request_queue_size=8
+    connections=32
+    # Before authorization the read timeout closes a silent connection; the
+    # deadline bounds one that trickles bytes, so sockets without the token
+    # cannot starve authorized callers.
+    auth_deadline=5
+    # Winsock does not promise that shutdown() wakes a blocked recv, so the
+    # read timeout also bounds a cut connection to about auth_deadline plus this.
+    auth_read_timeout=2
     def __init__(self,*args,**kwargs):
-        self.slots=threading.BoundedSemaphore(8)
+        self.slots=threading.BoundedSemaphore(self.connections)
         super().__init__(*args,**kwargs)
     def process_request(self,request,address):
         if not self.slots.acquire(False):
@@ -90,7 +99,25 @@ def serve(config_path: Path):
         protocol_version='HTTP/1.1'
         def setup(self):
             super().setup()
-            self.connection.settimeout(30)
+            self.connection.settimeout(self.server.auth_read_timeout)
+            # Timer.cancel() cannot stop a cut already running; the flag can.
+            self.guard=threading.Lock()
+            self.admitted=False
+            self.deadline=threading.Timer(self.server.auth_deadline,self.cut)
+            self.deadline.start()
+        def cut(self):
+            with self.guard:
+                if self.admitted:return
+                try:self.connection.shutdown(socket.SHUT_RDWR)
+                except OSError:pass
+        def handle(self):
+            # A cut or vanished client breaks the socket mid-request; that is
+            # not a server fault, and a traceback on a full stderr pipe can block.
+            try:super().handle()
+            except OSError:pass
+        def finish(self):
+            self.deadline.cancel()
+            super().finish()
         def log_message(self,*args):pass
         def respond(self,status,body,binary=False):
             raw=body if binary else json.dumps(body,separators=(',',':')).encode()
@@ -104,7 +131,11 @@ def serve(config_path: Path):
             except (BrokenPipeError,ConnectionResetError,TimeoutError):pass
         def authorized(self):
             values=self.headers.get_all('Authorization',[])
-            return len(values)==1 and hmac.compare_digest(values[0].encode(),('Bearer '+token).encode())
+            if len(values)!=1 or not hmac.compare_digest(values[0].encode(),('Bearer '+token).encode()):return False
+            with self.guard:self.admitted=True
+            self.deadline.cancel()
+            self.connection.settimeout(30)
+            return True
         def do_GET(self):
             if not self.authorized():return self.respond(401,{'error':'unauthorized'})
             if self.path!='/health':return self.respond(404,{'error':'unknown route'})

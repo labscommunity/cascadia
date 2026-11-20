@@ -56,7 +56,29 @@ def slow_write(self,data):
     time.sleep(.05)
     return written
 socketserver._SocketWriter.write=slow_write
-from cascadia_diffusion.server import serve
+import os,socket,threading
+from cascadia_diffusion.server import BoundedServer,serve
+knobs=json.loads(sys.argv[2]) if len(sys.argv)>2 else {}
+for name in ('auth_deadline','auth_read_timeout'):
+    if name in knobs:setattr(BoundedServer,name,knobs[name])
+if knobs.get('nowake'):
+    # Emulate Winsock: the deadline's shutdown does not wake a blocked read.
+    _shutdown=socket.socket.shutdown
+    socket.socket.shutdown=lambda self,how:None if how==socket.SHUT_RDWR else _shutdown(self,how)
+# Publish the held slot count so a test can wait for every accept.
+held=threading.Lock()
+def report(server):
+    with held:
+        (root/'held.tmp').write_text(str(server.connections-server.slots._value))
+        os.replace(root/'held.tmp',root/'held')
+_process,_thread=BoundedServer.process_request,BoundedServer.process_request_thread
+def process_request(self,*args):
+    _process(self,*args)
+    report(self)
+def process_request_thread(self,*args):
+    try:_thread(self,*args)
+    finally:report(self)
+BoundedServer.process_request,BoundedServer.process_request_thread=process_request,process_request_thread
 serve(root/'config.json')
 '''
 
@@ -86,13 +108,17 @@ class Server(unittest.TestCase):
         config={'artifact':str(self.root),'manifest':'a'*64,'components':['unet'],'device':'CPU','cache':str(self.root/'cache'),'port':self.port,
                 'coordinator':{'mode':'components','callback_url':f'http://127.0.0.1:{self.callback_port}/invoke','callback_boot':'00000000-0000-0000-0000-000000000001'}}
         (self.root/'config.json').write_text(json.dumps(config))
+        self.launch()
+    def launch(self,*args):
         env=os.environ|{'PYTHONPATH':str(SOURCE),'CASCADIA_DIFFUSION_TOKEN':TOKEN,'CASCADIA_DIFFUSION_CALLBACK_TOKEN':TOKEN}
-        self.process=subprocess.Popen([sys.executable,'-c',CHILD,str(self.root)],env=env,stdout=subprocess.DEVNULL,stderr=subprocess.PIPE)
+        self.process=subprocess.Popen([sys.executable,'-c',CHILD,str(self.root),*args],env=env,stdout=subprocess.DEVNULL,stderr=subprocess.PIPE)
         self.wait(lambda:self.ready())
+    def stop(self):
+        self.process.terminate()
+        return self.process.communicate(timeout=5)[1]
     def tearDown(self):
         (self.root/'finish').write_text('1')
-        self.process.terminate()
-        self.process.communicate(timeout=5)
+        if self.process.returncode is None:self.stop()
         self.temp.cleanup()
     def request(self,method,path,body=None,token=TOKEN):
         conn=http.client.HTTPConnection('127.0.0.1',self.port,timeout=2)
@@ -106,8 +132,8 @@ class Server(unittest.TestCase):
             raise RuntimeError(self.process.stderr.read().decode())
         try:return self.request('GET','/health')[0]==200
         except OSError:return False
-    def wait(self,predicate):
-        deadline=time.monotonic()+5
+    def wait(self,predicate,limit=5):
+        deadline=time.monotonic()+limit
         while not predicate():
             if time.monotonic()>deadline:self.fail('condition timed out')
             time.sleep(.01)
@@ -181,5 +207,53 @@ class Server(unittest.TestCase):
         (self.root/'finish').write_text('1')
         raw=(FIXTURES/'frame.bin').read_bytes()
         for _ in range(3):self.assertEqual(self.request('POST','/execute',raw)[0],200)
+    def relaunch(self,**knobs):
+        self.stop()
+        self.launch(json.dumps(knobs))
+    def held(self):
+        try:return int((self.root/'held').read_text())
+        except (FileNotFoundError,ValueError):return 0
+    def health(self):
+        try:return self.request('GET','/health')[0]
+        except OSError:return None
+    def hold_every_slot(self):
+        from cascadia_diffusion.server import BoundedServer
+        # Connect one at a time and wait for each accept: a burst overflows the
+        # listen backlog, and a socket still queued there holds no slot.
+        self.wait(lambda:self.held()==0)
+        idle=[]
+        for count in range(1,BoundedServer.connections+1):
+            idle.append(socket.create_connection(('127.0.0.1',self.port),2))
+            # Half stall inside the request line, half send nothing.
+            if count%2:idle[-1].sendall(b'G')
+            self.wait(lambda:self.held()==count)
+        return idle
+    def assert_slots_free_within(self,limit):
+        idle=self.hold_every_slot()
+        try:
+            with self.assertRaises(OSError):self.request('GET','/health')
+            self.wait(lambda:self.health()==200,limit)
+        finally:
+            for sock in idle:sock.close()
+    def test_idle_unauthorized_connections_cannot_hold_every_slot(self):
+        # A long read timeout, so only the deadline can free the slots.
+        self.relaunch(auth_deadline=2,auth_read_timeout=10)
+        self.assert_slots_free_within(3)
+        time.sleep(.2)
+        self.assertNotIn(b'Traceback',self.stop())
+    def test_read_timeout_frees_slots_when_shutdown_does_not_wake_a_read(self):
+        self.relaunch(auth_deadline=.2,auth_read_timeout=1.5,nowake=True)
+        self.assert_slots_free_within(2.5)
+    def test_authorized_body_may_arrive_slower_than_the_pre_auth_read_timeout(self):
+        self.relaunch(auth_deadline=.3,auth_read_timeout=.3)
+        body=json.dumps({'job':'00000000-0000-0000-0000-000000000005','request':{'prompt':'x'}}).encode()
+        sock=socket.create_connection(('127.0.0.1',self.port),5)
+        try:
+            sock.sendall(f'POST /generate HTTP/1.1\r\nHost: localhost\r\nAuthorization: Bearer {TOKEN}\r\nContent-Length: {len(body)}\r\n\r\n'.encode())
+            for part in (body[:10],body[10:20],body[20:]):
+                time.sleep(.6)
+                sock.sendall(part)
+            self.assertIn(b' 200 ',sock.recv(4096))
+        finally:sock.close()
 
 if __name__=='__main__':unittest.main()
