@@ -22,6 +22,10 @@ from .contracts import MAX_FRAME, exact, integer, parse_json, require
 MAX_GENERATE_BODY = 256 * 1024
 
 
+class StageExchangeFailed(Exception):
+    """A stage callback failed or replied badly; never a bad request."""
+
+
 class BoundedServer(socketserver.ThreadingMixIn, HTTPServer):
     daemon_threads=False
     block_on_close=True
@@ -66,6 +70,9 @@ def serve(config_path: Path):
         require(len(callback_token)>=32 and callback_token.isascii(), 'callback token required')
         opener=urllib.request.build_opener(urllib.request.ProxyHandler({}))
         def invoke(name,values):
+            try:return exchange(name,values)
+            except Exception as error:raise StageExchangeFailed() from error
+        def exchange(name,values):
             nonlocal sequence
             sequence+=1
             require(job is not None, 'generation has no admitted job')
@@ -102,8 +109,11 @@ def serve(config_path: Path):
             if not self.authorized():return self.respond(401,{'error':'unauthorized'})
             if self.path!='/health':return self.respond(404,{'error':'unknown route'})
             self.respond(200,{'ready':True,'boot':boot,'manifest':config['manifest'],'components':config['components'],'coordinator':pipeline is not None})
+        # Status contract with the Rust executor: 503 means this call did not run;
+        # 4xx means it did not run or ran to completion and was rejected; 500 and
+        # 502 are uncertain and quarantine the worker.
         def do_POST(self):
-            nonlocal job,sequence
+            nonlocal job
             if not self.authorized():return self.respond(401,{'error':'unauthorized'})
             if self.path not in ('/execute','/generate'):return self.respond(404,{'error':'unknown route'})
             lengths=self.headers.get_all('Content-Length',[])
@@ -113,29 +123,35 @@ def serve(config_path: Path):
             if not 0<length<=cap:return self.respond(413,{'error':'body exceeds limit'})
             lock=execute_slot if self.path=='/execute' else generate_slot
             if not lock.acquire(False):return self.respond(503,{'error':'busy'})
-            try:
-                raw=self.rfile.read(length)
-                require(len(raw)==length, 'truncated request')
-                if self.path=='/execute':
-                    result=engine.execute(raw)
-                    self.respond(200,result,True)
-                else:
-                    require(pipeline is not None, 'coordinator disabled')
-                    body=parse_json(raw)
-                    exact(body,('job','request'))
-                    require(str(uuid.UUID(body['job']))==body['job'], 'invalid job')
-                    job=body['job']
-                    sequence=0
-                    result=pipeline.generate(body['request'])
-                    self.respond(200,result)
-            except ValueError:
-                self.respond(400,{'error':'invalid stage request'})
-            except Exception as error:
-                print(json.dumps({'event':'execution_failed','type':type(error).__name__}),flush=True)
-                self.respond(500,{'error':'execution failed'})
+            # Reply only after unlocking, so an immediate next call is not busy.
+            try:status,body,binary=self.dispatch(length)
             finally:
                 if self.path=='/generate':job=None
                 lock.release()
+            self.respond(status,body,binary)
+        def dispatch(self,length):
+            nonlocal job,sequence
+            # A nonzero sequence marks a failure during or after a stage callback.
+            if self.path=='/generate':sequence=0
+            try:
+                raw=self.rfile.read(length)
+                require(len(raw)==length, 'truncated request')
+                if self.path=='/execute':return 200,engine.execute(raw),True
+                require(pipeline is not None, 'coordinator disabled')
+                body=parse_json(raw)
+                exact(body,('job','request'))
+                require(str(uuid.UUID(body['job']))==body['job'], 'invalid job')
+                job=body['job']
+                return 200,pipeline.generate(body['request']),False
+            except StageExchangeFailed:
+                return 502,{'error':'stage exchange failed'},False
+            except ValueError:
+                if self.path=='/generate' and sequence:return 502,{'error':'stage exchange failed'},False
+                return 400,{'error':'invalid stage request'},False
+            except Exception as error:
+                print(json.dumps({'event':'execution_failed','type':type(error).__name__}),flush=True)
+                if self.path=='/generate' and sequence:return 502,{'error':'stage exchange failed'},False
+                return 500,{'error':'execution failed'},False
     server=BoundedServer(('127.0.0.1',config['port']),Handler)
     print(json.dumps({'event':'ready','boot':boot,'manifest':config['manifest'],'port':config['port']}),flush=True)
     try:server.serve_forever(poll_interval=.25)

@@ -24,6 +24,8 @@ pub enum Error {
     Io(#[from] std::io::Error),
     #[error("diffusion JSON failed: {0}")]
     Json(#[from] serde_json::Error),
+    #[error("diffusion stage did not run the call or rejected it")]
+    Rejected,
 }
 
 pub type Result<T> = std::result::Result<T, Error>;
