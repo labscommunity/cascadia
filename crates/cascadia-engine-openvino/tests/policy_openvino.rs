@@ -28,8 +28,9 @@
 //! `fixtures-f32.npz`, saved uncompressed) and PyTorch f32 of Intel's port with
 //! Xiaomi's action mask in `<dir>.ref.npz` (same rule). XR1's are Xiaomi's own processor's
 //! graph inputs and model (PyTorch f32) in `xr1.ref.npz`, with the client's
-//! cropped frames added by `tools/xr1_processor_fixture.py crop` (same rule). GR00T's are NVIDIA's `Gr00tPolicy`
-//! (PyTorch f32) graph inputs, raw output and decoded actions in `ref.npz`, for
+//! cropped frames added by `tools/xr1_processor_fixture.py crop` (same rule). GR00T's are
+//! NVIDIA's `Gr00tPolicy` (PyTorch f32) graph inputs, raw output and decoded actions in
+//! `ref.npz`, for
 //! the frames and states in `gr00t-frames.npz` (regenerated from the
 //! exporter's seeds; same rule). Each MolmoAct2 package's are Intel's runtime stages
 //! in `molmoact2-stages-f32.npz` (the exporter's `fixtures-f32.npz`, saved
@@ -2578,7 +2579,8 @@ const MOLMOACT2: [Molmo; 3] = [
         state_len: 8,
         chunk: [15, 8],
         cpu_bound: 1e-3,
-        gpu_bound: 1e-2,
+        // GPU f16 measured 8.8e-4 on the Arc 140V.
+        gpu_bound: 3e-3,
     },
     Molmo {
         var: "CASCADIA_POLICY_PACKAGE_MOLMOACT2_SO100",
@@ -2916,8 +2918,8 @@ fn molmoact2_spec_prompt_limit_and_cpu_parity() {
         );
         let d = max_abs_diff(&a.actions, &npz(&z, "actions").f32s());
         eprintln!(
-            "molmoact2 engine cpu f32 vs pytorch f32: max abs {d:.3e} infer_ms={:.0}",
-            a.infer_ms
+            "molmoact2 engine cpu f32 vs pytorch f32 {}: max abs {d:.3e} infer_ms={:.0}",
+            m.var, a.infer_ms
         );
         assert!(d <= m.cpu_bound, "max abs diff {d} > {}", m.cpu_bound);
         let mut long = obs.clone();
@@ -2935,8 +2937,8 @@ fn molmoact2_spec_prompt_limit_and_cpu_parity() {
 
 /// MolmoAct2 on the GPU: f16 against PyTorch f32 as served, per checkpoint (LIBERO
 /// spike: 9.9e-4 normalized). At `--ov-inference-precision f32` the GPU compile fails
-/// (`CL_INVALID_EVENT`), which must be a load error; that runs in a child process, as
-/// π0's does.
+/// (`CL_INVALID_EVENT`, seen on LIBERO and DROID), which must be a load error; that runs
+/// in a child process, as π0's does.
 #[test]
 fn molmoact2_gpu_infer_f16_and_f32_is_a_load_error() {
     let test = "molmoact2_gpu_infer_f16_and_f32_is_a_load_error";
@@ -2985,7 +2987,11 @@ fn molmoact2_gpu_infer_f16_and_f32_is_a_load_error() {
 #[test]
 #[ignore = "run by molmoact2_gpu_infer_f16_and_f32_is_a_load_error, in its own process"]
 fn molmoact2_gpu_f32_load_is_an_error_in_its_own_process() {
-    let dir = PathBuf::from(std::env::var_os("CASCADIA_POLICY_MOLMOACT2_F32_CHILD").unwrap());
+    // The parent passes its first package; run by hand, any MolmoAct2 package variable works.
+    let dir = std::env::var_os("CASCADIA_POLICY_MOLMOACT2_F32_CHILD")
+        .or_else(|| MOLMOACT2.iter().find_map(|m| std::env::var_os(m.var)))
+        .map(PathBuf::from)
+        .expect("set a CASCADIA_POLICY_PACKAGE_MOLMOACT2* package variable");
     let opts = OvPolicyOptions {
         device: "GPU".into(),
         precision: Some(Precision::F32),

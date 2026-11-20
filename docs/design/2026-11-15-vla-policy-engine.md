@@ -60,10 +60,10 @@ gripper position), as openpi's `DroidOutputs` keeps. The latency row above is th
 stats, which stats do not change. Verified on CPU f32 (`tests/policy_openvino.rs`
 `pi05_droid_cpu_infer_matches_lerobot`): for the same two frames, state, task and noise, the
 served actions match LeRobot's `PI05Policy` (lerobot 0.6.0, PyTorch f32, openpi's stats at the
-robot's width, right wrist left out of the batch) within 1.2e-3 (mean 1.5e-4, mean |action| 0.10)
+robot's width, right wrist left out of the batch) within 1.3e-3 (mean 1.5e-4, mean |action| 0.10)
 over the first 8 dimensions of 5 frames of a real DROID episode (`lerobot/droid_1.0.1`, episode 1,
-"Put the blue block in the green bowl"), on macOS and on the Core Ultra 7 258V, and within 1.1e-3 on a synthetic frame pair. On those
-real frames LeRobot's predicted joint velocities follow the recorded ones (correlation 0.76; mean
+"Put the blue block in the green bowl"), on macOS and on the Core Ultra 7 258V, and within 1.1e-3
+on a synthetic frame pair. On those real frames LeRobot's predicted joint velocities follow the recorded ones (correlation 0.76; mean
 abs error 0.063 against 0.100 for predicting zero). Not measured: GPU f16, and task success.
 
 ## Scope
@@ -113,7 +113,7 @@ v1:
   4-frame video as two image slots of two frames. On an x86 CPU, given Xiaomi's processor inputs and
   the same noise, the fp16-weight IR at f32 is within 2.8e-4 of Xiaomi's own model in f32 on the 12
   served dims (f32 weights: 1.4e-6), no NaN. The engine reproduces Xiaomi's processor bit for bit
-  (prompt ids and mask, pixel values, state). On the Core Ultra 7 258V the engine is within 2.8e-4
+  (prompt ids and mask, pixel values, state). On the Core Ultra 7 258V the engine is within 2.9e-4
   of Xiaomi's model on CPU f32 (13–25 s a call) and within 3.4e-3 at GPU f16, about 660 ms a
   16-step chunk (`xr1_spec_and_cpu_parity`, `xr1_gpu_infer_f16`). Not measured: RoboCasa365 task
   success (Xiaomi reports 57.28% in bf16 on CUDA).
@@ -184,16 +184,17 @@ included, and differences are against PyTorch f32 unless stated.
 | `gr00t_n1d7` | 27/30 | 26/30 (NVIDIA's model, CPU bf16) | `125dd23d0` | engine at `7a6b19e5a`: GPU f16 ~240 ms, within 4.8e-3; CPU f32 3.5–4.3 s, within 3.3e-3 | supported |
 | `xr0` | 27/30 (26/30 with Xiaomi's task format, `task.capitalize() + "."`) | 27/30 (Intel's port, CPU f32, run on the earlier package that denoised all 32 dims) | `666562fcd` | engine: GPU f16 ~216 ms, within 1.2e-3; CPU f32 5.5 s, within 2.1e-4 | supported |
 | `molmoact2` | 28/30 | 27/30 (Intel's, CPU f32) | `8da6f67c2` | engine at `7a6b19e5a`: GPU f16 ~990 ms, within 4.0e-4; CPU f32 35 s, within 3.6e-4 | supported |
-| `xr0` (XR1 RoboCasa365) | none (no LIBERO-style bar; RoboCasa365 success not measured) | — | — | engine on Xiaomi's processor inputs: GPU f16 ~660 ms, within 3.4e-3 of Xiaomi's model (f32) on the 12 served dims; CPU f32 13–25 s, within 2.8e-4 (the export's f32 weights: 1.4e-6) | experimental |
-| `molmoact2` (DROID) | none (no LIBERO-style bar) | — | — | engine on the model card's sample: GPU f16 ~860 ms, within 8.8e-4; CPU f32 28–38 s, within 3.5e-4, as Intel's runtime | experimental |
-| `molmoact2` (SO-100/101) | none (no LIBERO-style bar) | — | — | engine on the model card's sample, in degrees on actions averaging 71: GPU f16 ~600 ms, within 1.05e-2; CPU f32 20–23 s, within 3.8e-3, as Intel's runtime | experimental |
+| `xr0` (XR1 RoboCasa365) | none (no LIBERO-style bar; RoboCasa365 success not measured) | — | — | engine on Xiaomi's processor inputs: GPU f16 ~660 ms, within 3.4e-3 of Xiaomi's model (f32) on the 12 served dims; CPU f32 13–25 s, within 2.9e-4, no NaN; f32 weights through OpenVINO's Python API 1.4e-6 | experimental |
+| `molmoact2` (DROID) | none (no LIBERO-style bar) | — | — | engine on the model card's sample: GPU f16 ~860 ms, within 8.8e-4; CPU f32 28–38 s, within 3.6e-4, as Intel's runtime | experimental |
+| `molmoact2` (SO-100/101) | none (no LIBERO-style bar) | — | — | engine on the model card's sample, in degrees on actions averaging 71: GPU f16 ~600 ms, within 1.1e-2; CPU f32 20–23 s, within 3.9e-3, as Intel's runtime | experimental |
 
 Every v1 kind meets the rule; π0 only just. No run had an error frame or a non-finite action. For
 VLA-JEPA the Windows CPU run is the package through OpenVINO's Python API, not the engine.
-For the DROID and SO-100/101 checkpoints the engine is verified without a device: its stages
-reproduce Intel's runtime exactly (prompt text, token ids, all six graph inputs bit for bit,
-postprocess max abs 0, as for LIBERO), and a prompt of 255 tokens is served and 256 refused. The
-engine's CPU and GPU runs and any task success are not measured.
+For the DROID and SO-100/101 checkpoints the engine's stages reproduce Intel's runtime exactly
+(prompt text, token ids, all six graph inputs bit for bit, postprocess max abs 0, as for LIBERO),
+a prompt of 255 tokens is served and 256 refused, and the engine's CPU and GPU runs are in the
+table above; at `--ov-inference-precision f32` the DROID graph does not compile on the GPU, a load
+error as for LIBERO. Task success is not measured.
 The `gr00t_n1d7` and `molmoact2` engine runs were repeated at `7a6b19e5a`, after RTC and the
 package digest landed, and gave the same differences as at their LIBERO builds.
 
