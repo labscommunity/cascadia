@@ -196,6 +196,27 @@ class ApplyStats(unittest.TestCase):
             for k, v in zip(keys, pad):
                 self.assertEqual(state[k], [5.0] * 8 + [v] * 24, (mode, k))
 
+    def test_pi05_state_stays_narrow_with_pad_to(self):
+        # pi0.5 DROID: openpi bins 8 state values into the prompt, so the state is not padded with
+        # identity stats; the engine pads it to the graph's 32 after normalizing.
+        m = _manifest(mode="quantiles", width=32)
+        m["policy"] = {"name": "pi05"}
+        m["model"]["input_features"] = [{"init_args": {"name": "state", "ftype": "STATE", "shape": [32]}}]
+        m["model"]["postprocessors"][0]["stats"]["action"]["shape"] = [32]
+        for k in ep.STAT_KEYS:
+            m["model"]["postprocessors"][0]["stats"]["action"][k] = [0.0] * 32
+        q = {"q01": [-2.0] * 8, "q99": [3.0] * 8}
+        ep.apply_stats(m, {"state": q, "action": q})
+        normalize = m["model"]["preprocessors"][1]
+        self.assertEqual(normalize["pad_to"], 32)
+        self.assertEqual(sorted(k for k in normalize["stats"]["state"] if k in ep.STAT_KEYS), ["q01", "q99"])
+        self.assertEqual(normalize["stats"]["state"]["q01"], [-2.0] * 8)
+        self.assertEqual(normalize["stats"]["state"]["shape"], [8])
+        self.assertEqual(m["model"]["input_features"][0]["init_args"]["shape"], [8])
+        action = m["model"]["postprocessors"][0]
+        self.assertNotIn("pad_to", action)
+        self.assertEqual(action["stats"]["action"]["q99"], [3.0] * 8 + [1.0] * 24)
+
     def test_a_step_without_mode_is_mean_std(self):
         m = _manifest()
         for step in m["model"]["preprocessors"][1:] + m["model"]["postprocessors"]:
@@ -253,6 +274,63 @@ class CopyPackage(unittest.TestCase):
                     ep.copy_package(Path(t), Path(t, "o"), bad)
 
 
+DROID_CAMERAS = ["base_0_rgb", "left_wrist_0_rgb", "right_wrist_0_rgb"]
+
+
+def _droid_manifest(pi05_step=None):
+    feature = lambda name, ftype: {"class_path": "x.InferenceFeature", "init_args": {"name": name, "ftype": ftype}}
+    return {
+        "model": {
+            "preprocessors": [
+                {"type": "normalize", "mode": "quantiles"},
+                pi05_step or {"type": "pi05", "image_resolution": [224, 224], "empty_cameras": 0},
+            ],
+            "input_features": [feature(f"images.{c}", "VISUAL") for c in DROID_CAMERAS]
+            + [feature("state", "STATE"), feature("task", "LANGUAGE")],
+        }
+    }
+
+
+class EmptyCameras(unittest.TestCase):
+    def test_drops_the_last_camera_into_an_empty_slot(self):
+        m = _droid_manifest()
+        ep.apply_empty_cameras(m, ["right_wrist_0_rgb"])
+        names = [f["init_args"]["name"] for f in m["model"]["input_features"]]
+        self.assertEqual(names, ["images.base_0_rgb", "images.left_wrist_0_rgb", "state", "task"])
+        self.assertEqual(m["model"]["preprocessors"][1]["empty_cameras"], 1)
+
+    def test_class_path_step_adds_to_its_empty_cameras(self):
+        step = {"class_path": "physicalai.inference.preprocessors.Pi05Preprocessor", "init_args": {"empty_cameras": 1}}
+        m = _droid_manifest(step)
+        ep.apply_empty_cameras(m, ["left_wrist_0_rgb", "right_wrist_0_rgb"])
+        self.assertEqual(step["init_args"]["empty_cameras"], 3)
+
+    def test_only_trailing_cameras_and_one_must_stay(self):
+        for names in (["left_wrist_0_rgb"], DROID_CAMERAS, ["nope"]):
+            with self.assertRaisesRegex(ValueError, "last of the package's cameras"):
+                ep.apply_empty_cameras(_droid_manifest(), names)
+
+    def test_problem_is_checked_before_the_export(self):
+        self.assertIsNone(ep.empty_camera_problem("pi05", DROID_CAMERAS, []))
+        self.assertIsNone(ep.empty_camera_problem("pi05", DROID_CAMERAS, ["right_wrist_0_rgb"]))
+        self.assertIn("pi0.5", ep.empty_camera_problem("smolvla", DROID_CAMERAS, ["right_wrist_0_rgb"]))
+        for names in (["base_0_rgb"], ["right_wrist_0_rgb"] * 2, DROID_CAMERAS):
+            self.assertIn("last of the checkpoint's cameras", ep.empty_camera_problem("pi05", DROID_CAMERAS, names))
+
+    def test_preflight_lists_the_cameras(self):
+        config = {
+            "type": "pi05",
+            "input_features": {
+                **{f"observation.images.{c}": {"type": "VISUAL", "shape": [3, 224, 224]} for c in DROID_CAMERAS},
+                "observation.state": {"type": "STATE", "shape": [32]},
+            },
+        }
+        with tempfile.TemporaryDirectory() as d:
+            (Path(d) / "config.json").write_text(json.dumps(config))
+            out = ep.preflight(d)
+        self.assertEqual(out["cameras"], DROID_CAMERAS)
+
+
 class LoadStats(unittest.TestCase):
     def _write(self, doc):
         f = tempfile.NamedTemporaryFile("w", suffix=".json", delete=False)
@@ -264,6 +342,36 @@ class LoadStats(unittest.TestCase):
     def test_accepts_lerobot_state_key(self):
         doc = ep.load_stats(self._write({"observation.state": {"mean": [0]}, "action": {"q01": [0]}}))
         self.assertIn("state", doc)
+
+    def test_openpi_norm_stats(self):
+        # The fixture the CLI's tests read too: openpi's layout, zero-padded to the model width.
+        doc = ep.load_stats(Path(__file__).parent / "fixtures" / "openpi-norm-stats.json")
+        self.assertEqual(sorted(doc), ["action", "state"])
+        self.assertEqual(doc["state"]["mean"], [0.25, 0.0, -2.0])
+        self.assertEqual(doc["state"]["q99"], [1.0, 1.0, -1.0])
+        self.assertEqual(doc["action"]["q01"], [-1.0, 0.0])
+        self.assertEqual(doc["action"]["std"], [0.3, 0.4])
+
+    def test_trim_logs_and_keeps_real_zeros(self):
+        doc, notes = ep.openpi_stats(
+            {"norm_stats": {"state": {"q01": [0, 0, 0], "q99": [1, 0, 0]}, "actions": {"mean": [0], "std": [1]}}}
+        )
+        self.assertEqual(notes, ["state: 3 -> 1 (2 all-zero padding dims dropped)"])
+        self.assertEqual(doc["state"], {"q01": [0], "q99": [1]})
+        self.assertEqual(doc["action"], {"mean": [0], "std": [1]})
+
+    def test_our_format_is_untouched(self):
+        src = {"state": {"mean": [1, 0], "std": [0, 0]}, "action": {"mean": [0, 0], "std": [1, 1]}}
+        doc, notes = ep.openpi_stats(json.loads(json.dumps(src)))
+        self.assertEqual((doc, notes), (src, []))
+
+    def test_all_zero_block_is_refused_later(self):
+        doc, _ = ep.openpi_stats(
+            {"norm_stats": {"state": {"mean": [0, 0], "std": [0, 0]}, "actions": {"mean": [1], "std": [1]}}}
+        )
+        self.assertEqual(doc["state"]["mean"], [])
+        with self.assertRaisesRegex(ValueError, "0 values"):
+            ep.apply_stats(_manifest(), doc)
 
     def test_rejects_bad_files(self):
         for bad, msg in (

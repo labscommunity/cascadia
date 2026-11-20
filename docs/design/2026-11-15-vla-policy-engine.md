@@ -49,11 +49,22 @@ Step 0 (2026-11-15) settled what the build depends on:
   both precisions and within 2.8e-3 of float32 PyTorch on CPU f32; bf16 compute on it is off by up to
   0.66 normalized units.
 
-**That DROID package is not usable for a robot.** Its `normalize`/`denormalize` stats are identity
-(mean 0, std 1, q01 −1, q99 1 over all 32 dimensions): `lerobot/pi05_droid` ships no normalization
-stats (`policy_preprocessor.json` has `"features": {}`), and the export filled in placeholders. Its
-latency row stands (stats do not change the graph); its accuracy does not. DROID stays out of v1
-claims until a stats source is settled (open question 3).
+**π0.5 DROID is served with openpi's statistics.** `lerobot/pi05_droid` ships none
+(`policy_preprocessor.json` has `"features": {}`), so it is exported with `--stats` set to openpi's
+published `norm_stats.json` for the checkpoint
+(`openpi-assets/checkpoints/pi05_droid/assets/droid/norm_stats.json`) and `--empty-camera
+right_wrist_0_rgb`. The package takes openpi's DROID inputs: the exterior camera as `base_0_rgb`,
+the wrist camera as `left_wrist_0_rgb`, and the 8-wide state (7 joint positions, gripper
+position); it serves 15 actions of 32, of which the first 8 are DROID's (7 joint velocities,
+gripper position), as openpi's `DroidOutputs` keeps. The latency row above is the graph without
+stats, which stats do not change. Verified on CPU f32 (`tests/policy_openvino.rs`
+`pi05_droid_cpu_infer_matches_lerobot`): for the same two frames, state, task and noise, the
+served actions match LeRobot's `PI05Policy` (lerobot 0.6.0, PyTorch f32, openpi's stats at the
+robot's width, right wrist left out of the batch) within 1.2e-3 (mean 1.5e-4, mean |action| 0.10)
+over the first 8 dimensions of 5 frames of a real DROID episode (`lerobot/droid_1.0.1`, episode 1,
+"Put the blue block in the green bowl"), and within 1.1e-3 on a synthetic frame pair. On those
+real frames LeRobot's predicted joint velocities follow the recorded ones (correlation 0.76; mean
+abs error 0.063 against 0.100 for predicting zero). Not measured: GPU f16, and task success.
 
 ## Scope
 
@@ -179,12 +190,12 @@ Loading rules:
   `Runtime::input_aliases`, shapes, dtypes) and refuses a mismatch at load, not at the first call.
 - Placeholder statistics refuse the load: a `normalize`/`denormalize` whose every feature has
   mean 0 and std 1 (`mean_std`), or q01 −1 and q99 1 (`quantiles`), or min −1 and max 1
-  (`min_max`), is an export that never had stats (our DROID package). `--policy-allow-identity-stats`
+  (`min_max`), is an export that never had stats (`lerobot/pi05_droid` exported without `--stats`). `--policy-allow-identity-stats`
   overrides it for testing.
 
 | Step | Behaviour |
 |---|---|
-| `normalize` | per feature on `state`, in f64 like Intel's numpy promotion. `mean_std`: `(x − mean) / (std + eps)`. `min_max`: `2(x − min)/(max − min + eps) − 1`. `quantiles`: `2(x − q01)/d − 1` with `d = q99 − q01`, replaced by eps only where it is 0. `identity`. Ours, GR00T's: `min_max_clip` with `bounds` `["min", "max"]` (the default) or `["q01", "q99"]`: `2(x − lo)/(hi − lo) − 1`, 0 where `np.isclose(hi, lo)`, clipped to [−1, 1]; `pad_to` zero-pads the result (GR00T's `max_state_dim`) and `history` must be 1; both only for `gr00t_n1d7`. |
+| `normalize` | per feature on `state`, in f64 like Intel's numpy promotion. `mean_std`: `(x − mean) / (std + eps)`. `min_max`: `2(x − min)/(max − min + eps) − 1`. `quantiles`: `2(x − q01)/d − 1` with `d = q99 − q01`, replaced by eps only where it is 0. `identity`. Ours, GR00T's: `min_max_clip` with `bounds` `["min", "max"]` (the default) or `["q01", "q99"]`: `2(x − lo)/(hi − lo) − 1`, 0 where `np.isclose(hi, lo)`, clipped to [−1, 1]; `pad_to` zero-pads the result (GR00T's `max_state_dim`) and `history` must be 1; both only for `gr00t_n1d7`, except that `pi05` takes `pad_to` too: π0.5 bins the state at the stats' width and the zero-padded state feeds the graph's wider port (DROID: 8 of 32), so the client sends the robot's width. |
 | `pi05` | Images: uint8 → `/255` → `x·2 − 1`, CHW. Slots in `input_features` order (see "Cameras"); `empty_cameras` extra slots filled with `−1`, mask false; stacked `images [n_slots, 1, 3, H, W]` f32 and `image_masks [n_slots, 1]` bool. Prompt: the normalized state is binned with `bin = digitize(x, linspace(−1, 1, 257)[:−1]) − 1`, which gives **−1 for x < −1** and 255 for x ≥ 1 − 2/256; text `"Task: {task}, State: {bins joined by ' '};\nAction: "`, task stripped with `_` and `\n` replaced by spaces. If `noise_shape` is set and the call carries no noise: `noise ~ N(0,1)` of `[1, *noise_shape]` f32. |
 | `pi0` | Ours (Intel's runtime dropped π0). The `pi05` parameters and image handling (dummy slots, centred padding, optional `noise_shape`); the prompt is left alone, so with `new_line` the tokenizer sees the task plus `"\n"` and no state bins. |
 | `smolvla_resize` | Images as in `pi05` at `image_resolution` (512). Ours: `resize` is `top_left` (the default, Intel's convention) or `stretch` (EVO1: LeRobot stretches frames bicubically, with antialiasing and no padding), and only changes the advertised `resize`. With a non-empty `image_key_reorder_map`, each value is a **slot index**. When `num_cameras` > 0, camera `name` goes to slot `map[name]`, every index below `num_cameras` that no camera takes is a masked dummy of `−1` in that position, and a value ≥ `num_cameras` refuses the load. When `num_cameras` ≤ 0 (the default), cameras are ordered by their slot values with no dummies. A duplicate or negative value always refuses the load. |
@@ -777,14 +788,30 @@ machine.
     a normalizer with no STATE feature, an unnormalizer with no ACTION feature, or a `state_file`
     missing from the repository), unless `--stats <file>` is given. This catches the identity
     stats above. The file is JSON, `{"state": {...}, "action": {...}}`, with `mean`/`std`,
-    `q01`/`q99` or `min`/`max`; it replaces the values in every `normalize` and `denormalize` step
+    `q01`/`q99` or `min`/`max`, or openpi's `norm_stats.json` (`{"norm_stats": {"state": ...,
+    "actions": ...}}`). openpi stores its stats zero-padded to the model width but normalizes at the
+    robot's width, so in its format the trailing dimensions where every stat is exactly 0 are
+    dropped, and the export prints what it dropped (`state: 32 -> 8 (24 all-zero padding dims
+    dropped)`); kept, quantiles would map a zero pad to −1. The CLI and the driver apply the same
+    rule to one shared test fixture. The values replace those in every `normalize` and `denormalize` step
     (the RTC leftover takes the action block; a step without a mode is `mean_std`), and each
     step's mode must find its keys. Widths and keys are checked against the checkpoint's config
     before the export environment is installed. Stats narrower than the package (DROID: 8-wide
     stats, 32-wide state and action) are padded with the mode's identity (mean 0 and std 1, q01 −1
     and q99 1, min −1 and max 1): LeRobot normalizes at the robot's width and then zero-pads
     (lerobot v0.6.0 `NormalizerProcessorStep`, then `pad_vector` in `modeling_pi05.py`), and an
-    identity stat maps that zero pad to zero.
+    identity stat maps that zero pad to zero. A π0.5 state is the exception: its prompt bins the
+    normalized state before the padding (openpi `TokenizePrompt` before `PadStatesAndActions`;
+    lerobot `Pi05PrepareStateTokenizerProcessorStep`), so identity padding would add 24 bins to the
+    prompt. Its state stats stay at the robot's width, the `normalize` step gets `pad_to` (the
+    package's width) and the STATE feature the robot's width.
+- **`--empty-camera <NAME>`** (π0.5, repeatable): a camera the robot does not have. The feature
+  leaves the manifest's `input_features` and the `pi05` step's `empty_cameras` grows by one, so
+  clients do not send it and its slot is `−1` with mask false. LeRobot fills a camera missing from
+  the batch that way (`_preprocess_images`), and openpi's DROID policy sends `right_wrist_0_rgb` as
+  a zero image (−1 after scaling) with mask false (`droid_policy.py` `DroidInputs`). Empty slots
+  come after the real ones, so only the checkpoint's last cameras can be named; anything else is
+  refused after the preflight.
 - **Licence.** The package gets a `NOTICE` (the checkpoint, its revision, the model card's
   licence, and for π0.5 the Gemma Terms of Use notice), which the engine serves as `attribution`,
   plus any licence files at the checkpoint's repository root. The exporter prints which terms
@@ -894,7 +921,7 @@ What runs where, as shipped. Items marked **not shipped** are planned and not in
    CPU rendering), the engine on an AI PC's GPU (the f16-versus-f32 comparison needs the GPU), joined
    by an SSH tunnel. The added network delay doesn't affect an accuracy run,
    since the simulator waits for each reply. Every LIBERO run in the tier table ran this way.
-3. **DROID statistics.** openpi publishes DROID norm stats with its checkpoints, but in its own
-   format. Can the exporter take them through `--stats`?
+3. **DROID statistics (settled).** `--stats` takes openpi's `norm_stats.json` as it is published;
+   see "Missing statistics" under the exporter and the DROID paragraph under "Evidence".
 4. **GPU memory.** When an LLM engine and a policy share one box: out of scope for v1 (one engine
    per process), left to the operator.

@@ -10,7 +10,9 @@
 //!   inference action mask, a 10-action chunk, fp16 weights;
 //! - `CASCADIA_POLICY_PACKAGE_GROOT`: `nvidia/GR00T-N1.7-LIBERO` (libero_spatial), Intel's
 //!   edge-ai-suites single-IR export, fp16 weights;
-//! - `CASCADIA_POLICY_PACKAGE_MOLMOACT2`: `allenai/MolmoAct2-LIBERO`, Intel's exporter, fp16 weights.
+//! - `CASCADIA_POLICY_PACKAGE_MOLMOACT2`: `allenai/MolmoAct2-LIBERO`, Intel's exporter, fp16 weights;
+//! - `CASCADIA_POLICY_PACKAGE_PI05_DROID`: `lerobot/pi05_droid`, `--stats` openpi's DROID
+//!   `norm_stats.json`, `--empty-camera right_wrist_0_rgb`.
 //!
 //! The π0 and X-VLA references are the exporters' PyTorch f32 outputs, in the
 //! package's `ref.npz` (or `<dir>.ref.npz` beside it). VLA-JEPA's are LeRobot's
@@ -25,7 +27,9 @@
 //! exporter's seeds; same rule). MolmoAct2's are Intel's runtime stages in
 //! `molmoact2-stages-f32.npz` (the exporter's `fixtures-f32.npz`, saved
 //! uncompressed) and the PyTorch f32 pipeline on a real LIBERO frame pair in
-//! `molmoact2-e2e.npz` (same rule). The RTC packages are listed above their tests.
+//! `molmoact2-e2e.npz` (same rule). π0.5 DROID's are LeRobot's PI05Policy (PyTorch f32, openpi's
+//! stats) served actions in `ref.npz`, with its raw frames, states, task and noise (same rule).
+//! The RTC packages are listed above their tests.
 #![cfg(feature = "openvino")]
 
 use std::path::{Path, PathBuf};
@@ -2870,4 +2874,71 @@ fn smolvla_rtc_gpu_f16_stays_in_the_f16_envelope() {
 #[test]
 fn pi05_rtc_gpu_f16_stays_in_the_f16_envelope() {
     rtc_gpu_f16_stays_in_the_f16_envelope("PI05");
+}
+
+/// openpi's DROID client sends two cameras and an 8-wide state; the package serves the third
+/// slot empty and pads the state for the graph, so the engine's actions must be LeRobot's for
+/// the same frames, state, task and noise. Only the first 8 action dims are DROID's.
+#[test]
+fn pi05_droid_cpu_infer_matches_lerobot() {
+    let test = "pi05_droid_cpu_infer_matches_lerobot";
+    let Some(dir) = package_from("CASCADIA_POLICY_PACKAGE_PI05_DROID", test) else {
+        return;
+    };
+    let z = reference(&dir);
+    let mut engine = OvPolicyEngine::load(&dir, &cpu()).unwrap();
+    let spec = engine.spec().clone();
+    assert_eq!(spec.cameras, vec!["base_0_rgb", "left_wrist_0_rgb"]);
+    assert_eq!((spec.height, spec.width, spec.state_len), (224, 224, 8));
+    assert_eq!(spec.chunk, [15, 32]);
+    assert_eq!(
+        (spec.noise, spec.noise_shape.clone()),
+        (NoiseMode::Input, Some(vec![15, 32]))
+    );
+    let (base, wrist) = (npz(&z, "base"), npz(&z, "wrist"));
+    let frames = base.shape[0];
+    let (states, noise, want) = (
+        npz(&z, "state").f32s(),
+        npz(&z, "noise").f32s(),
+        npz(&z, "actions").f32s(),
+    );
+    let task = npz(&z, "task").string();
+    let px = 224 * 224 * 3;
+    let image = |a: &Npy, i: usize| Image {
+        height: 224,
+        width: 224,
+        data: a.data[i * px..(i + 1) * px].to_vec(),
+    };
+    let (mut max, mut sum, mut mag, mut n) = (0.0f32, 0.0f64, 0.0f64, 0usize);
+    for i in 0..frames {
+        let obs = Observation {
+            images: vec![
+                ("base_0_rgb".into(), image(&base, i)),
+                ("left_wrist_0_rgb".into(), image(&wrist, i)),
+            ],
+            state: states[i * 8..(i + 1) * 8].to_vec(),
+            prompt: task.clone(),
+            seed: None,
+            noise: Some(noise[i * 480..(i + 1) * 480].to_vec()),
+            rtc: None,
+        };
+        let a = engine.infer(&obs).unwrap();
+        assert_eq!((a.steps, a.dim), (15, 32));
+        let w = &want[i * 480..(i + 1) * 480];
+        for (g, r) in a.actions.chunks(32).zip(w.chunks(32)) {
+            for (x, y) in g[..8].iter().zip(&r[..8]) {
+                let d = (x - y).abs();
+                max = max.max(d);
+                sum += f64::from(d);
+                mag += f64::from(y.abs());
+                n += 1;
+            }
+        }
+    }
+    let (mean, mag) = (sum / n as f64, mag / n as f64);
+    eprintln!(
+        "pi05_droid engine cpu f32 vs lerobot f32 (first 8 dims, {frames} frames): max abs {max:.3e} \
+         mean abs {mean:.3e}, mean |action| {mag:.4}"
+    );
+    assert!(max <= 5e-3, "max abs diff {max}");
 }

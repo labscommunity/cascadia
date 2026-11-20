@@ -83,9 +83,14 @@ pub struct ExportPolicyArgs {
     #[arg(long)]
     pub rtc: bool,
     /// Normalization statistics for a checkpoint that ships none: a JSON file
-    /// `{"state": {...}, "action": {...}}`, each with `mean`/`std`, `q01`/`q99` or `min`/`max`.
+    /// `{"state": {...}, "action": {...}}`, each with `mean`/`std`, `q01`/`q99` or `min`/`max`,
+    /// or openpi's `norm_stats.json` (its all-zero padding dimensions are dropped).
     #[arg(long, value_name = "FILE")]
     pub stats: Option<PathBuf>,
+    /// A camera the robot does not have (π0.5; repeatable): clients do not send it and its slot is
+    /// served empty (−1, masked), as LeRobot and openpi do. Only the checkpoint's last cameras.
+    #[arg(long = "empty-camera", value_name = "NAME")]
+    pub empty_camera: Vec<String>,
     /// Run the traced input through PyTorch and the package's IR (CPU f32, and GPU f16 when a
     /// GPU is present) and print the max and mean differences.
     #[arg(long)]
@@ -137,6 +142,9 @@ pub(crate) struct Preflight {
     pub state_dim: Option<usize>,
     #[serde(default)]
     pub action_dim: Option<usize>,
+    /// The checkpoint's VISUAL features in order, without `observation.images.`.
+    #[serde(default)]
+    pub cameras: Vec<String>,
     /// The mode the exporter will write into the manifest's normalize steps.
     #[serde(default)]
     pub stats_mode: Option<String>,
@@ -208,6 +216,91 @@ fn mode_keys(mode: &str) -> &'static [&'static str] {
         "min_max" => &["min", "max"],
         _ => &[],
     }
+}
+
+/// Accepts openpi's `norm_stats.json` as well: `{"norm_stats": {"state": ..., "actions": ...}}`;
+/// any other document is returned as it is.
+///
+/// openpi stores its stats zero-padded to the model width but normalizes at the robot's width, so
+/// trailing dimensions where every stat is exactly 0 are padding. They are dropped and the driver
+/// pads them with the identity; kept, quantiles would map a zero pad to −1 (q99 − q01 = 0). Returns
+/// a line per trimmed block. The driver applies the same rule (`export_policy.py` `openpi_stats`).
+pub(crate) fn openpi_stats(mut doc: serde_json::Value) -> (serde_json::Value, Vec<String>) {
+    let Some(inner) = doc.get_mut("norm_stats").filter(|v| v.is_object()) else {
+        return (doc, vec![]);
+    };
+    doc = inner.take();
+    if let Some(obj) = doc.as_object_mut() {
+        if !obj.contains_key("action") {
+            if let Some(a) = obj.remove("actions") {
+                obj.insert("action".into(), a);
+            }
+        }
+    }
+    let mut notes = Vec::new();
+    for block in ["state", "observation.state", "action"] {
+        let Some(entry) = doc
+            .get_mut(block)
+            .and_then(serde_json::Value::as_object_mut)
+        else {
+            continue;
+        };
+        let lists: Option<Vec<Vec<f64>>> = STAT_KEYS
+            .iter()
+            .filter_map(|k| entry.get(*k))
+            .map(|v| {
+                v.as_array()?
+                    .iter()
+                    .map(serde_json::Value::as_f64)
+                    .collect()
+            })
+            .collect();
+        let Some(lists) = lists.filter(|l| !l.is_empty()) else {
+            continue;
+        };
+        let width = lists.iter().map(Vec::len).max().unwrap_or(0);
+        let keep = lists
+            .iter()
+            .filter_map(|l| l.iter().rposition(|x| *x != 0.0).map(|i| i + 1))
+            .max()
+            .unwrap_or(0);
+        if keep < width {
+            for key in STAT_KEYS {
+                if let Some(values) = entry.get_mut(key).and_then(serde_json::Value::as_array_mut) {
+                    values.truncate(keep);
+                }
+            }
+            notes.push(format!(
+                "{block}: {width} -> {keep} ({} all-zero padding dims dropped)",
+                width - keep
+            ));
+        }
+    }
+    (doc, notes)
+}
+
+/// Why `--empty-camera` cannot drop `names` from the checkpoint's cameras, or None.
+pub(crate) fn empty_camera_refusal(p: &Preflight, names: &[String]) -> Option<String> {
+    if names.is_empty() {
+        return None;
+    }
+    if p.policy_type.as_deref() != Some("pi05") {
+        return Some("--empty-camera is for π0.5 checkpoints".into());
+    }
+    let cams = &p.cameras;
+    let mut sorted = names.to_vec();
+    sorted.sort();
+    sorted.dedup();
+    let mut tail = cams[cams.len().saturating_sub(names.len())..].to_vec();
+    tail.sort();
+    if sorted.len() != names.len() || names.len() >= cams.len() || sorted != tail {
+        return Some(format!(
+            "--empty-camera {}: must be the last of the checkpoint's cameras {cams:?}, each once, \
+             and at least one camera must stay",
+            names.join(", ")
+        ));
+    }
+    None
 }
 
 /// Checks a `--stats` file against the checkpoint's widths and the manifest's mode, before the
@@ -532,11 +625,12 @@ pub(crate) fn check_inputs(args: &ExportPolicyArgs) -> Result<()> {
             std::fs::read_to_string(path).with_context(|| format!("--stats {}", path.display()))?;
         let doc: serde_json::Value = serde_json::from_str(&text)
             .with_context(|| format!("--stats {}: not JSON", path.display()))?;
+        let (doc, _) = openpi_stats(doc);
         let has = |k: &str| doc.get(k).is_some_and(serde_json::Value::is_object);
         if !((has("state") || has("observation.state")) && has("action")) {
             return Err(anyhow!(
                 "--stats {}: expected {{\"state\": {{...}}, \"action\": {{...}}}}, each with \
-                 mean/std, q01/q99 or min/max",
+                 mean/std, q01/q99 or min/max, or openpi's norm_stats.json",
                 path.display()
             ));
         }
@@ -689,7 +783,8 @@ pub(crate) fn run_export(args: &ExportPolicyArgs, host: &mut dyn ExportHost) -> 
     let need = memory_need(pre.policy_type.as_deref());
     let why = kind_refusal(&pre, &args.model)
         .or_else(|| memory_refusal(&facts, &need))
-        .or_else(|| preflight_refusal(&pre, &args.model, args.stats.is_some()));
+        .or_else(|| preflight_refusal(&pre, &args.model, args.stats.is_some()))
+        .or_else(|| empty_camera_refusal(&pre, &args.empty_camera));
     if let Some(why) = why {
         return Err(anyhow!(why));
     }
@@ -707,6 +802,10 @@ pub(crate) fn run_export(args: &ExportPolicyArgs, host: &mut dyn ExportHost) -> 
     }
     if let Some(path) = &args.stats {
         let doc: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(path)?)?;
+        let (doc, notes) = openpi_stats(doc);
+        for note in notes {
+            eprintln!("--stats: {note}");
+        }
         if let Some(why) = stats_refusal(&doc, &pre) {
             return Err(anyhow!(why));
         }
@@ -1025,6 +1124,9 @@ impl ExportHost for UvHost {
         if let Some(stats) = &args.stats {
             cmd.arg("--stats").arg(stats);
         }
+        for camera in &args.empty_camera {
+            cmd.arg("--empty-camera").arg(camera);
+        }
         if args.verify {
             cmd.arg("--verify");
         }
@@ -1058,6 +1160,7 @@ mod tests {
             output_dir: out.into(),
             rtc: false,
             stats: None,
+            empty_camera: vec![],
             verify: false,
         }
     }
@@ -1133,6 +1236,10 @@ mod tests {
             "--rtc",
             "--stats",
             "s.json",
+            "--empty-camera",
+            "right_wrist_0_rgb",
+            "--empty-camera",
+            "left_wrist_0_rgb",
             "--verify",
         ])
         .unwrap();
@@ -1143,6 +1250,7 @@ mod tests {
         assert_eq!(a.output_dir, PathBuf::from("pkg"));
         assert!(a.rtc && a.verify);
         assert_eq!(a.stats, Some(PathBuf::from("s.json")));
+        assert_eq!(a.empty_camera, ["right_wrist_0_rgb", "left_wrist_0_rgb"]);
     }
 
     #[test]
@@ -1151,7 +1259,7 @@ mod tests {
         let crate::Command::ExportPolicy(a) = cli.cmd else {
             panic!("not export-policy")
         };
-        assert!(!a.rtc && !a.verify && a.stats.is_none());
+        assert!(!a.rtc && !a.verify && a.stats.is_none() && a.empty_camera.is_empty());
         assert!(parse(&["cascadia", "export-policy", "--model", "m/x"]).is_err());
         assert!(parse(&["cascadia", "export-policy", "-o", "p"]).is_err());
         assert!(parse(&["cascadia", "export-policy", "m/x", "-o", "p"]).is_err());
@@ -1973,6 +2081,107 @@ mod tests {
         no_stats.stats.as_mut().unwrap().ok = false;
         let (r, calls) = run_fake(roomy(), no_stats, &a);
         assert!(r.unwrap_err().to_string().contains("9 values"));
+        assert_eq!(calls, ["facts", "prepare_preflight", "preflight"]);
+    }
+
+    /// The fixture the driver's tests read too (tools/tests/test_export_policy.py).
+    const OPENPI_STATS: &str = include_str!(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/../../tools/tests/fixtures/openpi-norm-stats.json"
+    ));
+
+    #[test]
+    fn openpi_norm_stats_are_unwrapped_and_trimmed() {
+        let (doc, notes) = openpi_stats(serde_json::from_str(OPENPI_STATS).unwrap());
+        assert_eq!(
+            notes,
+            [
+                "state: 6 -> 3 (3 all-zero padding dims dropped)",
+                "action: 5 -> 2 (3 all-zero padding dims dropped)"
+            ]
+        );
+        assert_eq!(doc["state"]["mean"], serde_json::json!([0.25, 0.0, -2.0]));
+        assert_eq!(doc["state"]["q99"], serde_json::json!([1.0, 1.0, -1.0]));
+        assert_eq!(doc["action"]["q01"], serde_json::json!([-1.0, 0.0]));
+        assert_eq!(doc["action"]["std"], serde_json::json!([0.3, 0.4]));
+        assert!(doc.get("actions").is_none() && doc.get("norm_stats").is_none());
+
+        // Our own format is left as it is, trailing zeros included.
+        let ours = stats_json(
+            r#"{"mean": [1, 0], "std": [0, 0]}"#,
+            r#"{"mean": [0, 0], "std": [1, 1]}"#,
+        );
+        assert_eq!(openpi_stats(ours.clone()), (ours, vec![]));
+
+        // DROID: 32-wide quantiles with 8 real dims pass the 32-wide package's check.
+        let mut q = passing("pi05");
+        q.stats_mode = Some("quantiles".into());
+        q.state_dim = Some(32);
+        q.action_dim = Some(32);
+        let pad = |a: f64, b: f64| {
+            let mut v = vec![a, b];
+            v.resize(32, 0.0);
+            v
+        };
+        let block = serde_json::json!({"q01": pad(-1.0, 0.0), "q99": pad(1.0, 1.0)});
+        let droid = serde_json::json!({"norm_stats": {"state": block, "actions": block}});
+        assert_eq!(
+            stats_refusal(&droid, &q).as_deref(),
+            Some("--stats: no \"state\" block")
+        );
+        let (trimmed, notes) = openpi_stats(droid);
+        assert_eq!(
+            notes[0],
+            "state: 32 -> 2 (30 all-zero padding dims dropped)"
+        );
+        assert_eq!(stats_refusal(&trimmed, &q), None);
+
+        // check_inputs takes the openpi file as it is.
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("norm_stats.json");
+        std::fs::write(&file, OPENPI_STATS).unwrap();
+        let mut a = args("lerobot/pi05_droid", &dir.path().join("pkg"));
+        a.stats = Some(file);
+        check_inputs(&a).unwrap();
+    }
+
+    #[test]
+    fn empty_cameras_must_be_the_last_of_a_pi05_checkpoint() {
+        let mut p = passing("pi05");
+        p.cameras = ["base_0_rgb", "left_wrist_0_rgb", "right_wrist_0_rgb"]
+            .map(String::from)
+            .to_vec();
+        let names = |n: &[&str]| n.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+        assert_eq!(empty_camera_refusal(&p, &[]), None);
+        assert_eq!(
+            empty_camera_refusal(&p, &names(&["right_wrist_0_rgb"])),
+            None
+        );
+        assert_eq!(
+            empty_camera_refusal(&p, &names(&["right_wrist_0_rgb", "left_wrist_0_rgb"])),
+            None
+        );
+        for bad in [
+            names(&["left_wrist_0_rgb"]),
+            names(&["right_wrist_0_rgb", "right_wrist_0_rgb"]),
+            names(&["base_0_rgb", "left_wrist_0_rgb", "right_wrist_0_rgb"]),
+            names(&["nope"]),
+        ] {
+            let msg = empty_camera_refusal(&p, &bad).unwrap();
+            assert!(msg.contains("last of the checkpoint's cameras"), "{msg}");
+        }
+        let mut s = p.clone();
+        s.policy_type = Some("smolvla".into());
+        assert!(empty_camera_refusal(&s, &names(&["right_wrist_0_rgb"]))
+            .unwrap()
+            .contains("π0.5"));
+
+        // Refused after the preflight, before the export environment.
+        let dir = tempfile::tempdir().unwrap();
+        let mut a = args("lerobot/pi05_droid", &dir.path().join("pkg"));
+        a.empty_camera = names(&["base_0_rgb"]);
+        let (r, calls) = run_fake(roomy(), p, &a);
+        assert!(r.unwrap_err().to_string().contains("--empty-camera"));
         assert_eq!(calls, ["facts", "prepare_preflight", "preflight"]);
     }
 

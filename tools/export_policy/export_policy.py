@@ -8,7 +8,8 @@ manages (tools/export_policy/requirements.txt). Two subcommands:
       verdict: policy type, licence, gated-tokenizer access, normalization stats. The CLI decides
       whether to refuse. Needs only huggingface_hub. A local checkpoint directory is read in place:
       revision "local", the licence from its README.md, and no gated-tokenizer check (a note says so).
-  export --model ID|DIR --preflight FILE --out DIR [--rtc] [--stats FILE] [--verify]
+  export --model ID|DIR --preflight FILE --out DIR [--rtc] [--stats FILE] [--empty-camera NAME]...
+         [--verify]
       Loads the policy in float32 at the preflight's commit, exports it with physical-ai-studio's
       OpenVINO exporter into a float32 IR, and saves the package's IR from it with fp16 weights.
       DIR is the CLI's staging directory, renamed into place only when everything succeeded.
@@ -97,11 +98,51 @@ def license_files(files: set[str] | None) -> list[str]:
     return sorted(f for f in files or () if "/" not in f and f.lower().startswith(prefixes))
 
 
+def openpi_stats(doc: dict) -> tuple[dict, list[str]]:
+    """Accept openpi's norm_stats.json as well: {"norm_stats": {"state": ..., "actions": ...}}; any
+    other document is returned as it is.
+
+    openpi stores its stats zero-padded to the model width. It normalizes at the robot's width and
+    pads afterwards, so trailing dimensions where every stat is exactly 0 are padding: they are
+    dropped here and padded with the identity later (IDENTITY_PAD). Kept as they are, quantiles
+    would map a zero pad to -1 (q99 - q01 = 0). Returns the doc and a line per trimmed block.
+    The CLI applies the same rule (crates/cascadia-cli/src/export_policy.rs `openpi_stats`).
+    """
+    if not isinstance(doc.get("norm_stats"), dict):
+        return doc, []
+    doc = doc["norm_stats"]
+    if "action" not in doc and "actions" in doc:
+        doc = {**doc, "action": doc["actions"]}
+        del doc["actions"]
+    notes = []
+    for block in ("state", "observation.state", "action"):
+        entry = doc.get(block)
+        if not isinstance(entry, dict):
+            continue
+        lists = [v for k, v in entry.items() if k in STAT_KEYS]
+        if not lists or not all(
+            isinstance(v, list) and all(isinstance(x, (int, float)) for x in v) for v in lists
+        ):
+            continue
+        width = max(len(v) for v in lists)
+        keep = max((i + 1 for v in lists for i, x in enumerate(v) if x != 0), default=0)
+        if keep < width:
+            for k in STAT_KEYS:
+                if k in entry:
+                    entry[k] = entry[k][:keep]
+            notes.append(f"{block}: {width} -> {keep} ({width - keep} all-zero padding dims dropped)")
+    return doc, notes
+
+
 def load_stats(path: Path) -> dict:
-    """The --stats file: {"state": {...}, "action": {...}}, each with mean/std, q01/q99 or min/max."""
+    """The --stats file: {"state": {...}, "action": {...}}, each with mean/std, q01/q99 or min/max,
+    or openpi's norm_stats.json (see `openpi_stats`)."""
     doc = json.loads(path.read_text(encoding="utf-8"))
     if not isinstance(doc, dict):
         raise ValueError(f"{path}: expected a JSON object with \"state\" and \"action\"")
+    doc, notes = openpi_stats(doc)
+    for note in notes:
+        log(f"STATS TRIM {note}")
     if "observation.state" in doc and "state" not in doc:
         doc["state"] = doc.pop("observation.state")
     for block in ("state", "action"):
@@ -122,6 +163,7 @@ def load_stats(path: Path) -> dict:
 def apply_stats(manifest: dict, stats: dict) -> list[str]:
     """Write the --stats values into every normalize/denormalize step. Returns what was replaced."""
     model = manifest.get("model", {})
+    pi05 = manifest.get("policy", {}).get("name") == "pi05"
     done = []
     for step in model.get("preprocessors", []) + model.get("postprocessors", []):
         if step.get("type") not in ("normalize", "denormalize"):
@@ -133,6 +175,7 @@ def apply_stats(manifest: dict, stats: dict) -> list[str]:
                 raise ValueError(f"{step['type']}: no --stats block feeds the {name!r} entry")
             width = (entry.get("shape") or [0])[-1]
             supplied = stats[source]
+            real = None
             for key in STAT_KEYS:
                 if key not in supplied:
                     continue
@@ -141,7 +184,23 @@ def apply_stats(manifest: dict, stats: dict) -> list[str]:
                     raise ValueError(
                         f"{source}.{key} has {len(values)} values; the package's {name} has {width}"
                     )
+                real = len(values)
                 entry[key] = values + [IDENTITY_PAD[key]] * (width - len(values))
+            # pi0.5 bins the normalized state into its prompt, and openpi and LeRobot bin it at the
+            # robot's width (pad afterwards), so a narrower state stays narrow and the engine pads
+            # it for the graph (`pad_to`); identity stats would add a bin per padded dimension.
+            if pi05 and name == "state" and real is not None and real < width:
+                for key in STAT_KEYS:
+                    if key in supplied:
+                        entry[key] = entry[key][:real]
+                    else:
+                        entry.pop(key, None)
+                entry["shape"] = [real]
+                step["pad_to"] = width
+                for f in model.get("input_features", []):
+                    args = f.get("init_args", f)
+                    if args.get("ftype") == "STATE":
+                        args["shape"] = [real]
             missing = [k for k in MODE_KEYS.get(mode, ()) if k not in supplied]
             if missing:
                 raise ValueError(
@@ -151,6 +210,54 @@ def apply_stats(manifest: dict, stats: dict) -> list[str]:
     if not done:
         raise ValueError("the package has no normalize or denormalize step to take --stats")
     return done
+
+
+def empty_camera_problem(kind: str | None, cameras: list[str], names: list[str]) -> str | None:
+    """Why --empty-camera cannot drop `names` from the checkpoint's `cameras`, or None."""
+    if not names:
+        return None
+    if kind != "pi05":
+        return "--empty-camera is for pi0.5 checkpoints"
+    if len(set(names)) != len(names) or len(names) >= len(cameras) or set(names) != set(
+        cameras[len(cameras) - len(names):]
+    ):
+        return (
+            f"--empty-camera {', '.join(names)}: must be the last of the checkpoint's cameras "
+            f"{cameras}, each once, and at least one camera must stay"
+        )
+    return None
+
+
+def apply_empty_cameras(manifest: dict, names: list[str]) -> None:
+    """Serve the named cameras as empty slots (pixels -1, mask false) that clients do not send.
+
+    That is what LeRobot's pi0.5 does with a camera missing from the batch, and what openpi's DROID
+    policy does with right_wrist_0_rgb (zeros, mask false, then [-1, 1] scaling). The engine and
+    Intel's runtime append `empty_cameras` slots after the real ones, so only the checkpoint's last
+    cameras can be dropped without moving another camera's slot.
+    """
+    model = manifest.get("model", {})
+    features = model.get("input_features", [])
+    args = [f.get("init_args", f) for f in features]
+    visual = [i for i, a in enumerate(args) if a.get("ftype") == "VISUAL"]
+    tail = visual[len(visual) - len(names):] if names else []
+    if len(names) >= len(visual) or {args[i].get("name") for i in tail} != {
+        f"images.{n}" for n in names
+    }:
+        cameras = [args[i].get("name", "").removeprefix("images.") for i in visual]
+        raise ValueError(
+            f"--empty-camera {', '.join(names)}: must be the last of the package's cameras "
+            f"{cameras}, and at least one camera must stay"
+        )
+    steps = [
+        s for s in model.get("preprocessors", [])
+        if s.get("type") == "pi05" or str(s.get("class_path", "")).endswith(".Pi05Preprocessor")
+    ]
+    if len(steps) != 1:
+        raise ValueError("--empty-camera needs the package's one pi05 step")
+    params = steps[0].get("init_args", steps[0]) if "class_path" in steps[0] else steps[0]
+    params["empty_cameras"] = int(params.get("empty_cameras", 0)) + len(names)
+    model["input_features"] = [f for i, f in enumerate(features) if i not in tail]
 
 
 def package_mode(kind: str, pre: dict | None, config: dict) -> str:
@@ -337,6 +444,11 @@ def _preflight_checks(out: dict, files: set[str] | None, read, local: bool) -> d
     out["n_action_steps"] = config.get("n_action_steps")
     out["state_dim"] = feature_width(config, "input_features", "STATE")
     out["action_dim"] = feature_width(config, "output_features", "ACTION")
+    out["cameras"] = [
+        k.removeprefix("observation.images.")
+        for k, f in (config.get("input_features") or {}).items()
+        if f.get("type") == "VISUAL"
+    ]
     if kind not in SUPPORTED:
         return out
     gated = GATED_TOKENIZER.get(kind)
@@ -458,6 +570,10 @@ def export(args: argparse.Namespace) -> int:
     out = Path(args.out)
     tmp = out.with_name(out.name + ".f32")
     stats = load_stats(Path(args.stats)) if args.stats else None
+    problem = empty_camera_problem(kind, pre.get("cameras") or [], args.empty_camera)
+    if problem:
+        log(f"EXPORT FAILED: {problem}")
+        return 1
 
     if revision == LOCAL_REVISION:
         link = escaping_link(Path(args.model))
@@ -497,17 +613,19 @@ def export(args: argparse.Namespace) -> int:
     finally:
         shutil.rmtree(tmp, ignore_errors=True)
 
-    if stats is not None:
-        for name in ("manifest.json", "config.json"):
-            path = out / name
-            if not path.is_file():
-                continue
-            doc = json.loads(path.read_text(encoding="utf-8"))
-            if "model" not in doc:
-                continue
-            replaced = apply_stats(doc, stats)
-            path.write_text(json.dumps(doc, indent=2), encoding="utf-8")
-            log(f"STATS OK {name}: {', '.join(replaced)}")
+    for name in ("manifest.json", "config.json"):
+        path = out / name
+        if (stats is None and not args.empty_camera) or not path.is_file():
+            continue
+        doc = json.loads(path.read_text(encoding="utf-8"))
+        if "model" not in doc:
+            continue
+        if stats is not None:
+            log(f"STATS OK {name}: {', '.join(apply_stats(doc, stats))}")
+        if args.empty_camera:
+            apply_empty_cameras(doc, args.empty_camera)
+            log(f"CAMERAS OK {name}: empty {', '.join(args.empty_camera)}")
+        path.write_text(json.dumps(doc, indent=2), encoding="utf-8")
 
     if pre.get("license_files"):
         for name in pre["license_files"]:
@@ -540,6 +658,7 @@ def main(argv: list[str]) -> int:
     e.add_argument("--out", required=True)
     e.add_argument("--rtc", action="store_true")
     e.add_argument("--stats")
+    e.add_argument("--empty-camera", action="append", default=[])
     e.add_argument("--verify", action="store_true")
     args = ap.parse_args(argv)
     if args.cmd == "preflight":

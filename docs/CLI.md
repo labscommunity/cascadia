@@ -410,7 +410,7 @@ under the Cascadia cache built from hashed requirements; it needs `uv` 0.13.6
 or newer and `git` on `PATH`.
 
 ```
-cascadia export-policy --model <MODEL> -o <DIR> [--rtc] [--stats <FILE>] [--verify]
+cascadia export-policy --model <MODEL> -o <DIR> [--rtc] [--stats <FILE>] [--empty-camera <NAME>]... [--verify]
 ```
 
 | Flag | Default | Meaning |
@@ -418,7 +418,8 @@ cascadia export-policy --model <MODEL> -o <DIR> [--rtc] [--stats <FILE>] [--veri
 | `--model <MODEL>` | *required* | HF model id (e.g. `lerobot/smolvla_libero`) or a local LeRobot checkpoint directory with `config.json`. A local one is recorded as revision `local`, its licence is read from its `README.md`, and the gated-tokenizer check is skipped with a note. A checkpoint with a link that leaves its directory is refused. |
 | `-o, --output-dir <DIR>` | *required* | Package directory to write; must not exist or be empty. |
 | `--rtc` | off | Export the real-time chunking ports; the package serves the whole chunk. |
-| `--stats <FILE>` | none | Normalization statistics for a checkpoint that ships none: `{"state": {...}, "action": {...}}`. |
+| `--stats <FILE>` | none | Normalization statistics for a checkpoint that ships none: `{"state": {...}, "action": {...}}`, or openpi's `norm_stats.json` (`{"norm_stats": {"state": ..., "actions": ...}}`). Trailing dimensions where every statistic is exactly 0 are openpi's zero padding and are dropped (`state: 32 -> 8 (24 all-zero padding dims dropped)`); stats narrower than the checkpoint get identity statistics on the rest. |
+| `--empty-camera <NAME>` | none | π0.5, repeatable: a camera the robot does not have. Clients do not send it; its slot is served as an empty camera (pixels −1, masked), as LeRobot and openpi do. Only the checkpoint's last cameras. |
 | `--verify` | off | Run the traced input through PyTorch and the package's IR and print the differences. |
 
 Every refusal comes before the checkpoint is downloaded. The memory it needs
@@ -433,6 +434,15 @@ node, `cascadia run`/`worker`) is serving on the host.
 ```bash
 cascadia export-policy --model lerobot/smolvla_libero --output-dir ./smolvla_libero-ov
 cascadia run ./smolvla_libero-ov --engine ov-policy
+```
+
+π0.5 DROID ships no statistics; openpi publishes them with its checkpoint, and
+openpi's DROID client sends two cameras (exterior and wrist):
+
+```bash
+curl -fLO https://storage.googleapis.com/openpi-assets/checkpoints/pi05_droid/assets/droid/norm_stats.json
+cascadia export-policy --model lerobot/pi05_droid -o ./pi05_droid-ov \
+  --stats norm_stats.json --empty-camera right_wrist_0_rgb
 ```
 
 ---
