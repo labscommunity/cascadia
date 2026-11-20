@@ -132,7 +132,8 @@ def validate_manifest(m):
         for path in (component['xml'], component['weights']):
             relative_path(path)
             require(path in m['files'], 'unhashed component artifact')
-        require(component['xml'].endswith('.xml') and component['weights'].endswith('.bin') and component['xml'][:-4] == component['weights'][:-4], 'invalid IR pair')
+        xml, weights = component['xml'], component['weights']
+        require(xml.endswith('.xml') and weights.endswith('.bin') and xml.removesuffix('.xml') == weights.removesuffix('.bin'), 'invalid IR pair')
     return hashlib.sha256(canonical(m)).hexdigest()
 
 
@@ -141,11 +142,16 @@ def file_hash(path):
         return hashlib.file_digest(stream, 'sha256').hexdigest()
 
 
+def linked(path):
+    # is_symlink misses Windows directory junctions.
+    return path.is_symlink() or path.is_junction()
+
+
 def verify_bundle(root: Path, expected: str, selected):
     digest(expected)
-    require(not root.is_symlink(), 'bundle root is a symlink')
+    require(not linked(root), 'bundle root is a symlink')
     path = root / 'manifest.json'
-    require(not path.is_symlink() and path.stat().st_size <= 1024 * 1024, 'invalid manifest file')
+    require(not linked(path) and path.stat().st_size <= 1024 * 1024, 'invalid manifest file')
     manifest = parse_json(path.read_bytes())
     require(validate_manifest(manifest) == expected, 'manifest digest mismatch')
     require(len(set(selected)) == len(selected) and set(selected) <= manifest['components'].keys(), 'invalid component selection')
@@ -157,7 +163,7 @@ def verify_bundle(root: Path, expected: str, selected):
         path = root
         for part in name.split('/'):
             path /= part
-            require(not path.is_symlink(), 'artifact symlink')
+            require(not linked(path), 'artifact symlink')
         artifact = manifest['files'][name]
         require(path.is_file() and path.stat().st_size == artifact['bytes'], 'artifact length mismatch')
         require(file_hash(path) == artifact['sha256'], 'artifact hash mismatch')
@@ -165,9 +171,11 @@ def verify_bundle(root: Path, expected: str, selected):
     # influence execution. Runtime caches and config belong outside this root.
     for count, path in enumerate(root.rglob('*'), 1):
         require(count <= 1024, 'bundle has too many entries')
-        require(not path.is_symlink(), 'bundle symlink')
+        require(not linked(path), 'bundle symlink')
         if path.is_file():
             require(path.relative_to(root).as_posix() in manifest['files'] or path == root / 'manifest.json', 'unlisted artifact')
+        else:
+            require(path.is_dir(), 'nonregular artifact')
     return manifest
 
 

@@ -6,7 +6,7 @@ build-backend = "setuptools.build_meta"
 name = "cascadia-diffusion"
 version = "0.1.0"
 description = "Verified OpenVINO diffusion stages for Cascadia"
-requires-python = ">=3.11"
+requires-python = ">=3.12"
 license = "Apache-2.0"
 dependencies = []
 

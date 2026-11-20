@@ -160,11 +160,8 @@ impl Manifest {
                     return invalid("component references an unhashed artifact");
                 }
             }
-            if !component.xml.ends_with(".xml")
-                || !component.weights.ends_with(".bin")
-                || component.xml.trim_end_matches(".xml")
-                    != component.weights.trim_end_matches(".bin")
-            {
+            let xml = component.xml.strip_suffix(".xml");
+            if xml.is_none() || xml != component.weights.strip_suffix(".bin") {
                 return invalid("IR XML and BIN must share a basename");
             }
         }
