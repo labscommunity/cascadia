@@ -3,9 +3,9 @@
 ## Local OpenVINO comparison — 2026-11-13
 
 The fixed 512×512 SDXL profile was exported and run on an idle Intel Tiber
-Arrow Lake machine (`cascadia-tate-02`, PDX88-HP0756, Core Ultra 7 265T,
-32 GB RAM, Windows). Existing fleet/monitoring services were left running.
-No tests used alpha, beta, charlie, delta, tate-08, or tate-07.
+Arrow Lake machine (Core Ultra 7 265T, 32 GB RAM, Windows). Existing
+fleet/monitoring services were left running. Six in-service fleet hosts were
+not used.
 
 Source: [OpenVINO SDXL INT8](https://huggingface.co/OpenVINO/stable-diffusion-xl-base-1.0-int8-ov), revision:
 `d54e5b43fcb6b4b358f3a134269115d3fcb3eb25`.
@@ -104,8 +104,8 @@ HTTP authentication, framing, and retaining capacity after a client disconnect.
 Report date uses America/Chicago; evidence timestamps use UTC.
 
 The same SDXL artifacts were served through the enterprise admitted QUIC mesh on two
-idle older Tiber Arrow Lake PCs, each Core Ultra 7 265T / 32 GB RAM, Windows, Intel GPU
-driver `32.0.101.8132`. The final production-feature release binary used enterprise
+idle older Tiber Arrow Lake PCs (hosts A and B), each Core Ultra 7 265T / 32 GB RAM,
+Windows, Intel GPU driver `32.0.101.8132`. The final production-feature release binary used enterprise
 `c3da10f98b6c84dd12f1478b651a7cc989a24e6b` and upstream
 `450520bbc7c2ee69c174ffbbdc32b80c261a95ea`. Its SHA-256 was
 `3e39f0b7e235bb69f026324ac9acfdd4821d23be5a072de9aaacaf353e5397fd`. The packaged Python

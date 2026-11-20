@@ -17,17 +17,19 @@ Use a dedicated Python environment. Install the package from the same upstream
 commit as the Rust integration. The runtime extra pins the inference stack;
 the worker extra installs only the dependencies needed to execute stages.
 
-```sh
-python -m venv .venv
-.venv/bin/python -m pip install './tools/diffusion[runtime]'
-```
-
-For the qualified Windows/Python 3.14 environment, run from the repository root
-with Python 3.14 selected:
+The qualified environment is Windows with Python 3.14; install it with the
+constraints file, from the repository root with Python 3.14 selected:
 
 ```powershell
 python -m venv .venv
 .\.venv\Scripts\python.exe -m pip install -c tools\diffusion\constraints-windows-py314.txt '.\tools\diffusion[runtime]'
+```
+
+Other platforms are unpinned beyond the direct dependencies in the extras:
+
+```sh
+python -m venv .venv
+.venv/bin/python -m pip install './tools/diffusion[runtime]'
 ```
 
 The following examples use the installed `cascadia-diffusion` entry point.
