@@ -111,6 +111,10 @@ impl Worker {
     pub fn quarantined(&self) -> bool {
         self.gate.quarantined()
     }
+    /// True when `owner` holds a live lease on this worker; see [`Gate::leased_to`].
+    pub fn leased_to(&self, owner: &str) -> bool {
+        self.gate.leased_to(owner, Instant::now())
+    }
     pub fn drain(&self) {
         self.gate.drain();
     }
