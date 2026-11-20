@@ -419,9 +419,9 @@ mod tests {
             image_slots: 2,
             image_hw: None,
             state_len: 8,
-            action_shape: [30, 32],
+            action_shape: [10, 32],
             noise: NoiseMode::Input,
-            noise_shape: Some(vec![30, 32]),
+            noise_shape: Some(vec![10, 32]),
             rtc: false,
         };
         let (spec, layout) = derive_spec(&m, &ir, server()).unwrap();
@@ -429,18 +429,18 @@ mod tests {
         assert_eq!(layout.slots, vec![Some(0), Some(1)]);
         assert_eq!((spec.height, spec.width), (256, 256));
         assert_eq!(spec.resize, ResizeConvention::Stretch);
-        assert_eq!((spec.state_len, spec.chunk), (8, [30, 7]));
+        assert_eq!((spec.state_len, spec.chunk), (8, [10, 7]));
         // The stats must match the graph's output shape.
         let short = IrFacts {
-            action_shape: [10, 32],
-            noise_shape: Some(vec![10, 32]),
+            action_shape: [30, 32],
+            noise_shape: Some(vec![30, 32]),
             ..ir.clone()
         };
         let e = derive_spec(&m, &short, server()).unwrap_err().to_string();
-        assert!(e.contains("30 rows; the actions have 10"), "{e}");
+        assert!(e.contains("10 rows; the actions have 30"), "{e}");
         let narrow = IrFacts {
-            action_shape: [30, 16],
-            noise_shape: Some(vec![30, 16]),
+            action_shape: [10, 16],
+            noise_shape: Some(vec![10, 16]),
             ..ir
         };
         let e = derive_spec(&m, &narrow, server()).unwrap_err().to_string();

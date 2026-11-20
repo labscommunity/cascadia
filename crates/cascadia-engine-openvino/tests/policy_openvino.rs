@@ -6,7 +6,8 @@
 //! - `CASCADIA_POLICY_PACKAGE_XVLA`: `lerobot/xvla-libero`, cameras flipped on the host;
 //! - `CASCADIA_POLICY_PACKAGE_VLAJEPA`: `lerobot/VLA-JEPA-LIBERO`, prompt padded to 288;
 //! - `CASCADIA_POLICY_PACKAGE_EVO1`: `zuoxingdong/evo1_libero`, cameras flipped on the host;
-//! - `CASCADIA_POLICY_PACKAGE_XR0`: `XiaomiRobotics/Xiaomi-Robotics-0-LIBERO`, fp16 weights;
+//! - `CASCADIA_POLICY_PACKAGE_XR0`: `XiaomiRobotics/Xiaomi-Robotics-0-LIBERO` with Xiaomi's
+//!   inference action mask, a 10-action chunk, fp16 weights;
 //! - `CASCADIA_POLICY_PACKAGE_GROOT`: `nvidia/GR00T-N1.7-LIBERO` (libero_spatial), Intel's
 //!   edge-ai-suites single-IR export, fp16 weights;
 //! - `CASCADIA_POLICY_PACKAGE_MOLMOACT2`: `allenai/MolmoAct2-LIBERO`, Intel's exporter, fp16 weights.
@@ -17,8 +18,8 @@
 //! the package, or `<dir>.<name>` beside it). EVO1's are LeRobot's served
 //! actions in `ref.npz`, for the raw LIBERO frames in `frames.npz` (same rule).
 //! XR0's are Intel's runtime stages in `xr0-stages-f32.npz` (the exporter's
-//! `fixtures-f32.npz`, saved uncompressed) and PyTorch f32 in
-//! `xr0-libero-f32.ref.npz` (same rule). GR00T's are NVIDIA's `Gr00tPolicy`
+//! `fixtures-f32.npz`, saved uncompressed) and PyTorch f32 of Intel's port with
+//! Xiaomi's action mask in `<dir>.ref.npz` (same rule). GR00T's are NVIDIA's `Gr00tPolicy`
 //! (PyTorch f32) graph inputs, raw output and decoded actions in `ref.npz`, for
 //! the frames and states in `gr00t-frames.npz` (regenerated from the
 //! exporter's seeds; same rule). MolmoAct2's are Intel's runtime stages in
@@ -1683,9 +1684,9 @@ fn xr0_ports() -> (Vec<PortInfo>, Vec<PortInfo>) {
             port("tokenized_prompt_mask", DType::I64, &[1, 256]),
             port("pixel_values", DType::F32, &[512, 1536]),
             port("state", DType::F32, &[1, 1, 32]),
-            port("noise", DType::F32, &[1, 30, 32]),
+            port("noise", DType::F32, &[1, 10, 32]),
         ],
-        vec![port("action", DType::F32, &[1, 30, 32])],
+        vec![port("action", DType::F32, &[1, 10, 32])],
     )
 }
 
@@ -1723,7 +1724,7 @@ fn xr0_engine_binds_intels_stages() {
         Box::new(JepaRecorder {
             inputs: bound.clone(),
             output: Arc::new(Mutex::new(npz(&z, "90_runner/action").f32s())),
-            shape: vec![1, 30, 32],
+            shape: vec![1, 10, 32],
         }),
         &inputs,
         &outputs,
@@ -1783,10 +1784,22 @@ fn xr0_engine_binds_intels_stages() {
         TensorData::F32(npz(&z, "01_XR0Preprocessor/state").f32s())
     );
     assert_eq!(get("noise"), TensorData::F32(noise));
-    assert_eq!((a.steps, a.dim), (30, 7));
+    assert_eq!((a.steps, a.dim), (10, 7));
     let d = max_abs_diff(&a.actions, &npz(&z, "91_XR0Postprocessor/action").f32s());
     eprintln!("xr0 denormalize vs intel: max abs {d}");
     assert!(d <= 1e-6, "xr0_denormalize differs by {d}");
+}
+
+/// The PyTorch f32 reference, `<dir>.ref.npz` in the package or beside it.
+fn xr0_reference(dir: &Path) -> Vec<u8> {
+    let name = dir.file_name().unwrap().to_string_lossy();
+    let inside = dir.join(format!("{name}.ref.npz"));
+    let path = if inside.exists() {
+        inside
+    } else {
+        dir.with_extension("ref.npz")
+    };
+    std::fs::read(&path).unwrap_or_else(|e| panic!("{}: {e}", path.display()))
 }
 
 /// PyTorch f32's second draw, denormalized with the package's stats.
@@ -1798,15 +1811,15 @@ fn xr0_second_reference(dir: &Path, z: &[u8]) -> Vec<f32> {
     cascadia_engine_openvino::policy::xr0::denormalize(s, &npz(z, "ref2").f32s(), 32)
 }
 
-/// CPU f32 with fp16 weights against PyTorch f32 on both noise draws (spike:
-/// 8.3e-4 / 8.9e-4 on the 32-wide output), and the prompt limit: the tokenizer
+/// CPU f32 with fp16 weights against PyTorch f32 on both noise draws (measured:
+/// 5.5e-4 / 4.5e-4 normalized, 2.1e-4 / 1.7e-4 served), and the prompt limit: the tokenizer
 /// IR's `truncation` variable is held off, so 256 tokens are served and 257 refused.
 #[test]
 fn xr0_spec_prompt_limit_and_cpu_parity() {
     let Some(dir) = xr0("xr0_spec_prompt_limit_and_cpu_parity") else {
         return;
     };
-    let z = beside(&dir, "xr0-libero-f32.ref.npz");
+    let z = xr0_reference(&dir);
     let task = npz(&z, "task").string();
     let mut tok = OvTokenizer::load(&dir.join("tokenizer.xml")).unwrap();
     assert!(tok.has_truncation_state());
@@ -1834,10 +1847,10 @@ fn xr0_spec_prompt_limit_and_cpu_parity() {
     assert_eq!(spec.cameras, vec!["base", "wrist_left"]);
     assert_eq!((spec.height, spec.width), (256, 256));
     assert_eq!(spec.resize, ResizeConvention::Stretch);
-    assert_eq!((spec.state_len, spec.chunk), (8, [30, 7]));
+    assert_eq!((spec.state_len, spec.chunk), (8, [10, 7]));
     assert_eq!(
         (spec.noise, spec.noise_shape.clone()),
-        (NoiseMode::Input, Some(vec![30, 32]))
+        (NoiseMode::Input, Some(vec![10, 32]))
     );
     let second = xr0_second_reference(&dir, &z);
     for (noise, want, label) in [
@@ -1846,7 +1859,7 @@ fn xr0_spec_prompt_limit_and_cpu_parity() {
     ] {
         let obs = xr0_observation(&z, "obs_", task.clone(), npz(&z, noise).f32s());
         let a = engine.infer(&obs).unwrap();
-        assert_eq!((a.steps, a.dim, a.actions.len()), (30, 7, 210));
+        assert_eq!((a.steps, a.dim, a.actions.len()), (10, 7, 70));
         let d = max_abs_diff(&a.actions, &want);
         eprintln!(
             "xr0 engine cpu f32 vs pytorch f32 ({label}): max abs {d} infer_ms={:.0}",
@@ -1865,7 +1878,8 @@ fn xr0_spec_prompt_limit_and_cpu_parity() {
     engine.infer(&obs).unwrap();
 }
 
-/// XR0 on the GPU: f16 within 1e-2 of PyTorch f32 (spike: 3.2e-3 / 4.5e-3).
+/// XR0 on the GPU: f16 within 1e-2 of PyTorch f32, measured on the Arc
+/// (TODO(remeasure): 3.2e-3 / 4.5e-3 was the unmasked 30-row package).
 /// At `--ov-inference-precision f32` the GPU compile fails (`CL_INVALID_EVENT`), which must
 /// be a load error; that runs in a child process, as π0's does.
 #[test]
@@ -1877,7 +1891,7 @@ fn xr0_gpu_infer_f16_and_f32_is_a_load_error() {
     if !gpu_enabled(test) {
         return;
     }
-    let z = beside(&dir, "xr0-libero-f32.ref.npz");
+    let z = xr0_reference(&dir);
     let task = npz(&z, "task").string();
     let second = xr0_second_reference(&dir, &z);
     {

@@ -2924,23 +2924,23 @@ mod tests {
                 port(PROMPT_MASK, DType::I64, &[1, 2048]),
                 port(PIXEL_VALUES, DType::F32, &[512, 1536]),
                 port(STATE, DType::F32, &[1, 1, 32]),
-                port(NOISE, DType::F32, &[1, 30, 32]),
+                port(NOISE, DType::F32, &[1, 10, 32]),
             ],
-            vec![port(ACTION, DType::F32, &[1, 30, 32])],
+            vec![port(ACTION, DType::F32, &[1, 10, 32])],
         )
     }
 
     #[test]
     fn xr0_binds_its_ports_pads_the_state_and_denormalizes_per_row() {
         // The byte tokenizer needs a wide port: the template alone is ~2 KB.
-        let out = vec![1.0f32; 30 * 32];
+        let out = vec![1.0f32; 10 * 32];
         let mut r = rig_with(XR0_LIBERO, xr0_ports(), false, true, out);
         let spec = r.engine.spec().clone();
         assert_eq!(spec.cameras, vec!["base", "wrist_left"]);
-        assert_eq!(spec.chunk, [30, 7]);
+        assert_eq!(spec.chunk, [10, 7]);
         let o = obs(&spec, "go");
         let a = r.engine.infer(&o).unwrap();
-        assert_eq!((a.steps, a.dim, a.actions.len()), (30, 7, 210));
+        assert_eq!((a.steps, a.dim, a.actions.len()), (10, 7, 70));
         // 1 * (std + 1e-6) + mean, in f32, first row.
         assert_eq!(a.actions[0], 1.0 * (0.335_501_02f32 + 1e-6) + 0.0628);
         let (inputs, _) = xr0_ports();
@@ -3386,7 +3386,7 @@ mod tests {
             ("vlajepa", vla_jepa()),
             (
                 "xr0",
-                rig_with(XR0_LIBERO, xr0_ports(), false, true, vec![1.0; 30 * 32]),
+                rig_with(XR0_LIBERO, xr0_ports(), false, true, vec![1.0; 10 * 32]),
             ),
         ] {
             let spec = r.engine.spec().clone();

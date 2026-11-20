@@ -2629,10 +2629,10 @@ mod tests {
         };
         assert_eq!(
             (d.action_mean.len(), d.action_mean[0].len(), d.action_dim),
-            (30, 32, Some(7))
+            (10, 32, Some(7))
         );
         assert_eq!(d.action_eps, 1e-6);
-        assert_eq!(d.action_mean[29][0], 0.0628);
+        assert_eq!(d.action_mean[9][0], 0.0628);
         // Noise comes after xr0, as Intel's xr0 returns a new dict.
         assert!(matches!(m.preprocessors[1], PreStep::Noise { .. }));
     }
@@ -2686,8 +2686,8 @@ mod tests {
         // Identity stats are a placeholder.
         let mut v = xr0();
         let p = &mut v["model"]["postprocessors"][0];
-        p["action_mean"] = json!(vec![vec![0.0; 32]; 30]);
-        p["action_std"] = json!(vec![vec![1.0; 32]; 30]);
+        p["action_mean"] = json!(vec![vec![0.0; 32]; 10]);
+        p["action_std"] = json!(vec![vec![1.0; 32]; 10]);
         assert!(e(&v).contains("xr0_denormalize stats are identity placeholders"));
         // Intel's class names map to the steps.
         let mut v = xr0();

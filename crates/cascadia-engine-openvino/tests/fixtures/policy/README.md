@@ -25,7 +25,8 @@ Copied, unmodified:
   its `smolvla_resize` step.
 - `xr0-libero-manifest.json`: our export of `XiaomiRobotics/Xiaomi-Robotics-0-LIBERO` (Intel's
   exporter, physical-ai-studio `8f132416`, runtime `e3dd944`), f32 with fp16 weights, the in-graph
-  noise replaced by a `noise` input and a `noise` step after `xr0`.
+  noise replaced by a `noise` input and a `noise` step after `xr0`, the denoised action masked to
+  the checkpoint's real dims (`std > 1e-5`, 7 of 32) as Xiaomi's model does, a 10-action chunk.
 - `gr00t-libero-spatial-manifest.json`: our export of `nvidia/GR00T-N1.7-LIBERO`
   (`libero_spatial`, revision `65854032`) with Intel's edge-ai-suites single-IR exporter
   (`decbb06f`, Isaac-GR00T `3df8b382`), f32 with fp16 weights, static shapes and named ports, the
