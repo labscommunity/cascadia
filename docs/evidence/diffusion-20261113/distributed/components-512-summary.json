@@ -1,0 +1,181 @@
+{
+  "started_unix": 1794615271.823562,
+  "node_executable_names": [
+    "cascadia-image-stage-e2e.exe",
+    "cascadia-image-stage-e2e.exe"
+  ],
+  "configuration": {
+    "source_commit": "c3da10f98b6c84dd12f1478b651a7cc989a24e6b",
+    "runtime_source": "git+https://github.com/labscommunity/cascadia?rev=450520bbc7c2ee69c174ffbbdc32b80c261a95ea#450520bbc7c2ee69c174ffbbdc32b80c261a95ea",
+    "node_sha256": "3e39f0b7e235bb69f026324ac9acfdd4821d23be5a072de9aaacaf353e5397fd",
+    "profile": "release",
+    "manifest": "c6dae31741b7816562a8bf65d27888814ab9a393321681cc606afda58b328243",
+    "model": "sdxl-components-512",
+    "size": "512x512",
+    "mode": "components",
+    "routes": {
+      "text_encoder": "1",
+      "text_encoder_2": "local",
+      "unet": "local",
+      "vae_decoder": "local"
+    },
+    "expected_image_sha256": "8dc0024aaca6e425e20ec7bc735beb228f09d39f6ad46977a36b966947ae3785"
+  },
+  "harness_sha256": "d3f3bd337bbf75e6c60853d11399400e5513587bc1bf90b546bdeb97781173f0",
+  "suite": "smoke",
+  "checks": [
+    "worker_preflight",
+    "worker_preflight",
+    "both_workers_ready_with_ca_admission",
+    "authentication_and_invalid_requests_rejected",
+    "image_generated",
+    "distributed_output_matches_local_reference",
+    "production_stage_metrics_exported",
+    "image_generated",
+    "maximum_public_body_generates_without_quarantine",
+    "oversized_public_body_rejected_without_quarantine",
+    "stage_execution_evidence",
+    "stage_execution_evidence",
+    "passed"
+  ],
+  "check_details": [
+    {
+      "check": "both_workers_ready_with_ca_admission",
+      "source_commit": "c3da10f98b6c84dd12f1478b651a7cc989a24e6b",
+      "runtime": "git+https://github.com/labscommunity/cascadia?rev=450520bbc7c2ee69c174ffbbdc32b80c261a95ea#450520bbc7c2ee69c174ffbbdc32b80c261a95ea"
+    },
+    {
+      "check": "authentication_and_invalid_requests_rejected"
+    },
+    {
+      "check": "distributed_output_matches_local_reference",
+      "sha256": "8dc0024aaca6e425e20ec7bc735beb228f09d39f6ad46977a36b966947ae3785"
+    },
+    {
+      "check": "production_stage_metrics_exported"
+    },
+    {
+      "check": "maximum_public_body_generates_without_quarantine",
+      "public_bytes": 65536,
+      "sidecar_bytes": 65615
+    },
+    {
+      "check": "oversized_public_body_rejected_without_quarantine"
+    },
+    {
+      "check": "stage_execution_evidence",
+      "worker": 0,
+      "calls": 30,
+      "components": [
+        "text_encoder_2",
+        "unet",
+        "vae_decoder"
+      ],
+      "input_bytes": 33817724,
+      "output_bytes": 12620746
+    },
+    {
+      "check": "stage_execution_evidence",
+      "worker": 1,
+      "calls": 4,
+      "components": [
+        "text_encoder"
+      ],
+      "input_bytes": 3620,
+      "output_bytes": 2852728
+    },
+    {
+      "check": "passed",
+      "suite": "smoke"
+    }
+  ],
+  "cleanup_errors": [],
+  "log_collection_errors": [],
+  "images": [
+    {
+      "label": "cold",
+      "seconds": 76.17435737419873,
+      "sha256": "8dc0024aaca6e425e20ec7bc735beb228f09d39f6ad46977a36b966947ae3785",
+      "request_id": "8c0638c9-8b6a-4aae-90e1-f491aefa9794",
+      "bytes": 366576,
+      "variance": 7341.548665137714
+    },
+    {
+      "label": "maximum-public-body",
+      "seconds": 18.50492479186505,
+      "sha256": "cbb48ed3842d3160d16c1eae55367b34ff0e16068550677f639bfd3e8e532296",
+      "request_id": "e552bf34-36ed-4257-af9b-e298fdfe5198",
+      "bytes": 455337,
+      "variance": 7001.458944104132
+    }
+  ],
+  "workers": [
+    {
+      "cpu": "Intel(R) Core(TM) Ultra 7 265T",
+      "ram_bytes": 33752002560,
+      "gpu": [
+        {
+          "Name": "Intel(R) Graphics",
+          "DriverVersion": "32.0.101.8132"
+        }
+      ],
+      "components": [
+        "text_encoder_2",
+        "unet",
+        "vae_decoder"
+      ],
+      "memory": {
+        "WorkingSet64": 7439556608,
+        "PrivateMemorySize64": 8688619520,
+        "sampled_gpu_shared_bytes": 6475980800,
+        "samples": 10,
+        "sample_errors": 0
+      }
+    },
+    {
+      "cpu": "Intel(R) Core(TM) Ultra 7 265T",
+      "ram_bytes": 33779265536,
+      "gpu": [
+        {
+          "Name": "Intel(R) Graphics",
+          "DriverVersion": "32.0.101.8132"
+        }
+      ],
+      "components": [
+        "text_encoder"
+      ],
+      "memory": {
+        "WorkingSet64": 394821632,
+        "PrivateMemorySize64": 991645696,
+        "sampled_gpu_shared_bytes": 155578368,
+        "samples": 10,
+        "sample_errors": 0
+      }
+    }
+  ],
+  "stage_execution": [
+    {
+      "check": "stage_execution_evidence",
+      "worker": 0,
+      "calls": 30,
+      "components": [
+        "text_encoder_2",
+        "unet",
+        "vae_decoder"
+      ],
+      "input_bytes": 33817724,
+      "output_bytes": 12620746
+    },
+    {
+      "check": "stage_execution_evidence",
+      "worker": 1,
+      "calls": 4,
+      "components": [
+        "text_encoder"
+      ],
+      "input_bytes": 3620,
+      "output_bytes": 2852728
+    }
+  ],
+  "memory_note": "Maximum of summed sampled owned-process values per host; shared iGPU allocations overlap system RAM. Compilation caches were reused. These are not independent physical-memory totals or an empty-cache benchmark."
+}

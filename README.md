@@ -22,7 +22,8 @@ Frontier models don't fit on a single laptop. Cloud APIs are expensive, opaque, 
 - **Pipeline parallelism**: shard a model into stages and run each stage on a different machine, activations relayed over TCP
 - **Built-in sharder**: `cascadia shard` cuts a HuggingFace model into INT4 per-stage shards; no external tooling
 - **Seven engines**: `mock`, `ov-genai`, `ov-runtime`, `ov-dist-spec` (distributed speculative decoding), `gemma4`, a CPU-targeted `sparse-moe` engine for large mixture-of-experts models (Kimi K2.6, MiniMax-M2, GLM-5, DeepSeek-V4, Inkling), and `qwen35` for the Qwen3.5 hybrid family (Qwen3.6 MoE, dense Qwen3.8)
-- **Single static binary per node**: Rust only at runtime; no Python on workers
+- **Single static binary per LLM node**: Rust only at runtime; no Python on LLM workers
+- **SDXL image runtime**: a separate [diffusion package](tools/diffusion/README.md) exports and executes verified OpenVINO components and two-way denoiser partitions; requires its pinned Python environment
 - **Zero-config peer discovery**: `cascadia discover` finds LAN peers over mDNS
 - **`cascadia doctor`**: diagnoses the one failure everyone hits: OpenVINO silently not seeing your GPU
 
@@ -159,6 +160,19 @@ Not sure of a node's address? `cascadia discover` lists Cascadia peers on the LA
 Two stages on the **same host** (e.g. iGPU + dGPU in one box)? Link them over a Unix domain socket instead of loopback TCP — `--listen unix:/tmp/cascadia-1.sock` on the downstream, the same path as `--next` on the upstream. Measured 85–92 % lower per-frame round-trip latency for decode-sized frames (Unix only; see [docs/CLI.md](docs/CLI.md#unix-domain-sockets)).
 
 For distributed speculative decoding, run **every** rank with `--engine ov-dist-spec` (they share a wire protocol) and give rank 0 `--draft-model ~/models/llama-3.2-1b-int4-ov --spec-k 4` — the draft is a local OpenVINO IR directory, not an HF id. See ([docs/engines/ov-dist-spec.md](docs/engines/ov-dist-spec.md)).
+
+### Image generation
+
+The [diffusion runtime](tools/diffusion/README.md) provides local SDXL image
+generation, component export/packing, and a supervised stage executor. Its Rust
+`cascadia-diffusion` crate handles immutable artifact contracts, bounded tensors,
+and execution leases. Install the Python package separately; it is not part of
+the LLM release bundle or the `cascadia worker` engine list.
+
+The [enterprise integration](https://github.com/labscommunity/cascadia-enterprise)
+adds the authenticated image API and multi-host component/layer placement using
+this upstream runtime. See [hardware qualification](docs/diffusion-stage-qualification.md)
+for the tested SDXL profile and the measured cost of transferring activations.
 
 ### Web dashboard
 
