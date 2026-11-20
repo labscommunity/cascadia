@@ -98,6 +98,9 @@ pub trait PolicyEngine: Send {
 /// noise is allowed and its length, and the RTC inputs.
 pub fn check_observation(spec: &PolicySpec, obs: &Observation) -> EngineResult<()> {
     let bad = |msg: String| Err(EngineError::InvalidConfig(msg));
+    if spec.history == 0 {
+        return bad("the spec's history is 0; it must be at least 1".into());
+    }
     let mut seen = HashSet::new();
     for (name, img) in &obs.images {
         if !seen.insert(name.as_str()) && spec.history == 1 {
@@ -426,6 +429,13 @@ mod tests {
         assert!(err_of(&s, &short).contains("state has 5 values; expected 2 rows of 3"));
         // One observation is refused, not repeated.
         assert!(err_of(&s, &obs()).contains("has 1 frames"));
+        // History 0 would otherwise pass any frames with an empty state.
+        let zero = PolicySpec { history: 0, ..s };
+        let stateless = Observation {
+            state: Vec::new(),
+            ..obs()
+        };
+        assert!(err_of(&zero, &stateless).contains("history is 0"));
     }
 
     #[test]

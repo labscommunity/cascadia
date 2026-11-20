@@ -492,6 +492,18 @@ fn scalar_uint(what: &str, a: &NpArray<'_>) -> Result<u32, RequestError> {
     }
 }
 
+/// physicalai sends one observation per call; a history package takes more.
+pub(super) fn one_observation(spec: &PolicySpec) -> Result<(), String> {
+    if spec.history > 1 {
+        return Err(format!(
+            "this model takes the last {} observations per call; physicalai's protocol sends \
+             one, so drive it over the openpi WebSocket",
+            spec.history
+        ));
+    }
+    Ok(())
+}
+
 /// Map physicalai's inputs onto an [`Observation`] for `spec`.
 ///
 /// `state` is `[D]` or `[1, D]`; `task` a one-string list (the prompt);
@@ -505,13 +517,7 @@ fn observation(
     images: Vec<(String, Image)>,
     spec: &PolicySpec,
 ) -> Result<Observation, RequestError> {
-    if spec.history > 1 {
-        return refuse(format!(
-            "this model takes the last {} observations per call; physicalai's protocol sends \
-             one, so drive it over the openpi WebSocket",
-            spec.history
-        ));
-    }
+    one_observation(spec).map_err(RequestError::new)?;
     let (mut state, mut prompt, mut noise) = (None, None, None);
     let (mut left, mut delay, mut weight, mut horizon) = (None, None, None, None);
     let mut budget = u64::MAX;

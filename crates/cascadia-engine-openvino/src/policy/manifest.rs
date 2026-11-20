@@ -2016,6 +2016,14 @@ fn xr0_step(params: Map<String, Value>, ctx: &str) -> EngineResult<Xr0Step> {
             p.temporal_patch_size
         ));
     }
+    // Qwen3-VL's video processor samples a frame list at fps 2 of an assumed
+    // 24 fps, keeping at least min_frames 4: a longer history loses frames there.
+    if processor == Xr0Processor::Xr1 && history > 4 {
+        return refuse(format!(
+            "{ctx}: history {history}; Xiaomi's processor keeps at most 4 frames of a video \
+             unchanged"
+        ));
+    }
     let (mean, std) = (
         p.image_mean.map(|x| x as f32),
         p.image_std.map(|x| x as f32),
@@ -2813,6 +2821,9 @@ mod tests {
         let mut v = xr1();
         step(&mut v)["history"] = json!(3);
         assert!(e(&v).contains("history 3 is not a multiple of temporal_patch_size 2"));
+        let mut v = xr1();
+        step(&mut v)["history"] = json!(6);
+        assert!(e(&v).contains("history 6; Xiaomi's processor keeps at most 4 frames"));
         let mut v = xr1();
         step(&mut v)["history"] = json!(2);
         assert!(e(&v).contains("camera \"agentview_left_1\" does not end in _0"));

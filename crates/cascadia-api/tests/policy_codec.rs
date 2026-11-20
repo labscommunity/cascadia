@@ -258,6 +258,21 @@ fn decodes_and_encodes_an_openpi_client_history() {
         .contains("shape [3, 4, 4, 3]; expected [2, 4, 4, 3]"));
 }
 
+/// History 0 from a server's metadata would divide by zero in the encoder.
+#[test]
+fn history_zero_is_refused() {
+    use cascadia_api::policy::decode_metadata;
+    let zero = PolicySpec {
+        history: 0,
+        ..spec()
+    };
+    let e = decode_metadata(&encode_metadata(&zero)).unwrap_err().0;
+    assert!(e.contains("history 0"), "{e}");
+    let obs = decode_request(REQUEST, &spec()).unwrap();
+    let e = encode_request(&obs, &zero).unwrap_err().0;
+    assert!(e.contains("history is 0"), "{e}");
+}
+
 #[test]
 fn rtc_fields_round_trip_and_take_a_batch_of_one() {
     let mut obs = decode_request(REQUEST_RTC, &rtc_spec()).unwrap();

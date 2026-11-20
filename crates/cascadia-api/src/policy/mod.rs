@@ -452,7 +452,8 @@ fn metadata_value(spec: &PolicySpec, id: &PackageIdentity, timing: bool) -> serd
     // Keep the key order the metadata had before `rtc_chunk_size` joined the
     // spec (it followed `chunk_size`), so that with serde_json's
     // `preserve_order` a package's metadata bytes, and their hash, are
-    // unchanged. It is the spec's last field, so removing it moves nothing.
+    // unchanged. It is the last field serialized while `history` is 1 (left
+    // out), so removing it moves nothing; a history package has no older bytes.
     let rtc = o.remove("rtc_chunk_size").unwrap_or_default();
     o.insert("policy_name".into(), id.policy_name.clone().into());
     o.insert("chunk_size".into(), spec.chunk[0].into());
@@ -492,6 +493,9 @@ pub fn decode_metadata(bytes: &[u8]) -> Result<(PolicySpec, PackageIdentity), Re
     let v = msgpack::parse(bytes)?.to_json();
     let spec: PolicySpec = serde_json::from_value(v.clone())
         .map_err(|e| RequestError::new(format!("metadata is not a policy spec: {e}")))?;
+    if spec.history == 0 {
+        return refuse("metadata states history 0; it must be at least 1");
+    }
     let id = PackageIdentity {
         policy_name: v["policy_name"].as_str().unwrap_or_default().to_string(),
         warmup_ms: None,
@@ -506,6 +510,9 @@ pub fn decode_metadata(bytes: &[u8]) -> Result<(PolicySpec, PackageIdentity), Re
 pub fn encode_request(obs: &Observation, spec: &PolicySpec) -> Result<Vec<u8>, RequestError> {
     if obs.rtc.is_some() && spec.rtc_chunk_size.is_none() {
         return refuse("this model takes no RTC inputs; export it with RTC enabled");
+    }
+    if spec.history == 0 {
+        return refuse("the spec's history is 0; it must be at least 1");
     }
     let mut w = Writer::default();
     let n = 3

@@ -3,7 +3,7 @@
 //! (`processor: "xr1"`) from Xiaomi's `processing_mibot.py` and
 //! `eval_robocasa365/entry.py`.
 //!
-//! Frames must arrive at the size Intel's resize leaves alone (256×256 for
+//! XR0's frames must arrive at the size Intel's resize leaves alone (256×256 for
 //! LIBERO), so its OpenCV resize never runs here. XR1's processor never
 //! resizes; its client crops each frame to the centre 0.95 and resizes it back
 //! (bilinear) before sending.
@@ -61,7 +61,7 @@ fn resize_target(h: usize, w: usize, factor: usize, max_pixels: usize) -> [usize
 }
 
 /// Cameras are the VISUAL `input_features` (`[3, H, W]`, one size for all),
-/// the state length the STATE feature; refused where Intel would resize.
+/// the state length the STATE feature; refused where Intel would resize (xr0).
 pub fn geometry(m: &PolicyManifest, step: &Xr0Step) -> EngineResult<Xr0Geometry> {
     let mut hw = None;
     let mut views = Vec::new();
@@ -125,7 +125,8 @@ pub fn geometry(m: &PolicyManifest, step: &Xr0Step) -> EngineResult<Xr0Geometry>
         return refuse(format!("aspect ratio of {hw:?} is over 200"));
     }
     let target = resize_target(hw[0], hw[1], step.image_factor, step.image_max_pixels);
-    if target != hw {
+    // Xiaomi's XR1 processor never resizes (`do_resize=False`).
+    if step.processor == Xr0Processor::Xr0 && target != hw {
         return refuse(format!(
             "frames of {hw:?} would be resized to {target:?}; the engine takes only frames \
              xr0 leaves as they are"
@@ -485,15 +486,31 @@ mod tests {
             .collect()
     }
 
-    /// The XR1 manifest with 32x32 cameras, the fixture's frame size.
-    fn xr1_32px() -> PolicyManifest {
+    /// The XR1 manifest with `h`x`w` cameras.
+    fn xr1_sized(h: usize, w: usize) -> PolicyManifest {
         let mut v: serde_json::Value = serde_json::from_str(XR1_ROBOCASA).unwrap();
         for f in v["model"]["input_features"].as_array_mut().unwrap() {
             if f["init_args"]["ftype"] == "VISUAL" {
-                f["init_args"]["shape"] = serde_json::json!([3, 32, 32]);
+                f["init_args"]["shape"] = serde_json::json!([3, h, w]);
             }
         }
         PolicyManifest::parse(&v.to_string(), LoadOptions::default()).unwrap()
+    }
+
+    /// The XR1 manifest with 32x32 cameras, the fixture's frame size.
+    fn xr1_32px() -> PolicyManifest {
+        xr1_sized(32, 32)
+    }
+
+    /// Frames Intel's xr0 would shrink pass for XR1, whose processor never resizes.
+    #[test]
+    fn xr1_frames_are_never_resized() {
+        assert_eq!(resize_target(480, 640, 32, 90_000), [256, 320]);
+        let m = xr1_sized(480, 640);
+        let ImageStep::Xr0(step) = m.image_step() else {
+            panic!("xr0 is the image step")
+        };
+        assert_eq!(geometry(&m, step).unwrap().hw, [480, 640]);
     }
 
     /// Xiaomi's prompt, pixel values and state for the fixture's request, bit for bit.

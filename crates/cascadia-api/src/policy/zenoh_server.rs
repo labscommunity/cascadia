@@ -23,8 +23,8 @@ use zenoh::{Session, Wait};
 
 use super::physicalai::{
     check_name, decode_control, decode_predict, encode_error, encode_metadata,
-    encode_predict_reply, encode_reset_ok, key_prefix, read_seq, ControlError, ErrorCode,
-    ServerIdentity, Timings, MAX_REQUEST_BYTES, NO_SEQ,
+    encode_predict_reply, encode_reset_ok, key_prefix, one_observation, read_seq, ControlError,
+    ErrorCode, ServerIdentity, Timings, MAX_REQUEST_BYTES, NO_SEQ,
 };
 use super::server::{is_engine_fault, SharedPolicy};
 use super::{check_reply, max_payload_bytes, PackageIdentity};
@@ -421,6 +421,7 @@ impl ZenohFrontEnd {
         advert: Advert,
         backend: Box<dyn Backend>,
     ) -> Result<Self, ZenohError> {
+        one_observation(&advert.spec).map_err(ZenohError)?;
         let endpoint = listen.endpoint()?;
         // Frames may come at the camera's native size and are resized here.
         let max_bytes = MAX_REQUEST_BYTES.max(u64::from(max_payload_bytes(&advert.spec)));
@@ -672,6 +673,29 @@ mod tests {
                 assert!(rejected() > rejected_before, "{}", make());
             }
         }
+    }
+
+    /// physicalai sends one observation, so a history package is refused at
+    /// start rather than on every predict.
+    #[tokio::test]
+    async fn a_history_package_is_refused_at_start() {
+        let s = PolicySpec {
+            history: 2,
+            ..spec()
+        };
+        let policy =
+            SharedPolicy::new(Box::new(cascadia_engine::MockPolicyEngine::new(s)), 1).unwrap();
+        let e = ZenohFrontEnd::serve_local(
+            policy.clone(),
+            &listen("127.0.0.1", false),
+            PackageIdentity::default(),
+        )
+        .await
+        .err()
+        .unwrap()
+        .0;
+        assert!(e.contains("drive it over the openpi WebSocket"), "{e}");
+        assert!(policy.try_slot().is_some(), "the slot is given back");
     }
 
     /// A Zenoh client in this process against the front end on a mock engine:
