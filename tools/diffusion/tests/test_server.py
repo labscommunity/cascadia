@@ -100,6 +100,17 @@ class Echo(http.server.BaseHTTPRequestHandler):
         self.wfile.write(raw)
     def log_message(self,*args):pass
 
+class Mismatch(Echo):
+    field=None
+    def do_POST(self):
+        header=json.loads(self.rfile.read(int(self.headers['Content-Length'])))
+        header[self.field]=header['sequence']+1 if self.field=='sequence' else 'other'
+        raw=json.dumps(header).encode()
+        self.send_response(200)
+        self.send_header('Content-Length',str(len(raw)))
+        self.end_headers()
+        self.wfile.write(raw)
+
 class Server(unittest.TestCase):
     def setUp(self):
         self.temp=tempfile.TemporaryDirectory()
@@ -203,6 +214,16 @@ class Server(unittest.TestCase):
         finally:
             echo.shutdown()
             echo.server_close()
+    def test_callback_reply_for_another_execution_fails_the_exchange(self):
+        body=json.dumps({'job':'00000000-0000-0000-0000-000000000004','request':{'prompt':'call a stage'}}).encode()
+        for field in ('manifest','component','lease','sequence'):
+            handler=type('Reply',(Mismatch,),{'field':field})
+            echo=http.server.HTTPServer(('127.0.0.1',self.callback_port),handler)
+            threading.Thread(target=echo.serve_forever,daemon=True).start()
+            try:self.assertEqual(self.request('POST','/generate',body),(502,b'{"error":"stage exchange failed"}'),field)
+            finally:
+                echo.shutdown()
+                echo.server_close()
     def test_lock_is_free_when_the_reply_arrives(self):
         (self.root/'finish').write_text('1')
         raw=(FIXTURES/'frame.bin').read_bytes()

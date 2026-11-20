@@ -136,3 +136,18 @@ fn drain_finishes_admitted_job_and_lifetime_cannot_be_extended() {
         Err(Error::Capacity)
     ));
 }
+#[test]
+fn call_sequence_is_capped() {
+    let gate = Gate::new();
+    let now = Instant::now();
+    let id = reserve(&gate, now);
+    for sequence in 1..=2048 {
+        gate.begin("peer-a", id, &"a".repeat(64), "unet_first", sequence, now)
+            .unwrap()
+            .complete(now);
+    }
+    assert!(matches!(
+        gate.begin("peer-a", id, &"a".repeat(64), "unet_first", 2049, now),
+        Err(Error::Replay)
+    ));
+}
