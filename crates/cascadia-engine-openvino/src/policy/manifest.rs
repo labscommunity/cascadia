@@ -769,17 +769,20 @@ impl PolicyManifest {
                     | PreStep::Constant { .. }
             )
         };
-        let padded = self.normalize().any(|s| s.pad_to.is_some())
-            || self
-                .preprocessors
-                .iter()
-                .any(|s| matches!(s, PreStep::Noise { port: Some(_), .. }));
+        let noise_port = self
+            .preprocessors
+            .iter()
+            .any(|s| matches!(s, PreStep::Noise { port: Some(_), .. }));
         if self.policy != PolicyKind::Gr00tN1d7 {
             if let Some(s) = self.preprocessors.iter().find(|s| own(s)) {
                 return refuse(format!("{} needs policy.name \"gr00t_n1d7\"", pre_name(s)));
             }
-            if padded {
-                return refuse("normalize pad_to and a noise port need policy.name \"gr00t_n1d7\"");
+            if noise_port {
+                return refuse("a noise port needs policy.name \"gr00t_n1d7\"");
+            }
+            // π0.5 pads too: openpi bins the state at the robot's width (DROID: 8 of 32).
+            if self.policy != PolicyKind::Pi05 && self.normalize().any(|s| s.pad_to.is_some()) {
+                return refuse("normalize pad_to needs policy.name \"gr00t_n1d7\" or \"pi05\"");
             }
             if self
                 .postprocessors
@@ -2855,7 +2858,7 @@ mod tests {
                 s["port"] = json!("actions");
             }
         }
-        assert!(err(&v).contains("a noise port need policy.name"));
+        assert!(err(&v).contains("a noise port needs policy.name"));
         // Identity bounds are a placeholder.
         let mut v = gr00t();
         let st = &mut v["model"]["postprocessors"][2]["stats"]["action"];

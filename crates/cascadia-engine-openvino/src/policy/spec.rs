@@ -172,7 +172,22 @@ pub fn derive_spec(
         }
         Ok(())
     };
-    check_len(&mut m.normalize(), "state", ir.state_len)?;
+    // A π0.5 normalize with `pad_to` takes the robot's width and pads it to the state port's.
+    let state_len = match m.normalize().find_map(|s| s.pad_to.map(|n| (n, s))) {
+        Some((n, s)) if matches!(m.image_step(), ImageStep::Pi05(_)) => {
+            if n != ir.state_len {
+                return refuse(format!(
+                    "normalize pad_to {n} differs from the model's state length {}",
+                    ir.state_len
+                ));
+            }
+            s.stats_for("state")
+                .and_then(|f| [&f.mean, &f.q01, &f.min].into_iter().flatten().next())
+                .map_or(n, Vec::len)
+        }
+        _ => ir.state_len,
+    };
+    check_len(&mut m.normalize(), "state", state_len)?;
     // The served width is what the postprocessors leave, not the IR's.
     let mut dim = ir_dim;
     let mut rows = ir_steps;
@@ -249,7 +264,7 @@ pub fn derive_spec(
         cameras: layout.names.clone(),
         height,
         width,
-        state_len: ir.state_len,
+        state_len,
         chunk: [steps, dim],
         noise: ir.noise,
         noise_shape: ir.noise_shape.clone(),
@@ -645,6 +660,30 @@ mod tests {
             serde_json::json!({"type": "noise", "shape": [50, 16]}),
         ));
         assert!(e(&both, &ir).contains("disagree"));
+    }
+
+    #[test]
+    fn pi05_pad_to_serves_the_robot_width() {
+        let mut v: serde_json::Value = serde_json::from_str(PI05_LIBERO).unwrap();
+        v["model"]["preprocessors"][0]["pad_to"] = serde_json::json!(32);
+        let m = PolicyManifest::parse(&v.to_string(), LoadOptions::default()).unwrap();
+        let mut ir = pi05_ir();
+        ir.state_len = 32;
+        let (spec, _) = derive_spec(&m, &ir, server()).unwrap();
+        assert_eq!(spec.state_len, 8);
+        ir.state_len = 16;
+        let e = derive_spec(&m, &ir, server()).unwrap_err().to_string();
+        assert!(
+            e.contains("pad_to 32 differs from the model's state length 16"),
+            "{e}"
+        );
+        // Other kinds may not pad.
+        let mut v: serde_json::Value = serde_json::from_str(PI0_LIBERO).unwrap();
+        v["model"]["preprocessors"][0]["pad_to"] = serde_json::json!(32);
+        let e = PolicyManifest::parse(&v.to_string(), LoadOptions::default())
+            .unwrap_err()
+            .to_string();
+        assert!(e.contains("pad_to needs policy.name"), "{e}");
     }
 
     #[test]

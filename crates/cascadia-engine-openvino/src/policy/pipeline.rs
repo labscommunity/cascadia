@@ -1422,6 +1422,9 @@ impl PolicyPipeline {
         let mut state = raw;
         for step in self.manifest.normalize() {
             state = normalize(step, STATE, &state)?;
+            if let Some(n) = step.pad_to {
+                state.resize(n, 0.0);
+            }
         }
         let (images, image_masks) = images_tensor(
             &self.layout,
@@ -2658,6 +2661,38 @@ mod tests {
         assert_ne!(texts[0], texts[1]);
         // No noise port, so nothing is drawn.
         assert!(!r.log.lock().unwrap().inputs.iter().any(|(n, _)| n == NOISE));
+    }
+
+    #[test]
+    fn pi05_pad_to_bins_the_robot_width_and_pads_the_port() {
+        // DROID: openpi bins the 8 real values, then pads the state to the model's 32.
+        let mut v: serde_json::Value = serde_json::from_str(PI05_LIBERO).unwrap();
+        v["model"]["preprocessors"][0]["pad_to"] = serde_json::json!(32);
+        let (mut inputs, outputs) = pi05_ports();
+        inputs[0] = port(STATE, DType::F32, &[1, 32]);
+        let mut r = rig_with(
+            &v.to_string(),
+            (inputs, outputs),
+            true,
+            true,
+            vec![0.5; 350],
+        );
+        let spec = r.engine.spec().clone();
+        assert_eq!(spec.state_len, 8);
+        r.engine.infer(&obs(&spec, "pick up")).unwrap();
+        let m = PolicyManifest::parse(PI05_LIBERO, LoadOptions::default()).unwrap();
+        let raw: Vec<f64> = obs(&spec, "").state.iter().map(|&x| f64::from(x)).collect();
+        let norm = normalize(m.normalize().next().unwrap(), STATE, &raw).unwrap();
+        let texts = r.log.lock().unwrap().texts.clone();
+        assert_eq!(
+            texts.last().unwrap(),
+            &pi05_prompt("pick up", &pi05_bins(&norm))
+        );
+        let state = input(&r.log, STATE);
+        assert_eq!(state.shape, vec![1, 32]);
+        let mut want: Vec<f32> = norm.iter().map(|&x| x as f32).collect();
+        want.resize(32, 0.0);
+        assert_eq!(f32s(&state), want.as_slice());
     }
 
     #[test]
