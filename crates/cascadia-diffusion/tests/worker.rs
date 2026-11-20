@@ -210,3 +210,22 @@ async fn uncertain_failure_quarantines_and_notifies() {
     assert!(!worker.status().available);
     assert_eq!(changed, 1);
 }
+#[tokio::test]
+async fn reply_for_another_execution_or_schema_quarantines() {
+    let other_execution: Reply = Box::new(|frame| {
+        let (mut header, values) = wire::decode(&frame)?;
+        header.sequence += 1;
+        wire::encode(&header, &values)
+    });
+    let other_schema: Reply = Box::new(|frame| {
+        let (mut header, values) = wire::decode(&frame)?;
+        header.tensors[0].name = "other".into();
+        wire::encode(&header, &values)
+    });
+    for reply in [other_execution, other_schema] {
+        let (worker, result, changed) = run_once(reply).await;
+        assert!(matches!(result, Err(Error::Quarantined)), "{result:?}");
+        assert!(worker.quarantined());
+        assert_eq!(changed, 1);
+    }
+}
