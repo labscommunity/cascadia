@@ -24,8 +24,8 @@ pub const PAYLOAD_FRAMING_BYTES: u64 = 64 * 1024;
 /// refused at load. 8 MiB less the framing allowance.
 pub const PAYLOAD_MAX_BYTES: u32 = 8 * 1024 * 1024 - 64 * 1024;
 
-/// The WebSocket message cap for `spec`: every camera's `H*W*3` bytes, the
-/// state as f64 (numpy's default dtype, the widest a request may send), the
+/// The WebSocket message cap for `spec`: every camera's `H*W*3` bytes per
+/// frame of its history, the state (every history row) as f64 (numpy's default dtype, the widest a request may send), the
 /// noise and the RTC leftover (`rtc_chunk_size * D`) as f32, the prompt cap,
 /// plus [`PAYLOAD_FRAMING_BYTES`].
 ///
@@ -47,9 +47,15 @@ pub fn payload_cap(spec: &PolicySpec) -> EngineResult<u32> {
             .and_then(|n| (n as u64).checked_mul(4)),
         None => Some(0),
     };
+    let history = spec.history as u64;
     let total = frame
         .and_then(|f| f.checked_mul(spec.cameras.len() as u64))
-        .zip((spec.state_len as u64).checked_mul(8))
+        .and_then(|f| f.checked_mul(history))
+        .zip(
+            (spec.state_len as u64)
+                .checked_mul(8)
+                .and_then(|b| b.checked_mul(history)),
+        )
         .and_then(|(a, b)| a.checked_add(b))
         .zip(noise)
         .and_then(|(a, b)| a.checked_add(b))
@@ -88,13 +94,13 @@ pub trait PolicyEngine: Send {
 /// Check an observation against `spec` before any work is queued.
 ///
 /// Covers what the spec alone settles: camera names (exactly the advertised
-/// set), frame sizes, state length and finiteness, prompt size, whether
+/// set, each [`PolicySpec::history`] times), frame sizes, state length and finiteness, prompt size, whether
 /// noise is allowed and its length, and the RTC inputs.
 pub fn check_observation(spec: &PolicySpec, obs: &Observation) -> EngineResult<()> {
     let bad = |msg: String| Err(EngineError::InvalidConfig(msg));
     let mut seen = HashSet::new();
     for (name, img) in &obs.images {
-        if !seen.insert(name.as_str()) {
+        if !seen.insert(name.as_str()) && spec.history == 1 {
             return bad(format!("camera {name:?} sent twice"));
         }
         if !spec.cameras.iter().any(|c| c == name) {
@@ -123,12 +129,30 @@ pub fn check_observation(spec: &PolicySpec, obs: &Observation) -> EngineResult<(
             spec.cameras
         ));
     }
-    if obs.state.len() != spec.state_len {
-        return bad(format!(
-            "state has {} values; expected {}",
-            obs.state.len(),
-            spec.state_len
-        ));
+    if spec.history > 1 {
+        for cam in &spec.cameras {
+            let n = obs.images.iter().filter(|(name, _)| name == cam).count();
+            if n != spec.history {
+                return bad(format!(
+                    "camera {cam:?} has {n} frames; this model takes {}",
+                    spec.history
+                ));
+            }
+        }
+    }
+    if Some(obs.state.len()) != spec.state_len.checked_mul(spec.history) {
+        return bad(match spec.history {
+            1 => format!(
+                "state has {} values; expected {}",
+                obs.state.len(),
+                spec.state_len
+            ),
+            h => format!(
+                "state has {} values; expected {h} rows of {}",
+                obs.state.len(),
+                spec.state_len
+            ),
+        });
     }
     if obs.state.iter().any(|x| !x.is_finite()) {
         return bad("state contains a non-finite value".into());
@@ -321,6 +345,7 @@ mod tests {
             package_sha256: String::new(),
             server_resize: None,
             rtc_chunk_size: None,
+            history: 1,
         }
     }
 
@@ -381,6 +406,26 @@ mod tests {
         let mut o = obs();
         o.images.push(("wrist".into(), frame()));
         assert!(err_of(&s, &o).contains("sent twice"));
+    }
+
+    #[test]
+    fn a_history_takes_every_camera_and_state_row_that_many_times() {
+        let s = PolicySpec {
+            history: 2,
+            ..spec(NoiseMode::Constant)
+        };
+        let mut o = obs();
+        o.images.extend(obs().images);
+        o.state.extend([4.0, 5.0, 6.0]);
+        check_observation(&s, &o).unwrap();
+        let mut short = o.clone();
+        short.images.pop();
+        assert!(err_of(&s, &short).contains("camera \"image\" has 1 frames; this model takes 2"));
+        short = o.clone();
+        short.state.pop();
+        assert!(err_of(&s, &short).contains("state has 5 values; expected 2 rows of 3"));
+        // One observation is refused, not repeated.
+        assert!(err_of(&s, &obs()).contains("has 1 frames"));
     }
 
     #[test]
@@ -495,6 +540,12 @@ mod tests {
         assert_eq!(
             payload_cap(&s).unwrap() as u64,
             24 + 24 + 24 + 16 + PAYLOAD_FRAMING_BYTES
+        );
+        // A history multiplies the frames and the state rows.
+        let h = PolicySpec { history: 4, ..s };
+        assert_eq!(
+            payload_cap(&h).unwrap() as u64,
+            4 * (24 + 24) + 24 + 16 + PAYLOAD_FRAMING_BYTES
         );
         let mut big = spec(NoiseMode::Constant);
         big.height = 1024;

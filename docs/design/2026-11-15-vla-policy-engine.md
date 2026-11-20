@@ -79,7 +79,8 @@ v1:
   Xiaomi's native 10-action chunk); `xvla` and
   `evo1` take their cameras and prompt like `smolvla` (`evo1` strips the task with Python's
   `str.strip()`, as LeRobot's EVO1 does). `vlajepa`, `xr0`, `gr00t_n1d7` and `molmoact2` have their
-  own input ports (see "Port layouts"). The `molmoact2` package is Intel's own export, with its own
+  own input ports (see "Port layouts"). `xr0` also serves XR1 (`processor: "xr1"` on its step; see
+  the step table). The `molmoact2` package is Intel's own export, with its own
   runtime steps. The `gr00t_n1d7` package is Intel's edge-ai-suites single-IR export of
   NVIDIA's checkpoint, saved with fp16 weights, static shapes and named ports.
 - Devices: GPU (default, f16 unless `--ov-inference-precision f32`) and CPU (always f32). NPU is refused:
@@ -105,6 +106,17 @@ v1:
   of GPU memory (12.3 GB process peak at load). At `--ov-inference-precision f32` the GPU compile fails
   (`CL_INVALID_EVENT`), a load error as for π0; CPU f32 is about 5.5 s a call (7.2 s the first) and
   23 GB, within 2.1e-4.
+- XR1 (`XiaomiRobotics/Xiaomi-Robotics-1-RoboCasa365`, revision `3a6d0293`, Apache-2.0; Qwen3-VL-4B
+  with a 36-layer DiT, 5 flow steps), experimental. Intel's XR0 exporter (physical-ai-studio
+  `8f132416`) exports it with four patches (no DiT middle and final norms, a 1024-wide projector
+  middle, the checkpoint's action mask baked in, a `[1, 4, 60]` state); the graph takes each camera's
+  4-frame video as two image slots of two frames. On an x86 CPU, given Xiaomi's processor inputs and
+  the same noise, the fp16-weight IR at f32 is within 2.8e-4 of Xiaomi's own model in f32 on the 12
+  served dims (f32 weights: 1.4e-6), no NaN. The engine reproduces Xiaomi's processor bit for bit
+  (prompt ids and mask, pixel values, state). Not measured: the engine's CPU and GPU runs, latency
+  on the Arc 140V (estimate 450–550 ms for a 16-step chunk at GPU f16, about twice XR0: three times
+  the vision patches and twice the prompt), and RoboCasa365 task success (Xiaomi reports 57.28% in
+  bf16 on CUDA).
 - VLA-JEPA (`lerobot/VLA-JEPA-LIBERO`, Qwen3-VL-2B with all four flow steps in one graph) on the Arc
   140V: GPU f16 about 99 ms a call and within 8.2e-4 of PyTorch f32, GPU f32 about 610 ms, CPU f32
   about 3 s, no gripper flips. The GPU f16 default holds: LIBERO `libero_spatial` 29/30 at GPU f16,
@@ -172,6 +184,7 @@ included, and differences are against PyTorch f32 unless stated.
 | `gr00t_n1d7` | 27/30 | 26/30 (NVIDIA's model, CPU bf16) | `125dd23d0` | engine at `7a6b19e5a`: GPU f16 ~240 ms, within 4.8e-3; CPU f32 3.5–4.3 s, within 3.3e-3 | supported |
 | `xr0` | 27/30 (26/30 with Xiaomi's task format, `task.capitalize() + "."`) | 27/30 (Intel's port, CPU f32, run on the earlier package that denoised all 32 dims) | `666562fcd` | engine: GPU f16 ~216 ms, within 1.2e-3; CPU f32 5.5 s, within 2.1e-4 | supported |
 | `molmoact2` | 28/30 | 27/30 (Intel's, CPU f32) | `8da6f67c2` | engine at `7a6b19e5a`: GPU f16 ~990 ms, within 4.0e-4; CPU f32 35 s, within 3.6e-4 | supported |
+| `xr0` (XR1 RoboCasa365) | none (no LIBERO-style bar; RoboCasa365 success not measured) | — | — | not measured; x86 CPU through OpenVINO's Python API on Xiaomi's processor inputs: fp16-weight IR at f32 within 2.8e-4 of Xiaomi's model (f32) on the 12 served dims, f32 weights 1.4e-6, no NaN; Arc 140V latency not measured (estimate 450–550 ms) | experimental |
 | `molmoact2` (DROID) | none (no LIBERO-style bar) | — | — | not measured; x86 CPU through Intel's runtime on the model card's sample: fp16-weight IR within 9.1e-5 (normalized) of PyTorch f32, end to end within 3.5e-4, no NaN | experimental |
 | `molmoact2` (SO-100/101) | none (no LIBERO-style bar) | — | — | not measured; x86 CPU through Intel's runtime on the model card's sample: fp16-weight IR within 1.4e-4 (normalized), end to end within 3.8e-3 degrees on actions averaging 71, no NaN | experimental |
 
@@ -231,7 +244,7 @@ Loading rules:
 | `gripper_binarize` | Ours (LeRobot EVO1's LIBERO postprocessing). `index`, `threshold`, `above`, `below`: each row's `a[index]` becomes `above` if `a[index] > threshold` (strictly), else `below`. Runs where it is listed (after `denormalize` for EVO1); an `index` outside the width at its step refuses the load. |
 | `vla_jepa_prompt` | Ours. `template`: the chat prompt with every `{instruction}` replaced by the task verbatim (no stripping); a template without `{instruction}` refuses the load. Must come before `ov_tokenizer`. |
 | `vla_jepa_inputs` | Ours, ported from Intel's draft `VLAJEPAPreprocessor` (runtime `e3dd944`). Frames uint8 HWC at exactly `image_resolution` (224×224; other sizes are refused, so Intel's first area resize is the identity) → `/255` → antialiased bicubic to `vision_resolution` (256×256) with separable matrices built at load like Intel's `_bicubic_weights` (`a = −0.5`, centre `(i + 0.5)·scale`, support `2·max(scale, 1)`, rows normalized in f64, stored f32; `rows @ img @ colsᵀ` summed in f64) → `(x − mean)/std` → tiled `temporal_patch_size` times → reshaped `(1, tp, 3, gh/m, m, p, gw/m, m, p)`, transposed `(0, 3, 6, 4, 7, 2, 1, 5, 8)` → `[gh·gw, 3·tp·p²]` per camera in `image_keys` order, concatenated into `pixel_values`. `embodied_positions`: the indices of `embodied_token_id` in the ids; anything but exactly `num_embodied_tokens` (at load, for the empty task, and per call) is refused. A `vision_resolution` not a multiple of `patch_size · merge_size`, or an unknown parameter, refuses the load. The state goes to the graph **raw** and the graph's actions are served as they are: its normalize and denormalize stats are graph constants, so a `vlajepa` manifest may not carry `normalize`, `denormalize` or any step but these, `ov_tokenizer`, `noise` and `action_chunk_trimmer` (and there is no placeholder-stats check to run). |
-| `xr0` | Intel's `XR0Preprocessor` (runtime `e3dd944`). Cameras are the VISUAL `input_features` in order, all one `[3, H, W]`; frames uint8 HWC at exactly that size, and only a size Intel's resize (sides to multiples of `image_factor`, area ≤ `image_max_pixels`) leaves alone, so its OpenCV resize never runs (LIBERO: 256×256). Pixels `(x · rescale_factor − mean)/std` in f32, then the Qwen patchify `vla_jepa_inputs` uses. Prompt: Qwen3-VL's chat template, `# <Title> View` per camera (`base` → Base, `wrist_left` → Left-Wrist, …) with `patches/merge²` image pads, then `Generate robot actions for the task:\n{task} /no_cot`, the task verbatim (Xiaomi's LIBERO client sends `task.capitalize() + "."`; the client, not the engine, formats it). State: raw, zero-padded to `max_state_dim`, `[1, 1, 32]`. `normalize_state: true`, a non-empty `image_key_view_map` or an unknown parameter refuses the load. `noise` may follow it. |
+| `xr0` | Intel's `XR0Preprocessor` (runtime `e3dd944`). Cameras are the VISUAL `input_features` in order, all one `[3, H, W]`; frames uint8 HWC at exactly that size, and only a size Intel's resize (sides to multiples of `image_factor`, area ≤ `image_max_pixels`) leaves alone, so its OpenCV resize never runs (LIBERO: 256×256). Pixels `(x · rescale_factor − mean)/std` in f32, then the Qwen patchify `vla_jepa_inputs` uses. Prompt: Qwen3-VL's chat template, `# <Title> View` per camera (`base` → Base, `wrist_left` → Left-Wrist, …) with `patches/merge²` image pads, then `Generate robot actions for the task:\n{task} /no_cot`, the task verbatim (Xiaomi's LIBERO client sends `task.capitalize() + "."`; the client, not the engine, formats it). State: raw, zero-padded to `max_state_dim`, `[1, 1, 32]`. `normalize_state: true`, a non-empty `image_key_view_map` or an unknown parameter refuses the load. `noise` may follow it. Ours, for XR1: `processor: "xr1"` (default `"xr0"`) reproduces Xiaomi's `MiBotProcessor` (`processing_mibot.py`, transformers 4.57.1) as `eval_robocasa365/entry.py` calls it, with `history` (frames per camera and state rows, a multiple of `temporal_patch_size`; XR1: 4) and `camera_labels` (one per camera, in order). With a history above 1 the VISUAL features are each camera's image slots, `images.<camera>_0` … `_<history/tp − 1>`, camera after camera; the request names the cameras (`agentview_left`, `agentview_right`, `eye_in_hand`) and slot k takes the camera's frames 2k and 2k+1, patchified as one temporal patch. Pixels `(x − mean/rescale_factor)/(std/rescale_factor)` in f32 (transformers' fused rescale and normalize; an ulp from Intel's form). Prompt: `<|im_start|>user\n`, then per camera `<label>: ` (`\n` between cameras) and per slot `<t seconds><|vision_start|>` + 64 image pads + `<|vision_end|>`, then `\n\nGenerate robot actions for the task:\n{task} /no_cot<|im_end|>\n<|im_start|>assistant\n<cot></cot><|im_end|>\n`. A frame list carries no fps, so the processor times frame i at i/24 s and stamps slot k with its two frames' mean, one decimal: `<0.0 seconds>`, `<0.1 seconds>`. Xiaomi's video processor writes video pads; the graph, exported as an image model, takes image pads (the model's output is identical). State: each of the `history` rows zero-padded to `max_state_dim` and rounded to bf16 (the processor's `state.to(bfloat16)`), `[1, 4, 60]`. XR1's processor never resizes, so no server resize is advertised. `history` or `camera_labels` without `processor: "xr1"` refuses the load. |
 | `xr0_denormalize` | Intel's `XR0Postprocessor`: `action · (std + action_eps) + mean` in f32 with per-timestep `[T, D]` stats (which must match the graph's output at load), then the first `action_dim` values of a row (Xiaomi's own decode has no eps, a difference of about 1e-6). `action_mode: delta` (needs a state passthrough output) and unknown parameters refuse the load; all-identity stats are a placeholder. |
 | `gr00t_image` | Ours, NVIDIA's eval transform (Isaac-GR00T `3df8b382`, `image_augmentations.py`): letterbox to a square, shortest edge to `shortest_edge`, a centred `crop_fraction` crop (`max(1, int(side · fraction))` at `(side − crop) // 2`), back to `shortest_edge` with OpenCV `INTER_AREA`. The engine takes only square frames of `shortest_edge` (every VISUAL feature `[3, s, s]`), so the letterbox and first resize do nothing; the 243 → 256 upscale is OpenCV's own arithmetic, ported bit for bit (`INTER_AREA` that does not shrink is a fixed-point bilinear with area-mode weights, the vertical pass in OpenCV's 128-bit SIMD form), checked against `cv2.resize`. `interpolation` other than `area` refuses the load. `image_flip` runs before it. |
 | `qwen_vl_patchify` | Ours. Pixels `(x/255 − mean)/std` in f32, then the Qwen patchify `vla_jepa_inputs` uses, cameras in VISUAL order. `grid_thw` must be `[1, s/p, s/p]` per camera. |
@@ -253,7 +266,7 @@ the length). The set is read from the package, not guessed: the strings in the t
 `SpecialTokensSplit` pattern, `added_tokens` of a `tokenizer.json` beside it, and every `<…>`
 marker of the template itself (`<cot>`); a package whose tokenizer declares none is refused at
 load. Behind that, every call's ids must carry each single-token marker exactly as often as the
-template does (XR0: 64 image pads per camera, checked at load; VLA-JEPA: 32 embodied tokens;
+template does (XR0: 64 image pads per image slot, checked at load, so 384 for XR1's six; VLA-JEPA: 32 embodied tokens;
 GR00T: one image token per camera, checked at load). Where a step rewrites the task first
 (`gr00t_prompt`'s `formalize_language`, `molmoact2`'s lowercasing), both the task as sent and as
 rewritten are checked. MolmoAct2's state tokens (`<state_0>` … `<state_255>`) are refused in a
@@ -269,7 +282,7 @@ new kind with new ports adds a layout, not a branch inside another one.
 | Layout | Kinds | Inputs |
 |---|---|---|
 | image slots | `smolvla`, `pi05`, `pi0`, `xvla`, `evo1` | `state` f32 (normalized), `tokenized_prompt` i64, `tokenized_prompt_mask` bool, `images [slots, 1, 3, H, W]` f32, `image_masks [slots, 1]` bool, optional `noise` |
-| XR0 | `xr0` | `tokenized_prompt` i64 and `tokenized_prompt_mask` i64 `[1, 256]` (right-padded with `<|endoftext|>`), `pixel_values [512, 1536]` f32, `state [1, 1, 32]` f32 raw, `noise [1, 10, 32]`; `action [1, 10, 32]` normalized, then `xr0_denormalize` |
+| XR0 | `xr0` | `tokenized_prompt` i64 and `tokenized_prompt_mask` i64 `[1, 256]` (right-padded with `<|endoftext|>`), `pixel_values [512, 1536]` f32, `state [1, history, 32]` f32 raw (`history` 1), `noise [1, 10, 32]`; `action [1, 10, 32]` normalized, then `xr0_denormalize`. XR1: `[1, 512]`, `pixel_values [1536, 1536]` (3 cameras × 2 slots × 256 patches), `state [1, 4, 60]`, `noise [1, 16, 60]`, `action [1, 16, 60]`, of which `xr0_denormalize` serves the first 12 per row |
 | GR00T | `gr00t_n1d7` | in this order, each bound by name or else by its index (the CPU plugin renames `state`): `input_ids` and `attention_mask` i64 `[1, 192]`, `pixel_values [512, 1536]` f32, `position_ids [3, 1, 192]` i64, `state [1, 1, 132]` f32 (normalized, zero-padded), the `constant` ports (`embodiment_id [1]` i64), the noise port (`actions [1, 40, 132]`); the one output (`predicted_action [1, 40, 132]`, normalized), whatever its name; then `action_chunk_trimmer` 16, `action_slice` 7, `denormalize` |
 | MolmoAct2 | `molmoact2` | `input_ids`, `attention_mask` and `token_type_ids` i64 `[1, 256 + cameras × 197]` (the tokenizer's 255, BOS, and 197 per expanded image), `images [1, cameras, 729, 588]` f32, `token_pooling [1, cameras × 196, 4]` i64, `action_dim_is_pad [1, 32]` bool; no state or noise input; `action [1, chunk, action_dim]` normalized, then `molmoact2_postprocess`. LIBERO: `[1, 650]`, `[1, 2, 729, 588]`, `[1, 392, 4]`, `action [1, 10, 7]`; DROID: `[1, 847]`, `[1, 3, 729, 588]`, `[1, 588, 4]`, `[1, 15, 8]`; SO-100/101: `[1, 650]`, `[1, 2, 729, 588]`, `[1, 392, 4]`, `[1, 30, 6]` |
 | VLA-JEPA | `vlajepa` | `input_ids` i64 and `attention_mask` i64 `[1, L]` (the tokenizer pads right to L = 288 with `<|endoftext|>`, mask 0), `pixel_values [cameras·patches, 3·tp·p²]` f32 (`[512, 1536]`), `embodied_positions [1, 32]` i64, `state` f32 raw, `noise [1, 7, 7]`; `action [1, 7, 7]` is final |
@@ -297,7 +310,8 @@ check tokenizes the task with the worst-case state (every bin `255`) and the rea
 VLA-JEPA's prompt carries no state, so its count is exact: its tokenizer IR's `truncation`
 variable defaults on, the engine holds it off, and a task is served up to exactly 288 tokens and
 refused at 289 (LIBERO's tasks take 221–234). XR0's works the same way at 256 (its LIBERO template
-alone is 191 tokens); truncating would cut the template. GR00T's tokenizer does not pad: the
+alone is 191 tokens); truncating would cut the template. XR1's at 512: its template is 469 tokens,
+so the task may take 43 (a task of 14 tokens makes 483); 512 tokens are served and 513 refused. GR00T's tokenizer does not pad: the
 image tokens it emits are expanded to 64 each after it, so the prompt may hold `seq_len` less
 what the images take, 64 language tokens (template and task) beside two cameras; the count is
 exact and a task over it is refused, in language tokens (LIBERO's example uses 28). MolmoAct2's
@@ -333,7 +347,9 @@ package's padding convention, which the metadata states as `resize`: bilinear, p
 scaling, padded **centred** for `pi05` and **top and left** for `smolvla_resize` (content at the
 bottom right). VLA-JEPA's `resize` is `stretch`: a plain resize to 224×224 with no padding; so is EVO1's
 (`smolvla_resize` with `"resize": "stretch"`; LIBERO renders at 448, so the two agree there), and
-XR0's (`xr0`: frames at exactly 256×256). GR00T's is `center` (its letterbox pads evenly with 0),
+XR0's (`xr0`: frames at exactly 256×256). XR1's client crops each frame to its centre 0.95
+(`max(1, int(side · 0.95))` at `(side − crop) // 2`) and resizes it back to 256×256 with PIL's
+bilinear filter (`entry.py` `center_crop`) before sending; the server does not crop. GR00T's is `center` (its letterbox pads evenly with 0),
 and only square frames at exactly 256×256 are taken, which the letterbox leaves alone. MolmoAct2's
 is `stretch`: a plain resize to 378×378 (OpenCV `INTER_LINEAR_EXACT`, no padding). openpi's `resize_with_pad` centres, so it is correct for π0.5 only; a 640×480 frame
 sent to SmolVLA through it lands 64 rows off with no error. `tools/` ships a reference resize for
@@ -471,6 +487,7 @@ Limits, all checked before work is queued:
 | `attribution` | the package's `NOTICE` file, else the manifest's `metadata.attribution`, else `policy.source.attribution`; omitted when there is none (GR00T's NVIDIA Open Model License notice) |
 | `resize` | the image step: `center` (`pi05`, `pi0`, `gr00t_image`) or `top_left` (`smolvla_resize`), bilinear, pad 0 before scaling; `stretch` (`vla_jepa_inputs`, `xr0`, `molmoact2`, `smolvla_resize` with `"resize": "stretch"`), no padding |
 | `rtc_chunk_size` | T when the IR has the RTC port group, else null |
+| `history` | the `xr0` step's `history` (XR1: 4): frames per camera and state rows a request carries, oldest first; left out of the metadata when 1, so every other package's metadata bytes are unchanged |
 | `manifest_sha256`, `package_sha256`, `precision` | the load, as in "Metadata identity" |
 | `device`, `model`, `prompt_max_bytes` | the server |
 
@@ -515,9 +532,11 @@ array. Replies must be encoded the same way, with `"<f4"` actions. This is pinne
 the bytes as fixtures, and the Rust tests must produce and accept exactly those bytes, so CI needs
 no Python. Decoding rules:
 
-- `images`: dtype `|u1`, shape exactly `[H, W, 3]`.
-- `state`: dtype `<f4`, or `<f8` cast to f32 (numpy's default); length `state_len`; every value
-  finite.
+- `images`: dtype `|u1`, shape exactly `[H, W, 3]`; with a `history` h above 1, exactly
+  `[h, H, W, 3]` per camera, oldest frame first (what `np.stack` of a frame history gives; XR1's
+  frames are 2 environment steps apart, Xiaomi's `obs_interval`, which the server cannot check).
+- `state`: dtype `<f4`, or `<f8` cast to f32 (numpy's default); length `state_len`, or `[h,
+  state_len]` with a history (the rows oldest first, at the frames' times); every value finite.
 - `noise`: only for a package in `input` mode (an error otherwise); dtype `<f4`, shape exactly
   `[1, *noise_shape]`; every value finite with |x| ≤ 10.
 - RTC fields: only for a package with `rtc_chunk_size` (an error otherwise). `prev_chunk_left_over`
@@ -565,7 +584,9 @@ carries both, so a bump would not clear them.
   (the prompt), cameras as `images.<name>` with the advertised names, or a bare `images` for a
   one-camera package (what Intel's `PolicySource` sends for one camera), optional `noise` for
   input-mode packages, and for an RTC package the four inputs `RTCExecution` injects
-  (`prev_chunk_left_over` float32 `[1, T, D]`, the others 0-d numpy arrays).
+  (`prev_chunk_left_over` float32 `[1, T, D]`, the others 0-d numpy arrays). A package with a
+  `history` above 1 (XR1) is refused on every predict: physicalai's protocol sends one observation,
+  so such a package is served over the openpi WebSocket.
 - Frames: physicalai's client sends them at the camera's native resolution (unless it is given
   `max_image_side`) and physicalai's server resizes them in the model's preprocessor, so this front
   end runs the package's own first resize, where it is ported exactly, before the observation is
@@ -849,12 +870,13 @@ machine.
 
 What runs where, as shipped. Items marked **not shipped** are planned and not in the repo.
 
-- **Fixtures.** Committed, all small (about 115 KB under
+- **Fixtures.** Committed, all small (about 380 KB under
   `crates/cascadia-engine-openvino/tests/fixtures/policy/`; its README names each file's source):
   - the manifests of Intel's published packages and of our exports, copied unmodified, including
     our DROID manifest for the placeholder-stats refusal;
   - generated references: OpenCV's `INTER_AREA` resize for GR00T, LeRobot's X-VLA rotation
-    conversion, and the SmolVLA end-to-end reference (served actions for the fixed inputs of
+    conversion, Xiaomi's XR1 processor on seeded 32×32 frames (`tools/xr1_processor_fixture.py`:
+    prompt, ids, pixel values and the bf16 state, checked bit for bit), and the SmolVLA end-to-end reference (served actions for the fixed inputs of
     `tests/policy_openvino.rs`, from an independent numpy + OpenVINO Python pipeline on CPU with
     `INFERENCE_PRECISION_HINT=f32`; the file records that source);
   - golden msgpack bytes for openpi requests and replies, packed by the real `openpi_client`

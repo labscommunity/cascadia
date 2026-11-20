@@ -282,7 +282,7 @@ pub enum EngineKind {
     #[value(name = "sycl-llama")]
     SyclLlama,
     /// Robot model (VLA policy) engine: serves an exported robot model (SmolVLA, pi0.5, pi0,
-    /// X-VLA, EVO1, VLA-JEPA, XR0, GR00T N1.7, MolmoAct2) over an openpi-compatible WebSocket.
+    /// X-VLA, EVO1, VLA-JEPA, XR0, XR1, GR00T N1.7, MolmoAct2) over an openpi-compatible WebSocket.
     /// `cascadia run` only.
     #[value(name = "ov-policy")]
     OvPolicy,
@@ -1958,7 +1958,7 @@ fn cmd_engines() -> Result<()> {
     println!("  sparse-moe     sparse mixture-of-experts on CPU: Kimi K2.6 (AVX-512 int4 GEMM), MiniMax-M2 (OV-IR shells), GLM-5 / DeepSeek-V4 / Inkling (Rust shells + int4 mmap experts, N-rank pipeline)");
     println!("  sycl-llama     external llama.cpp SYCL server (GGUF, spawned subprocess); bin via --llama-bin / CASCADIA_LLAMA_BIN / PATH; --elastic = GGML_STREAM_WEIGHTS device-side streaming (needs a streaming build, scripts/build-llama-stream.sh)");
     println!("  qwen35         Qwen3.5-family staged chain (GatedDeltaNet; 3.5/3.6 MoE or 3.8 dense); qwen3_5* IR-surgery shards (alias: qwen36-moe)");
-    println!("  ov-policy      robot models (VLA policies): SmolVLA / pi0.5 / pi0 / X-VLA / EVO1 / VLA-JEPA / XR0 / GR00T N1.7 / MolmoAct2 on GPU or CPU, openpi-compatible WebSocket; `cascadia run` only");
+    println!("  ov-policy      robot models (VLA policies): SmolVLA / pi0.5 / pi0 / X-VLA / EVO1 / VLA-JEPA / XR0 / XR1 / GR00T N1.7 / MolmoAct2 on GPU or CPU, openpi-compatible WebSocket; `cascadia run` only");
     Ok(())
 }
 
@@ -5392,6 +5392,7 @@ mod tests {
             package_sha256: String::new(),
             server_resize: None,
             rtc_chunk_size: None,
+            history: 1,
         };
         /// The mock, recording `close`.
         struct Closing(cascadia_engine::MockPolicyEngine, Arc<AtomicBool>);

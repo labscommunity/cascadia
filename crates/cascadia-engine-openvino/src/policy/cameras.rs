@@ -3,7 +3,8 @@
 //! Never taken from the client. The first rule that applies wins:
 //! 1. `smolvla_resize` with a non-empty `image_key_reorder_map`: each camera
 //!    at its mapped slot (`smolvla.py` `_camera_slot_layout`).
-//! 2. VISUAL `input_features` in manifest order (`model.py` `_order_cameras`).
+//! 2. VISUAL `input_features` in manifest order (`model.py` `_order_cameras`);
+//!    an `xr0` step with a history groups them into cameras of several slots.
 //! 3. Neither: `camera_0..camera_{n-1}` in IR slot order, `n` from the IR.
 
 use cascadia_engine::{EngineError, EngineResult};
@@ -62,6 +63,9 @@ impl CameraPlan {
                     slots: (0..names.len()).map(Some).collect(),
                     names,
                 }));
+            }
+            ImageStep::Xr0(x) if x.history > 1 => {
+                return Ok(Self::Fixed(super::xr0::geometry(m, x)?.layout()))
             }
             ImageStep::Xr0(_) | ImageStep::Gr00t(_) => (0, None),
         };

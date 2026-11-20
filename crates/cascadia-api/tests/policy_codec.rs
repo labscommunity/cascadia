@@ -11,6 +11,7 @@ const REQUEST: &[u8] = include_bytes!("fixtures/policy/request.msgpack");
 const REQUEST_F8: &[u8] = include_bytes!("fixtures/policy/request-f8-state.msgpack");
 const REPLY: &[u8] = include_bytes!("fixtures/policy/reply.msgpack");
 const REQUEST_RTC: &[u8] = include_bytes!("fixtures/policy/request-rtc.msgpack");
+const REQUEST_HISTORY: &[u8] = include_bytes!("fixtures/policy/request-history.msgpack");
 
 fn spec() -> PolicySpec {
     PolicySpec {
@@ -31,6 +32,7 @@ fn spec() -> PolicySpec {
         package_sha256: String::new(),
         server_resize: None,
         rtc_chunk_size: None,
+        history: 1,
     }
 }
 
@@ -38,6 +40,14 @@ fn spec() -> PolicySpec {
 fn rtc_spec() -> PolicySpec {
     PolicySpec {
         rtc_chunk_size: Some(2),
+        ..spec()
+    }
+}
+
+/// [`spec`] taking the last two observations.
+fn history_spec() -> PolicySpec {
+    PolicySpec {
+        history: 2,
         ..spec()
     }
 }
@@ -205,6 +215,47 @@ fn decodes_openpi_client_rtc_fields() {
     assert!(e.contains("this model takes no RTC inputs"), "{e}");
     // Without the fields an RTC package serves the plain chunk.
     assert_eq!(decode_request(REQUEST, &rtc_spec()).unwrap().rtc, None);
+}
+
+#[test]
+fn decodes_and_encodes_an_openpi_client_history() {
+    let obs = decode_request(REQUEST_HISTORY, &history_spec()).unwrap();
+    // `v[::-1]`: the rows of a 4x4 RGB frame in reverse order.
+    let flipped = |f: Vec<u8>| -> Vec<u8> { f.chunks(12).rev().flatten().copied().collect() };
+    let want = [
+        ("image", frame(false)),
+        ("image", flipped(frame(false))),
+        ("wrist", frame(true)),
+        ("wrist", flipped(frame(true))),
+    ];
+    assert_eq!(obs.images.len(), want.len());
+    for ((name, img), (want_name, want_data)) in obs.images.iter().zip(want) {
+        assert_eq!((name.as_str(), &img.data), (want_name, &want_data));
+    }
+    assert_eq!(obs.state, vec![0.5, -1.0, 2.25, 1.5, 0.0, -2.0]);
+    assert_eq!(
+        encode_request(&obs, &history_spec()).unwrap(),
+        REQUEST_HISTORY
+    );
+    // One frame per camera, or a history sent to a one-observation package, is refused.
+    let e = decode_request(REQUEST, &history_spec()).unwrap_err().0;
+    assert!(e.contains("shape [4, 4, 3]; expected [2, 4, 4, 3]"), "{e}");
+    let e = decode_request(REQUEST_HISTORY, &spec()).unwrap_err().0;
+    assert!(e.contains("shape [2, 4, 4, 3]; expected [4, 4, 3]"), "{e}");
+    let mut r = Req::good();
+    r.images = r
+        .images
+        .into_iter()
+        .map(|(n, d, _, data)| (n, d, vec![2, 4, 4, 3], [data.clone(), data].concat()))
+        .collect();
+    assert!(r
+        .err(&history_spec())
+        .contains("state has shape [3]; expected [2, 3]"));
+    r.images[0].2 = vec![3, 4, 4, 3];
+    r.images[0].3.extend(frame(false));
+    assert!(r
+        .err(&history_spec())
+        .contains("shape [3, 4, 4, 3]; expected [2, 4, 4, 3]"));
 }
 
 #[test]
@@ -477,6 +528,7 @@ fn non_rtc_metadata_bytes_are_unchanged_in_both_map_modes() {
         package_sha256: String::new(),
         server_resize: Some(cascadia_types::ServerResize::Letterbox),
         rtc_chunk_size: None,
+        history: 1,
     };
     let id = PackageIdentity {
         policy_name: "smolvla".into(),

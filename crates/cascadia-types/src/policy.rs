@@ -25,7 +25,10 @@ impl Image {
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct Observation {
     /// Camera name to frame; names must be exactly [`PolicySpec::cameras`].
+    /// With [`PolicySpec::history`] above 1, each camera appears that many
+    /// times, oldest frame first.
     pub images: Vec<(String, Image)>,
+    /// `state_len` values, or `history` rows of them, oldest first.
     pub state: Vec<f32>,
     pub prompt: String,
     pub seed: Option<u64>,
@@ -159,6 +162,18 @@ pub struct PolicySpec {
     /// exported with real-time chunking; `None` otherwise.
     #[serde(default)]
     pub rtc_chunk_size: Option<usize>,
+    /// Observations a request carries, oldest first: frames per camera and
+    /// state rows (XR1 takes 4). Left out of the metadata when 1.
+    #[serde(default = "one", skip_serializing_if = "is_one")]
+    pub history: usize,
+}
+
+fn one() -> usize {
+    1
+}
+
+fn is_one(n: &usize) -> bool {
+    *n == 1
 }
 
 #[cfg(test)]
@@ -195,6 +210,7 @@ mod tests {
             package_sha256: String::new(),
             server_resize: None,
             rtc_chunk_size: None,
+            history: 1,
         };
         let v = serde_json::to_value(&spec).unwrap();
         assert_eq!(v["noise"], "in_graph_random");
@@ -203,7 +219,12 @@ mod tests {
         assert!(v["noise_shape"].is_null());
         assert!(v.get("attribution").is_none());
         assert!(v["rtc_chunk_size"].is_null());
+        assert!(v.get("history").is_none());
         assert_eq!(serde_json::from_value::<PolicySpec>(v).unwrap(), spec);
+        let video = PolicySpec { history: 4, ..spec };
+        let v = serde_json::to_value(&video).unwrap();
+        assert_eq!(v["history"], 4);
+        assert_eq!(serde_json::from_value::<PolicySpec>(v).unwrap(), video);
     }
 
     #[test]

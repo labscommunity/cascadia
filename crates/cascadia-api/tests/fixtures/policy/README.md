@@ -6,4 +6,6 @@ repeated in `tests/policy_codec.rs`.
 
 - `request.msgpack`: a full request with `<f4` state, an int seed and `<f4` noise `[1, 2, 3]`.
 - `request-f8-state.msgpack`: numpy's default `<f8` state, an `np.int64` seed, no noise.
+- `request-history.msgpack`: two observations, `[2, 4, 4, 3]` per camera (the frame, then its
+  rows reversed) and a `[2, 3]` `<f4` state, no seed or noise.
 - `reply.msgpack`: a `[2, 3]` `<f4` action chunk with `server_timing.infer_ms` 12.5.

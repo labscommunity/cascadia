@@ -8,6 +8,9 @@
 //! - `CASCADIA_POLICY_PACKAGE_EVO1`: `zuoxingdong/evo1_libero`, cameras flipped on the host;
 //! - `CASCADIA_POLICY_PACKAGE_XR0`: `XiaomiRobotics/Xiaomi-Robotics-0-LIBERO` with Xiaomi's
 //!   inference action mask, a 10-action chunk, fp16 weights;
+//! - `CASCADIA_POLICY_PACKAGE_XR1`: `XiaomiRobotics/Xiaomi-Robotics-1-RoboCasa365` (Intel's XR0
+//!   exporter, patched), fp16 weights, `manifest.json` replaced by the
+//!   `xr1-robocasa365-manifest.json` fixture;
 //! - `CASCADIA_POLICY_PACKAGE_GROOT`: `nvidia/GR00T-N1.7-LIBERO` (libero_spatial), Intel's
 //!   edge-ai-suites single-IR export, fp16 weights;
 //! - `CASCADIA_POLICY_PACKAGE_MOLMOACT2`: `allenai/MolmoAct2-LIBERO`, Intel's exporter, fp16 weights;
@@ -23,7 +26,9 @@
 //! actions in `ref.npz`, for the raw LIBERO frames in `frames.npz` (same rule).
 //! XR0's are Intel's runtime stages in `xr0-stages-f32.npz` (the exporter's
 //! `fixtures-f32.npz`, saved uncompressed) and PyTorch f32 of Intel's port with
-//! Xiaomi's action mask in `<dir>.ref.npz` (same rule). GR00T's are NVIDIA's `Gr00tPolicy`
+//! Xiaomi's action mask in `<dir>.ref.npz` (same rule). XR1's are Xiaomi's own processor's
+//! graph inputs and model (PyTorch f32) in `xr1.ref.npz`, with the client's
+//! cropped frames added by `tools/xr1_processor_fixture.py crop` (same rule). GR00T's are NVIDIA's `Gr00tPolicy`
 //! (PyTorch f32) graph inputs, raw output and decoded actions in `ref.npz`, for
 //! the frames and states in `gr00t-frames.npz` (regenerated from the
 //! exporter's seeds; same rule). Each MolmoAct2 package's are Intel's runtime stages
@@ -1958,6 +1963,261 @@ fn xr0_gpu_f32_load_is_an_error_in_its_own_process() {
                 "{m}"
             );
         }
+    }
+}
+
+fn xr1(test: &str) -> Option<PathBuf> {
+    package_from("CASCADIA_POLICY_PACKAGE_XR1", test)
+}
+
+/// The cameras XR1 serves, and the RoboCasa365 keys their frames have in `xr1.ref.npz`.
+const XR1_CAMERAS: [(&str, &str); 3] = [
+    ("agentview_left", "robot0_agentview_left"),
+    ("agentview_right", "robot0_agentview_right"),
+    ("eye_in_hand", "robot0_eye_in_hand"),
+];
+
+/// The request Xiaomi's client sends: each camera's four cropped frames, oldest first.
+fn xr1_observation(z: &[u8], task: String, noise: Vec<f32>) -> Observation {
+    let mut images = Vec::new();
+    for (camera, key) in XR1_CAMERAS {
+        let a = npz(z, &format!("crop_{key}"));
+        assert_eq!(a.shape, [4, 256, 256, 3], "{key}");
+        for f in a.data.chunks_exact(256 * 256 * 3) {
+            let img = Image {
+                height: 256,
+                width: 256,
+                data: f.to_vec(),
+            };
+            images.push((camera.to_string(), img));
+        }
+    }
+    Observation {
+        images,
+        state: npz(z, "state14").f32s(),
+        prompt: task,
+        seed: None,
+        noise: Some(noise),
+        rtc: None,
+    }
+}
+
+/// The ports of our XR1 export.
+fn xr1_ports() -> (Vec<PortInfo>, Vec<PortInfo>) {
+    let port = |name: &str, dtype, dims: &[usize]| PortInfo {
+        aliases: vec![name.into()],
+        dtype: Some(dtype),
+        dims: dims.iter().map(|&d| Some(d)).collect(),
+    };
+    (
+        vec![
+            port("tokenized_prompt", DType::I64, &[1, 512]),
+            port("tokenized_prompt_mask", DType::I64, &[1, 512]),
+            port("pixel_values", DType::F32, &[1536, 1536]),
+            port("state", DType::F32, &[1, 4, 60]),
+            port("noise", DType::F32, &[1, 16, 60]),
+        ],
+        vec![port("action", DType::F32, &[1, 16, 60])],
+    )
+}
+
+/// Xiaomi's processor, bit for bit: prompt ids and mask (video pads as image
+/// pads), pixel values and the bf16 state; `xr0_denormalize` within 1e-5 of
+/// Xiaomi's decode (it adds no eps). And the prompt limit: 512 tokens served,
+/// 513 refused. No model run, so it needs no device.
+#[test]
+fn xr1_engine_binds_xiaomis_processor() {
+    let Some(dir) = xr1("xr1_engine_binds_xiaomis_processor") else {
+        return;
+    };
+    let z = beside(&dir, "xr1.ref.npz");
+    let manifest = PolicyManifest::load(&dir, LoadOptions::default()).unwrap();
+    let task = npz(&z, "task").string();
+    let mut tok = OvTokenizer::load(&dir.join(manifest.tokenizer_artifact())).unwrap();
+    assert!(tok.has_truncation_state());
+    let specials = tok.special_tokens();
+    let prompt = |t: &str| {
+        cascadia_engine_openvino::policy::xr0::render_xr1_prompt(
+            &[
+                "Left camera".into(),
+                "Right camera".into(),
+                "Wrist camera".into(),
+            ],
+            2,
+            2,
+            64,
+            t,
+        )
+    };
+    assert_eq!(
+        prompt(&task).replace("<|image_pad|>", "<|video_pad|>"),
+        npz(&z, "prompt").string()
+    );
+    let words = |k: usize| vec!["word"; k].join(" ");
+    let mut count = |k: usize| {
+        let t = tok.tokenize(&prompt(&words(k))).unwrap();
+        (t.ids.len(), t.mask.iter().filter(|&&m| m).count())
+    };
+    let fit = (1..100).find(|&k| count(k).1 == 512).unwrap();
+    assert_eq!(count(fit + 1), (513, 513));
+
+    let bound = Arc::new(Mutex::new(Vec::new()));
+    let (inputs, outputs) = xr1_ports();
+    let mut pipeline = PolicyPipeline::new(
+        manifest,
+        ServerFacts {
+            model: "xr1".into(),
+            device: "CPU".into(),
+            prompt_max_bytes: 1024,
+        },
+        Box::new(JepaRecorder {
+            inputs: bound.clone(),
+            output: Arc::new(Mutex::new(npz(&z, "ref1").f32s())),
+            shape: vec![1, 16, 60],
+        }),
+        &inputs,
+        &outputs,
+        false,
+        Box::new(OvTokenizer::load(&dir.join("tokenizer.xml")).unwrap()),
+    )
+    .unwrap();
+    let spec = pipeline.spec().clone();
+    assert_eq!(
+        spec.cameras,
+        XR1_CAMERAS.map(|(c, _)| c.to_string()).to_vec()
+    );
+    assert_eq!(
+        (spec.history, spec.state_len, spec.chunk),
+        (4, 14, [16, 12])
+    );
+    let noise = npz(&z, "noise1").f32s();
+    let obs = xr1_observation(&z, task, noise.clone());
+    let a = pipeline.infer(&obs).unwrap();
+    let recorded = bound.lock().unwrap().clone();
+    assert_special_tasks_refused(
+        &mut pipeline,
+        &specials,
+        &[
+            "<|image_pad|>",
+            "<|vision_start|>",
+            "<|vision_end|>",
+            "<|video_pad|>",
+            "<|im_start|>",
+            "<|im_end|>",
+            "<|endoftext|>",
+            "<cot>",
+            "</cot>",
+        ],
+        &obs,
+    );
+    let get = |name: &str| {
+        recorded
+            .iter()
+            .find(|(n, _)| n == name)
+            .map(|(_, t)| t.data.clone())
+            .unwrap_or_else(|| panic!("{name} not bound"))
+    };
+    let mask = npz(&z, "in_tokenized_prompt_mask").i64s();
+    eprintln!(
+        "xr1 prompt: {} tokens of 512",
+        mask.iter().filter(|&&m| m == 1).count()
+    );
+    assert_eq!(
+        get("tokenized_prompt"),
+        TensorData::I64(npz(&z, "in_tokenized_prompt").i64s())
+    );
+    assert_eq!(get("tokenized_prompt_mask"), TensorData::I64(mask));
+    assert_eq!(
+        get("pixel_values"),
+        TensorData::F32(npz(&z, "in_pixel_values").f32s()),
+        "pixel_values bit for bit"
+    );
+    assert_eq!(get("state"), TensorData::F32(npz(&z, "in_state").f32s()));
+    assert_eq!(get("noise"), TensorData::F32(noise));
+    assert_eq!((a.steps, a.dim), (16, 12));
+    let d = max_abs_diff(&a.actions, &npz(&z, "act1").f32s());
+    eprintln!("xr1 denormalize vs xiaomi: max abs {d}");
+    assert!(d <= 1e-5, "xr0_denormalize differs by {d}");
+    let mut long = obs.clone();
+    long.prompt = words(fit + 1);
+    let e = pipeline.infer(&long).unwrap_err();
+    assert!(
+        e.to_string().contains("needs 513 tokens; the limit is 512"),
+        "{e}"
+    );
+    long.prompt = words(fit);
+    pipeline.infer(&long).unwrap();
+}
+
+/// The first `keep` values of each `width`-wide row.
+fn rows_cut(v: &[f32], width: usize, keep: usize) -> Vec<f32> {
+    v.chunks(width).flat_map(|r| r[..keep].to_vec()).collect()
+}
+
+/// CPU f32 with fp16 weights against Xiaomi's model in f32 on both noise
+/// draws, on the 12 served dims (spike: 2.8e-4 / 2.8e-4).
+#[test]
+fn xr1_spec_and_cpu_parity() {
+    let Some(dir) = xr1("xr1_spec_and_cpu_parity") else {
+        return;
+    };
+    let z = beside(&dir, "xr1.ref.npz");
+    let task = npz(&z, "task").string();
+    let mut engine = OvPolicyEngine::load(&dir, &cpu()).unwrap();
+    let spec = engine.spec().clone();
+    assert_eq!((spec.height, spec.width, spec.history), (256, 256, 4));
+    assert_eq!(spec.resize, ResizeConvention::Stretch);
+    assert_eq!(spec.server_resize, None);
+    assert_eq!((spec.state_len, spec.chunk), (14, [16, 12]));
+    assert_eq!(
+        (spec.noise, spec.noise_shape.clone()),
+        (NoiseMode::Input, Some(vec![16, 60]))
+    );
+    for (noise, reference, label) in [("noise1", "ref1", "draw 1"), ("noise2", "ref2", "draw 2")] {
+        let want = rows_cut(&npz(&z, reference).f32s(), 60, 12);
+        let obs = xr1_observation(&z, task.clone(), npz(&z, noise).f32s());
+        let a = engine.infer(&obs).unwrap();
+        assert_eq!((a.steps, a.dim, a.actions.len()), (16, 12, 192));
+        let d = max_abs_diff(&a.actions, &want);
+        eprintln!(
+            "xr1 engine cpu f32 vs xiaomi f32 ({label}): max abs {d} infer_ms={:.0}",
+            a.infer_ms
+        );
+        assert!(d <= 1e-3, "{label}: max abs diff {d}");
+    }
+}
+
+/// XR1 on the GPU at f16 against Xiaomi's model in f32. Not measured yet: the
+/// bound is the bf16 spread of Xiaomi's own model (1.2e-2) rounded up.
+#[test]
+fn xr1_gpu_infer_f16() {
+    let test = "xr1_gpu_infer_f16";
+    let Some(dir) = xr1(test) else {
+        return;
+    };
+    if !gpu_enabled(test) {
+        return;
+    }
+    let z = beside(&dir, "xr1.ref.npz");
+    let task = npz(&z, "task").string();
+    let opts = OvPolicyOptions {
+        device: "GPU".into(),
+        ..OvPolicyOptions::default()
+    };
+    let mut engine = OvPolicyEngine::load(&dir, &opts).unwrap();
+    let warm = engine.warmup().unwrap();
+    assert_eq!(warm.len(), WARMUP_CALLS);
+    for (noise, reference, label) in [("noise1", "ref1", "draw 1"), ("noise2", "ref2", "draw 2")] {
+        let want = rows_cut(&npz(&z, reference).f32s(), 60, 12);
+        let obs = xr1_observation(&z, task.clone(), npz(&z, noise).f32s());
+        let a = engine.infer(&obs).unwrap();
+        assert!(a.actions.iter().all(|x| x.is_finite()), "{:?}", a.actions);
+        let d = max_abs_diff(&a.actions, &want);
+        eprintln!(
+            "gpu xr1 f16 ({label}): max abs {d} infer_ms={:.1} warmup={warm:?}",
+            a.infer_ms
+        );
+        assert!(d <= 2e-2, "gpu xr1 f16 {label} max abs diff {d} > 2e-2");
     }
 }
 

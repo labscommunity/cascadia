@@ -52,6 +52,14 @@ def cases():
         "max_guidance_weight": np.float32(5.0),
         "execution_horizon": 1,
     }
+    # A history of two observations (XR1 takes four): [2, H, W, 3] per camera
+    # and a [2, 3] state, oldest first.
+    f = frames()
+    yield "request-history.msgpack", {
+        "images": {k: np.stack([v, v[::-1]]) for k, v in f.items()},
+        "state": np.array([[0.5, -1.0, 2.25], [1.5, 0.0, -2.0]], dtype=np.float32),
+        "prompt": "pick up the cube",
+    }
     yield "reply.msgpack", {
         "actions": np.array([[0.5, -1.25, 3.0], [0.001, 2.0, -0.0]], dtype=np.float32),
         "server_timing": {"infer_ms": 12.5},

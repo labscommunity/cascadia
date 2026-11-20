@@ -12,7 +12,7 @@ The full design, the package contract and the measurements are in
 
 ## When to use
 
-- You run a robot model (SmolVLA, π0.5, π0, X-VLA, EVO1, VLA-JEPA, XR0, GR00T N1.7, MolmoAct2) on
+- You run a robot model (SmolVLA, π0.5, π0, X-VLA, EVO1, VLA-JEPA, XR0, XR1, GR00T N1.7, MolmoAct2) on
   an Intel GPU or CPU and want an openpi-compatible WebSocket, or Intel's physicalai protocol, with
   no Python on the serving machine.
 - One robot model on one machine. For language models use the chat engines; for more than one

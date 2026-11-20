@@ -213,7 +213,13 @@ fn images(v: Val<'_>, spec: &PolicySpec) -> Result<Vec<(String, Image)>, Request
         return refuse("images must be a map of camera name to array");
     };
     let hw3 = [spec.height as u64, spec.width as u64, 3];
-    let mut out = Vec::with_capacity(entries.len().min(spec.cameras.len()));
+    let shape = match spec.history {
+        1 => hw3.to_vec(),
+        h => [&[h as u64][..], &hw3].concat(),
+    };
+    // `max(1)`: an empty frame yields no chunks, and the camera is then missing.
+    let frame = (spec.height as usize * spec.width as usize * 3).max(1);
+    let mut out = Vec::with_capacity(entries.len().min(spec.cameras.len()) * spec.history);
     for (k, v) in entries {
         let Some(name) = k.key() else {
             return refuse("camera names must be strings");
@@ -229,15 +235,17 @@ fn images(v: Val<'_>, spec: &PolicySpec) -> Result<Vec<(String, Image)>, Request
         if a.dtype != "|u1" {
             return refuse(format!("{what} has dtype {}; expected |u1", a.dtype));
         }
-        a.expect_shape(&what, &hw3)?;
-        out.push((
-            name.to_string(),
-            Image {
-                height: spec.height,
-                width: spec.width,
-                data: a.bytes(&what, 1)?.to_vec(),
-            },
-        ));
+        a.expect_shape(&what, &shape)?;
+        for data in a.bytes(&what, 1)?.chunks_exact(frame) {
+            out.push((
+                name.to_string(),
+                Image {
+                    height: spec.height,
+                    width: spec.width,
+                    data: data.to_vec(),
+                },
+            ));
+        }
     }
     Ok(out)
 }
@@ -246,7 +254,9 @@ fn images(v: Val<'_>, spec: &PolicySpec) -> Result<Vec<(String, Image)>, Request
 ///
 /// The map holds `images` (camera name to `|u1` `[H, W, 3]`), `state` (`<f4`
 /// or `<f8`, `[state_len]`), `prompt`, and optional `seed` and `noise` (`<f4`
-/// `[1, *noise_shape]`, input-mode packages only). An RTC package also takes
+/// `[1, *noise_shape]`, input-mode packages only). A package with a
+/// [`PolicySpec::history`] `h` above 1 takes `[h, H, W, 3]` per camera and a
+/// `[h, state_len]` state instead, oldest first. An RTC package also takes
 /// `prev_chunk_left_over` (`<f4` `[rtc_chunk_size, D]`), `inference_delay`,
 /// `max_guidance_weight` and `execution_horizon`, all four or none. Everything
 /// [`check_observation`] covers is checked too, so a returned observation is
@@ -270,7 +280,11 @@ pub fn decode_request(bytes: &[u8], spec: &PolicySpec) -> Result<Observation, Re
             "images" => imgs = Some(images(v, spec)?),
             "state" => {
                 let a = NdArray::parse("state", v)?;
-                a.expect_shape("state", &[spec.state_len as u64])?;
+                let row = spec.state_len as u64;
+                match spec.history {
+                    1 => a.expect_shape("state", &[row])?,
+                    h => a.expect_shape("state", &[h as u64, row])?,
+                }
                 state = Some(a.floats("state")?);
             }
             "prompt" => match v {
@@ -486,8 +500,9 @@ pub fn decode_metadata(bytes: &[u8]) -> Result<(PolicySpec, PackageIdentity), Re
 }
 
 /// A request for `obs` in openpi's layout, as `msgpack_numpy` packs it: what
-/// [`decode_request`] reads. `spec` gives the noise and leftover shapes; RTC
-/// inputs for a package without RTC are refused.
+/// [`decode_request`] reads. `spec` gives the noise and leftover shapes and
+/// the history (a camera's frames packed as one array); RTC inputs for a
+/// package without RTC are refused.
 pub fn encode_request(obs: &Observation, spec: &PolicySpec) -> Result<Vec<u8>, RequestError> {
     if obs.rtc.is_some() && spec.rtc_chunk_size.is_none() {
         return refuse("this model takes no RTC inputs; export it with RTC enabled");
@@ -499,19 +514,52 @@ pub fn encode_request(obs: &Observation, spec: &PolicySpec) -> Result<Vec<u8>, R
         + 4 * usize::from(obs.rtc.is_some());
     w.map(n);
     w.str("images");
-    w.map(obs.images.len());
-    for (name, img) in &obs.images {
-        w.str(name);
-        ndarray_header(
-            &mut w,
-            "|u1",
-            &[img.height as usize, img.width as usize, 3],
-            &img.data,
-        );
+    if spec.history == 1 {
+        w.map(obs.images.len());
+        for (name, img) in &obs.images {
+            w.str(name);
+            ndarray_header(
+                &mut w,
+                "|u1",
+                &[img.height as usize, img.width as usize, 3],
+                &img.data,
+            );
+        }
+    } else {
+        // One `[history, H, W, 3]` array per camera, in first-sent order.
+        let mut names: Vec<&str> = Vec::new();
+        for (name, _) in &obs.images {
+            if !names.contains(&name.as_str()) {
+                names.push(name);
+            }
+        }
+        w.map(names.len());
+        for name in names {
+            let frames: Vec<&Image> = obs
+                .images
+                .iter()
+                .filter(|(n, _)| n == name)
+                .map(|(_, img)| img)
+                .collect();
+            let (h, wd) = (frames[0].height as usize, frames[0].width as usize);
+            if frames
+                .iter()
+                .any(|f| (f.height, f.width) != (frames[0].height, frames[0].width))
+            {
+                return refuse(format!("camera {name:?} frames differ in size"));
+            }
+            let data: Vec<u8> = frames.iter().flat_map(|f| f.data.iter().copied()).collect();
+            w.str(name);
+            ndarray_header(&mut w, "|u1", &[frames.len(), h, wd, 3], &data);
+        }
     }
     let f32s = |v: &[f32]| -> Vec<u8> { v.iter().flat_map(|x| x.to_le_bytes()).collect() };
     w.str("state");
-    ndarray_header(&mut w, "<f4", &[obs.state.len()], &f32s(&obs.state));
+    let state_shape = match spec.history {
+        1 => vec![obs.state.len()],
+        h => vec![h, obs.state.len() / h],
+    };
+    ndarray_header(&mut w, "<f4", &state_shape, &f32s(&obs.state));
     w.str("prompt");
     w.str(&obs.prompt);
     if let Some(seed) = obs.seed {

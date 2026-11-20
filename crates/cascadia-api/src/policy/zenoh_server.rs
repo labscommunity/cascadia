@@ -604,6 +604,7 @@ mod tests {
             package_sha256: String::new(),
             server_resize: Some(cascadia_types::ServerResize::Letterbox),
             rtc_chunk_size: None,
+            history: 1,
         }
     }
 

@@ -335,7 +335,7 @@ pub enum PortLayout {
     /// (the graph normalizes it), `noise`; `action` is final.
     VlaJepa,
     /// XR0: `tokenized_prompt` and `tokenized_prompt_mask` (both i64),
-    /// `pixel_values`, `state [1, 1, max_state_dim]` (raw, zero-padded), `noise`.
+    /// `pixel_values`, `state [1, history, max_state_dim]` (raw, zero-padded), `noise`.
     Xr0,
     /// GR00T N1.7: `input_ids`, `attention_mask` (i64, image tokens expanded),
     /// `pixel_values`, `position_ids [3, 1, seq_len]`, `state [1, 1, pad_to]`
@@ -741,9 +741,10 @@ pub fn bind_xr0(
         ));
     }
     let state = dims(inputs, STATE, &[DType::F32], 3, Some(0))?;
-    if state[1] != Some(1) || state[2] != Some(host.max_state_dim()) {
+    if state[1] != Some(host.geo.history) || state[2] != Some(host.max_state_dim()) {
         return refuse(format!(
-            "state is {state:?}; xr0 makes [1, 1, {}]",
+            "state is {state:?}; xr0 makes [1, {}, {}]",
+            host.geo.history,
             host.max_state_dim()
         ));
     }
@@ -1090,10 +1091,7 @@ fn prompt_text(m: &PolicyManifest, task: &str, state: &[f64], worst: bool) -> En
             PreStep::VlaJepaPrompt { template } => {
                 text = template.replace("{instruction}", &text);
             }
-            PreStep::Xr0(s) => {
-                let geo = super::xr0::geometry(m, s)?;
-                text = super::xr0::render_prompt(&geo.views, geo.patches.image_pads(), &text);
-            }
+            PreStep::Xr0(s) => text = super::xr0::task_prompt(m, s, &text)?,
             PreStep::Gr00tPrompt(s) => {
                 let cameras = super::gr00t::Gr00tGeometry::new(m)?.cameras;
                 text = super::gr00t::render_prompt(s, cameras, &text);
@@ -1638,7 +1636,7 @@ impl PolicyPipeline {
             (
                 STATE,
                 HostTensor {
-                    shape: vec![1, 1, state.len()],
+                    shape: vec![1, host.geo.history, host.max_state_dim()],
                     data: TensorData::F32(state),
                 },
             ),
@@ -1949,9 +1947,9 @@ impl PolicyEngine for PolicyPipeline {
                 .spec
                 .cameras
                 .iter()
-                .map(|c| (c.clone(), frame.clone()))
+                .flat_map(|c| std::iter::repeat_n((c.clone(), frame.clone()), self.spec.history))
                 .collect(),
-            state: vec![WARMUP_STATE; self.spec.state_len],
+            state: vec![WARMUP_STATE; self.spec.state_len * self.spec.history],
             prompt: String::new(),
             seed: Some(0),
             noise: None,
@@ -3000,6 +2998,121 @@ mod tests {
         let v = f32s(&px);
         let norm = |b: u8| (f32::from(b) * (1.0f64 / 255.0) as f32 - 0.5) / 0.5;
         assert_eq!((v[0], v[256 * 1536]), (norm(10), norm(20)));
+    }
+
+    const XR1_ROBOCASA: &str =
+        include_str!("../../tests/fixtures/policy/xr1-robocasa365-manifest.json");
+
+    /// The ports of our XR1 RoboCasa365 export; the prompt port widened for the byte tokenizer.
+    fn xr1_ports(state_rows: usize) -> (Vec<PortInfo>, Vec<PortInfo>) {
+        (
+            vec![
+                port(PROMPT, DType::I64, &[1, 8192]),
+                port(PROMPT_MASK, DType::I64, &[1, 8192]),
+                port(PIXEL_VALUES, DType::F32, &[1536, 1536]),
+                port(STATE, DType::F32, &[1, state_rows, 60]),
+                port(NOISE, DType::F32, &[1, 16, 60]),
+            ],
+            vec![port(ACTION, DType::F32, &[1, 16, 60])],
+        )
+    }
+
+    #[test]
+    fn xr1_takes_four_frames_per_camera_and_four_state_rows() {
+        let mut r = rig_with(XR1_ROBOCASA, xr1_ports(4), false, true, vec![1.0; 16 * 60]);
+        assert_eq!(r.engine.warmup().unwrap().len(), WARMUP_CALLS);
+        let spec = r.engine.spec().clone();
+        assert_eq!(
+            spec.cameras,
+            ["agentview_left", "agentview_right", "eye_in_hand"]
+        );
+        assert_eq!(
+            (spec.history, spec.state_len, spec.chunk),
+            (4, 14, [16, 12])
+        );
+        assert_eq!(spec.server_resize, None);
+        // Camera c's frame t is all 10 * (c + 1) + t, sent oldest first.
+        let images: Vec<(String, Image)> = spec
+            .cameras
+            .iter()
+            .enumerate()
+            .flat_map(|(c, name)| {
+                (0..4).map(move |t| (name.clone(), frame(256, 10 * (c as u8 + 1) + t)))
+            })
+            .collect();
+        let o = Observation {
+            images,
+            state: (0..4 * 14).map(|i| 1.0 + i as f32 / 1000.0).collect(),
+            prompt: "go".into(),
+            seed: None,
+            noise: None,
+            rtc: None,
+        };
+        let a = r.engine.infer(&o).unwrap();
+        assert_eq!((a.steps, a.dim), (16, 12));
+        assert_eq!(a.actions[0], 1.0 * (1.0 + 1e-6f32));
+        let (inputs, _) = xr1_ports(4);
+        for p in &inputs {
+            let t = input(&r.log, &p.aliases[0]);
+            let want: Vec<usize> = p.dims.iter().map(|d| d.unwrap()).collect();
+            assert_eq!(t.shape, want, "{}", p.aliases[0]);
+        }
+        // Slot k of a camera holds its frames 2k and 2k+1, 256 rows each;
+        // within a row, a channel's patch of the first frame, then the second's.
+        let v = f32s(&input(&r.log, PIXEL_VALUES)).to_vec();
+        let norm = |b: u8| (f32::from(b) - 127.5) / 127.5;
+        let row = |slot: usize| slot * 256 * 1536;
+        assert_eq!(
+            [
+                v[row(0)],
+                v[row(0) + 256],
+                v[row(1)],
+                v[row(1) + 256],
+                v[row(2)]
+            ],
+            [norm(10), norm(11), norm(12), norm(13), norm(20)]
+        );
+        let state = f32s(&input(&r.log, STATE)).to_vec();
+        assert_eq!(
+            state[..14],
+            o.state[..14]
+                .iter()
+                .map(|&x| half::bf16::from_f32(x).to_f32())
+                .collect::<Vec<_>>()[..]
+        );
+        assert_eq!(state[14..60], [0.0; 46]);
+        assert_eq!(state[60], half::bf16::from_f32(o.state[14]).to_f32());
+        let text = r.log.lock().unwrap().texts.last().unwrap().clone();
+        assert!(text.starts_with(
+            "<|im_start|>user\nLeft camera: <0.0 seconds><|vision_start|><|image_pad|>"
+        ));
+        assert!(text.contains("<|vision_end|><0.1 seconds><|vision_start|>"));
+        assert!(text.contains("<|vision_end|>\nWrist camera: <0.0 seconds>"));
+        assert_eq!(text.matches("<|image_pad|>").count(), 6 * 64);
+        // One frame short is refused before the model runs.
+        let mut short = o.clone();
+        short.images.pop();
+        let e = r.engine.infer(&short).unwrap_err().to_string();
+        assert!(
+            e.contains("camera \"eye_in_hand\" has 3 frames; this model takes 4"),
+            "{e}"
+        );
+        // A graph with a one-row state port does not fit the package.
+        let log = Arc::new(Mutex::new(Log::default()));
+        let (inputs, outputs) = xr1_ports(1);
+        let e = pipeline_with(
+            XR1_ROBOCASA,
+            (&inputs, &outputs),
+            false,
+            true,
+            8192,
+            &log,
+            vec![],
+        )
+        .err()
+        .unwrap()
+        .to_string();
+        assert!(e.contains("xr0 makes [1, 4, 60]"), "{e}");
     }
 
     #[test]

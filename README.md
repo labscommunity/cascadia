@@ -191,7 +191,7 @@ $ cascadia engines
   sparse-moe     sparse mixture-of-experts on CPU: Kimi K2.6 (AVX-512 int4 GEMM), MiniMax-M2 (OV-IR shells), GLM-5 / DeepSeek-V4 / Inkling (Rust shells + int4 mmap experts, N-rank pipeline)
   sycl-llama     external llama.cpp SYCL server (GGUF, spawned subprocess); bin via --llama-bin / CASCADIA_LLAMA_BIN / PATH; --elastic = GGML_STREAM_WEIGHTS device-side streaming (needs a streaming build, scripts/build-llama-stream.sh)
   qwen35         Qwen3.5-family staged chain (GatedDeltaNet; 3.5/3.6 MoE or 3.8 dense); qwen3_5* IR-surgery shards (alias: qwen36-moe)
-  ov-policy      robot models (VLA policies): SmolVLA / pi0.5 / pi0 / X-VLA / EVO1 / VLA-JEPA / XR0 / GR00T N1.7 / MolmoAct2 on GPU or CPU, openpi-compatible WebSocket; `cascadia run` only
+  ov-policy      robot models (VLA policies): SmolVLA / pi0.5 / pi0 / X-VLA / EVO1 / VLA-JEPA / XR0 / XR1 / GR00T N1.7 / MolmoAct2 on GPU or CPU, openpi-compatible WebSocket; `cascadia run` only
 ```
 
 `sparse-moe` consumes a `manifest.json` + per-expert artefact tree, not `cascadia shard` output, see [docs/architectures/moe.md](docs/architectures/moe.md). In-repo exporters: `tools/export_minimax_m2.py`, `export_glm5.py`, `export_deepseek_v4.py`, `export_inkling.py` (per-family pages under `docs/architectures/`); the Kimi K2.6 artefacts come from an external pipeline that is not part of this repo. Tuning: [docs/perf/A3_TOPK_REDUCTION.md](docs/perf/A3_TOPK_REDUCTION.md), [docs/perf/CHESS_PER_CHANNEL.md](docs/perf/CHESS_PER_CHANNEL.md).

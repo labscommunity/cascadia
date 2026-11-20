@@ -27,6 +27,12 @@ Copied, unmodified:
   exporter, physical-ai-studio `8f132416`, runtime `e3dd944`), f32 with fp16 weights, the in-graph
   noise replaced by a `noise` input and a `noise` step after `xr0`, the denoised action masked to
   the checkpoint's real dims (`std > 1e-5`, 7 of 32) as Xiaomi's model does, a 10-action chunk.
+- `xr1-robocasa365-manifest.json`: our export of `XiaomiRobotics/Xiaomi-Robotics-1-RoboCasa365`
+  (revision `3a6d0293`; Intel's XR0 exporter at physical-ai-studio `8f132416`, patched for XR1),
+  f32 with fp16 weights, `noise` an input. Edited after export: the `xr0` step gains `processor:
+  "xr1"`, `history: 4` and `camera_labels`, and `xr0_denormalize`'s `action_std` is the
+  checkpoint's own (1 on the 12 served dims, 0 on the padding; Intel's exporter pads it with 1,
+  which reads as placeholder stats). Served values are unchanged.
 - `gr00t-libero-spatial-manifest.json`: our export of `nvidia/GR00T-N1.7-LIBERO`
   (`libero_spatial`, revision `65854032`) with Intel's edge-ai-suites single-IR exporter
   (`decbb06f`, Isaac-GR00T `3df8b382`), f32 with fp16 weights, static shapes and named ports, the
@@ -46,6 +52,12 @@ Generated:
   (`lerobot/policies/xvla/utils.py`, numpy 1.26.4) on float32 6-D rotations built from
   axis-angles near π and below, plus a scaled non-orthogonal row, the identity and a near-identity
   row.
+
+- `xr1-processor-32px.npz`: Xiaomi's XR1 processor (`processing_mibot.py` at `3a6d0293`,
+  transformers 4.57.1, torch 2.11.0 CPU) on seeded random 32×32 frames, 3 cameras × 4, cropped as
+  Xiaomi's RoboCasa365 client does, a 4-row state and a task; `tools/xr1_processor_fixture.py make
+  <processor files> 32 <out>`. Holds the cropped frames, the prompt text and ids, `pixel_values`
+  and the bf16 state, saved uncompressed.
 
 - `smolvla-libero-noise-reference-actions.json`: the served actions for the fixed inputs of
   `tests/policy_openvino.rs`, from an independent numpy + OpenVINO Python pipeline (own

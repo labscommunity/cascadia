@@ -39,6 +39,7 @@ fn spec() -> PolicySpec {
         package_sha256: String::new(),
         server_resize: Some(cascadia_types::ServerResize::Letterbox),
         rtc_chunk_size: None,
+        history: 1,
     }
 }
 
@@ -537,6 +538,20 @@ fn the_hand_built_request_decodes() {
     let r = decode_predict(&good().pack(), &spec(), max()).unwrap();
     assert_eq!(r.observation.images.len(), 2);
     assert_eq!(r.observation.state, [0.5, -1.0, 2.25]);
+}
+
+#[test]
+fn a_history_package_is_refused_with_the_front_end_to_use() {
+    let s = PolicySpec {
+        history: 4,
+        ..spec()
+    };
+    let e = decode_predict(&good().pack(), &s, max()).unwrap_err();
+    assert!(
+        e.message()
+            .contains("takes the last 4 observations per call; physicalai's protocol sends one"),
+        "{e}"
+    );
 }
 
 #[test]

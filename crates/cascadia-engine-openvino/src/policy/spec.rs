@@ -5,7 +5,7 @@ use cascadia_engine::{EngineError, EngineResult};
 use cascadia_types::{NoiseMode, PolicySpec, ResizeConvention, ServerResize};
 
 use super::cameras::{CameraLayout, CameraPlan};
-use super::manifest::{ImageStep, PolicyManifest, PostStep, PreStep, StatsStep};
+use super::manifest::{ImageStep, PolicyManifest, PostStep, PreStep, StatsStep, Xr0Processor};
 use super::pipeline::PREV_CHUNK_LEFT_OVER;
 
 /// Facts only the compiled model can give.
@@ -47,6 +47,8 @@ pub struct ManifestSpec {
     /// of another size; never with an `image_flip` before it (a flip then a
     /// padded letterbox is not a letterbox then a flip).
     pub server_resize: Option<ServerResize>,
+    /// Observations per request (an `xr0` step's `history`), else 1.
+    pub history: usize,
 }
 
 fn refuse<T>(msg: impl std::fmt::Display) -> EngineResult<T> {
@@ -101,6 +103,8 @@ impl ManifestSpec {
             ImageStep::VlaJepa(_) => Some(ServerResize::Area),
             // On x86, physicalai's OpenCV resizes these with Intel IPP, which the
             // API does not reproduce; see `XR0_CUBIC_EXACT` there.
+            // Xiaomi's XR1 processor never resizes (`do_resize=False`).
+            ImageStep::Xr0(x) if x.processor == Xr0Processor::Xr1 => None,
             ImageStep::Xr0(x) if cfg!(target_arch = "aarch64") => {
                 Some(ServerResize::SmartResizeCubic {
                     factor: x.image_factor as u32,
@@ -122,6 +126,10 @@ impl ManifestSpec {
             resize,
             n_action_steps: m.n_action_steps(),
             noise_shape,
+            history: match m.image_step() {
+                ImageStep::Xr0(x) => x.history,
+                _ => 1,
+            },
         })
     }
 }
@@ -276,6 +284,7 @@ pub fn derive_spec(
         package_sha256: String::new(),
         server_resize: ms.server_resize,
         rtc_chunk_size,
+        history: ms.history,
     };
     if let Err(EngineError::InvalidConfig(m)) = cascadia_engine::payload_cap(&spec) {
         return refuse(m);

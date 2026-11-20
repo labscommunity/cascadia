@@ -505,6 +505,13 @@ fn observation(
     images: Vec<(String, Image)>,
     spec: &PolicySpec,
 ) -> Result<Observation, RequestError> {
+    if spec.history > 1 {
+        return refuse(format!(
+            "this model takes the last {} observations per call; physicalai's protocol sends \
+             one, so drive it over the openpi WebSocket",
+            spec.history
+        ));
+    }
     let (mut state, mut prompt, mut noise) = (None, None, None);
     let (mut left, mut delay, mut weight, mut horizon) = (None, None, None, None);
     let mut budget = u64::MAX;

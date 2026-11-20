@@ -142,10 +142,26 @@ pub struct VlaJepaInputsStep {
     pub temporal_patch_size: usize,
 }
 
+/// Whose processor an `xr0` step reproduces.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Xr0Processor {
+    /// Intel's runtime `xr0` preprocessor (XR0): one frame per view.
+    Xr0,
+    /// Xiaomi's `MiBotProcessor` for XR1: each camera a video of `history`
+    /// frames with timestamps, the rescale fused into the normalize, the
+    /// state rounded to bf16.
+    Xr1,
+}
+
 /// Intel's `xr0` preprocessor: Qwen3-VL `pixel_values`, the multi-view chat
 /// prompt and the padded state.
 #[derive(Clone, Debug, PartialEq)]
 pub struct Xr0Step {
+    pub processor: Xr0Processor,
+    /// Frames per camera and state rows a request carries (XR1: 4).
+    pub history: usize,
+    /// `xr1`: the prompt's name for each camera, in camera order.
+    pub camera_labels: Vec<String>,
     pub max_state_dim: usize,
     /// Intel resizes each side to a multiple of this within `image_max_pixels`;
     /// the engine takes only frames that resize leaves as they are.
@@ -153,7 +169,8 @@ pub struct Xr0Step {
     pub image_max_pixels: usize,
     pub image_mean: [f32; 3],
     pub image_std: [f32; 3],
-    pub rescale_factor: f32,
+    /// f64 as written: XR1's processor divides by it before rounding to f32.
+    pub rescale_factor: f64,
     pub patch_size: usize,
     pub merge_size: usize,
     pub temporal_patch_size: usize,
@@ -1300,6 +1317,13 @@ struct Xr0Params {
     #[serde(default)]
     #[allow(dead_code)]
     state_std: Option<Value>,
+    // Ours: XR1 (Xiaomi's processor, a frame history per camera).
+    #[serde(default)]
+    processor: Option<String>,
+    #[serde(default)]
+    history: Option<i64>,
+    #[serde(default)]
+    camera_labels: Option<Vec<String>>,
 }
 
 #[derive(Deserialize)]
@@ -1969,19 +1993,48 @@ fn xr0_step(params: Map<String, Value>, ctx: &str) -> EngineResult<Xr0Step> {
     if let Some((name, _)) = positive.iter().find(|(_, v)| *v < 1) {
         return refuse(format!("{ctx}: {name} must be at least 1"));
     }
+    let processor = match p.processor.as_deref() {
+        None | Some("xr0") => Xr0Processor::Xr0,
+        Some("xr1") => Xr0Processor::Xr1,
+        Some(other) => return refuse(format!("{ctx}: processor {other:?}; supported: xr0, xr1")),
+    };
+    let history = match p.history {
+        None => 1,
+        Some(h) if h < 1 => return refuse(format!("{ctx}: history must be at least 1")),
+        Some(h) => h as usize,
+    };
+    let camera_labels = p.camera_labels.unwrap_or_default();
+    if processor == Xr0Processor::Xr0 && (history != 1 || !camera_labels.is_empty()) {
+        return refuse(format!(
+            "{ctx}: history and camera_labels need processor \"xr1\"; Intel's xr0 takes one \
+             frame per view"
+        ));
+    }
+    if history > 1 && !history.is_multiple_of(p.temporal_patch_size as usize) {
+        return refuse(format!(
+            "{ctx}: history {history} is not a multiple of temporal_patch_size {}",
+            p.temporal_patch_size
+        ));
+    }
     let (mean, std) = (
         p.image_mean.map(|x| x as f32),
         p.image_std.map(|x| x as f32),
     );
-    let rescale = p.rescale_factor as f32;
-    if mean.iter().chain(&[rescale]).any(|x| !x.is_finite())
+    let rescale = p.rescale_factor;
+    if mean.iter().chain(&[rescale as f32]).any(|x| !x.is_finite())
         || std.iter().any(|x| !x.is_finite() || *x == 0.0)
     {
         return refuse(format!(
             "{ctx}: image_mean, image_std and rescale_factor must be finite, image_std non-zero"
         ));
     }
+    if processor == Xr0Processor::Xr1 && rescale == 0.0 {
+        return refuse(format!("{ctx}: xr1 divides by rescale_factor; it is 0"));
+    }
     Ok(Xr0Step {
+        processor,
+        history,
+        camera_labels,
         max_state_dim: p.max_state_dim as usize,
         image_factor: p.image_factor as usize,
         image_max_pixels: p.image_max_pixels as usize,
@@ -2344,6 +2397,8 @@ mod tests {
         include_str!("../../tests/fixtures/policy/vlajepa-libero-manifest.json");
     const EVO1_LIBERO: &str = include_str!("../../tests/fixtures/policy/evo1-libero-manifest.json");
     const XR0_LIBERO: &str = include_str!("../../tests/fixtures/policy/xr0-libero-manifest.json");
+    const XR1_ROBOCASA: &str =
+        include_str!("../../tests/fixtures/policy/xr1-robocasa365-manifest.json");
     const GR00T_LIBERO: &str =
         include_str!("../../tests/fixtures/policy/gr00t-libero-spatial-manifest.json");
     const MOLMOACT2_LIBERO: &str =
@@ -2626,7 +2681,7 @@ mod tests {
             ),
             (32, 16, 2, 2)
         );
-        assert_eq!(x.rescale_factor, (1.0f64 / 255.0) as f32);
+        assert_eq!(x.rescale_factor, 1.0f64 / 255.0);
         let PostStep::Xr0Denormalize(d) = &m.postprocessors[0] else {
             panic!("xr0_denormalize")
         };
@@ -2701,6 +2756,79 @@ mod tests {
             "init_args": step
         });
         parse(&v).unwrap();
+    }
+
+    #[test]
+    fn xr1_robocasa365_manifest_parses() {
+        let m = PolicyManifest::parse(XR1_ROBOCASA, LoadOptions::default()).unwrap();
+        assert_eq!(m.policy, PolicyKind::Xr0);
+        let ImageStep::Xr0(x) = m.image_step() else {
+            panic!("xr0 is the image step")
+        };
+        assert_eq!(
+            (x.processor, x.history, x.max_state_dim),
+            (Xr0Processor::Xr1, 4, 60)
+        );
+        assert_eq!(
+            x.camera_labels,
+            ["Left camera", "Right camera", "Wrist camera"]
+        );
+        let geo = crate::policy::xr0::geometry(&m, x).unwrap();
+        assert_eq!(
+            geo.cameras,
+            ["agentview_left", "agentview_right", "eye_in_hand"]
+        );
+        assert_eq!((geo.views.len(), geo.slots_per_camera()), (6, 2));
+        let PostStep::Xr0Denormalize(d) = &m.postprocessors[0] else {
+            panic!("xr0_denormalize")
+        };
+        assert_eq!(
+            (d.action_mean.len(), d.action_mean[0].len(), d.action_dim),
+            (16, 60, Some(12))
+        );
+        // The checkpoint's std: 1 on the 12 served dims, 0 on the padding.
+        assert!(d
+            .action_std
+            .iter()
+            .all(|r| r[..12] == [1.0; 12] && r[12..] == [0.0; 48]));
+    }
+
+    #[test]
+    fn xr1_steps_are_validated() {
+        let xr1 = || -> Value { serde_json::from_str(XR1_ROBOCASA).unwrap() };
+        let e = |v: &Value| err(v);
+        fn step(v: &mut Value) -> &mut Value {
+            &mut v["model"]["preprocessors"][0]
+        }
+        // Intel's export pads std with 1, so its stats read as a placeholder.
+        let mut v = xr1();
+        v["model"]["postprocessors"][0]["action_std"] = json!(vec![vec![1.0; 60]; 16]);
+        assert!(e(&v).contains("xr0_denormalize stats are identity placeholders"));
+        let mut v = xr1();
+        step(&mut v)["processor"] = json!("xr2");
+        assert!(e(&v).contains("processor \"xr2\"; supported: xr0, xr1"));
+        let mut v = xr1();
+        step(&mut v)["history"] = json!(0);
+        assert!(e(&v).contains("history must be at least 1"));
+        let mut v = xr1();
+        step(&mut v)["history"] = json!(3);
+        assert!(e(&v).contains("history 3 is not a multiple of temporal_patch_size 2"));
+        let mut v = xr1();
+        step(&mut v)["history"] = json!(2);
+        assert!(e(&v).contains("camera \"agentview_left_1\" does not end in _0"));
+        let mut v = xr1();
+        step(&mut v)["processor"] = json!("xr0");
+        assert!(e(&v).contains("history and camera_labels need processor \"xr1\""));
+        let mut v = xr1();
+        step(&mut v)["camera_labels"] = json!(["Left camera", "Right camera"]);
+        assert!(e(&v).contains("2 camera_labels for the cameras"));
+        let mut v = xr1();
+        v["model"]["input_features"][2]["init_args"]["name"] = json!("images.agentview_left_2");
+        assert!(e(&v).contains("\"agentview_left_2\" is not agentview_left_1"));
+        let mut v = xr1();
+        v["model"]["input_features"][3]["init_args"]["name"] = json!("images.agentview_left_0");
+        v["model"]["input_features"][4]["init_args"]["name"] = json!("images.agentview_left_1");
+        assert!(e(&v).contains("camera \"agentview_left\" declared twice"));
     }
 
     #[test]

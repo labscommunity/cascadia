@@ -28,12 +28,18 @@ impl PatchGeometry {
         self.patches() / (self.merge * self.merge)
     }
 
-    /// Patchify one CHW image: tiled `temporal` times, reshaped to
-    /// `(1, tp, C, gh/m, m, p, gw/m, m, p)` and transposed by
-    /// `(0, 3, 6, 4, 7, 2, 1, 5, 8)`, appended as `gh * gw` rows.
+    /// Patchify one CHW image, tiled `temporal` times: [`Self::patchify_frames`].
     pub fn patchify(&self, chw: &[f32], out: &mut Vec<f32>) {
+        self.patchify_frames(&vec![chw; self.temporal], out);
+    }
+
+    /// Patchify `temporal` consecutive CHW frames (one temporal patch of a
+    /// video): stacked, reshaped to `(1, tp, C, gh/m, m, p, gw/m, m, p)` and
+    /// transposed by `(0, 3, 6, 4, 7, 2, 1, 5, 8)`, appended as `gh * gw` rows.
+    pub fn patchify_frames(&self, frames: &[&[f32]], out: &mut Vec<f32>) {
+        assert_eq!(frames.len(), self.temporal, "one frame per temporal slot");
         let [vh, vw] = self.hw;
-        let (p, m, tp) = (self.patch, self.merge, self.temporal);
+        let (p, m) = (self.patch, self.merge);
         let (gh, gw) = (vh / p, vw / p);
         for bh in 0..gh / m {
             for bw in 0..gw / m {
@@ -41,7 +47,7 @@ impl PatchGeometry {
                     for mw in 0..m {
                         let (y0, x0) = ((bh * m + mh) * p, (bw * m + mw) * p);
                         for c in 0..3 {
-                            for _ in 0..tp {
+                            for chw in frames {
                                 for py in 0..p {
                                     let at = c * vh * vw + (y0 + py) * vw + x0;
                                     out.extend_from_slice(&chw[at..at + p]);
@@ -59,20 +65,13 @@ impl PatchGeometry {
 mod tests {
     use super::*;
 
-    /// The 9-D reshape and transpose, done the long way.
-    fn patchify_reference(
-        chw: &[f32],
-        h: usize,
-        w: usize,
-        p: usize,
-        m: usize,
-        tp: usize,
-    ) -> Vec<f32> {
-        let (gh, gw) = (h / p, w / p);
+    /// The 9-D reshape and transpose of `tp` stacked frames, done the long way.
+    fn patchify_reference(frames: &[&[f32]], h: usize, w: usize, p: usize, m: usize) -> Vec<f32> {
+        let (gh, gw, tp) = (h / p, w / p, frames.len());
         let feature = 3 * tp * p * p;
         let mut out = vec![0f32; gh * gw * feature];
         // Source index of (t, c, bh, mh, py, bw, mw, px); destination by the transposed order.
-        for t in 0..tp {
+        for (t, frame) in frames.iter().enumerate() {
             for c in 0..3 {
                 for bh in 0..gh / m {
                     for mh in 0..m {
@@ -84,7 +83,7 @@ mod tests {
                                         let x = (bw * m + mw) * p + px;
                                         let row = ((bh * (gw / m) + bw) * m + mh) * m + mw;
                                         let col = ((c * tp + t) * p + py) * p + px;
-                                        out[row * feature + col] = chw[c * h * w + y * w + x];
+                                        out[row * feature + col] = frame[c * h * w + y * w + x];
                                     }
                                 }
                             }
@@ -112,6 +111,23 @@ mod tests {
         let chw: Vec<f32> = (0..3 * 8 * 12).map(|i| i as f32).collect();
         let mut got = Vec::new();
         geo.patchify(&chw, &mut got);
-        assert_eq!(got, patchify_reference(&chw, 8, 12, 2, 2, 2));
+        assert_eq!(got, patchify_reference(&[&chw, &chw], 8, 12, 2, 2));
+    }
+
+    #[test]
+    fn two_frames_fill_one_temporal_patch_in_order() {
+        let geo = PatchGeometry {
+            hw: [8, 12],
+            patch: 2,
+            merge: 2,
+            temporal: 2,
+        };
+        let a: Vec<f32> = (0..3 * 8 * 12).map(|i| i as f32).collect();
+        let b: Vec<f32> = a.iter().map(|x| -x - 1.0).collect();
+        let mut got = Vec::new();
+        geo.patchify_frames(&[&a, &b], &mut got);
+        assert_eq!(got, patchify_reference(&[&a, &b], 8, 12, 2, 2));
+        // Row 0: channel 0 of frame a's first patch, then frame b's.
+        assert_eq!(got[..8], [0.0, 1.0, 12.0, 13.0, -1.0, -2.0, -13.0, -14.0]);
     }
 }
