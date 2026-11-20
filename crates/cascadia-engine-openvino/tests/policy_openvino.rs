@@ -2897,6 +2897,13 @@ fn pi05_droid_cpu_infer_matches_lerobot() {
     );
     let (base, wrist) = (npz(&z, "base"), npz(&z, "wrist"));
     let frames = base.shape[0];
+    for (key, a) in [("base", &base), ("wrist", &wrist)] {
+        assert_eq!(
+            (a.descr.as_str(), a.shape.as_slice()),
+            ("|u1", &[frames, 224, 224, 3][..]),
+            "reference {key}: expected uint8 frames of 224x224x3"
+        );
+    }
     let (states, noise, want) = (
         npz(&z, "state").f32s(),
         npz(&z, "noise").f32s(),
