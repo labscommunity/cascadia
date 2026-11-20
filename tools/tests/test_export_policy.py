@@ -8,6 +8,7 @@ import sys
 import tempfile
 import unittest
 from pathlib import Path
+from unittest import mock
 
 _DIR = os.path.abspath(os.path.join(os.path.dirname(__file__), os.pardir, "export_policy"))
 if _DIR not in sys.path:
@@ -331,6 +332,43 @@ class EmptyCameras(unittest.TestCase):
         self.assertEqual(out["cameras"], DROID_CAMERAS)
 
 
+FIXTURE = Path(__file__).parent / "fixtures" / "openpi-norm-stats.json"
+PI05_MANIFEST = (
+    Path(__file__).parents[2] / "crates/cascadia-engine-openvino/tests/fixtures/policy/pi05-droid-placeholder-manifest.json"
+)
+
+
+class RewritePackage(unittest.TestCase):
+    def test_export_argv_rewrites_manifest_and_config(self):
+        # The export's last step on a pi0.5 DROID package, from the driver's own argv.
+        seen = []
+        with mock.patch.object(ep, "export", lambda a: seen.append(a) or 0):
+            argv = ["export", "--model", "m", "--preflight", "p", "--out", "o", "--stats", str(FIXTURE)]
+            ep.main(argv + ["--empty-camera", "right_wrist_0_rgb"])
+        args = seen[0]
+        self.assertEqual(args.empty_camera, ["right_wrist_0_rgb"])
+        with tempfile.TemporaryDirectory() as d:
+            for name in ("manifest.json", "config.json"):
+                Path(d, name).write_text(PI05_MANIFEST.read_text())
+            ep.rewrite_package(Path(d), ep.load_stats(Path(args.stats)), args.empty_camera)
+            for name in ("manifest.json", "config.json"):
+                model = json.loads(Path(d, name).read_text())["model"]
+                normalize, pi05 = model["preprocessors"][:2]
+                self.assertEqual(normalize["pad_to"], 32, name)
+                self.assertEqual(normalize["stats"]["state"]["shape"], [3], name)
+                self.assertEqual(normalize["stats"]["state"]["q01"], [-0.5, -1.0, -3.0], name)
+                action = model["postprocessors"][0]["stats"]["action"]
+                self.assertEqual(action["q99"], [1.0, 1.0, 0.5] + [1.0] * 29, name)
+                self.assertEqual(pi05["empty_cameras"], 1, name)
+                features = [f["init_args"] for f in model["input_features"]]
+                self.assertEqual(
+                    [f["name"] for f in features if f["ftype"] == "VISUAL"],
+                    ["images.base_0_rgb", "images.left_wrist_0_rgb"],
+                    name,
+                )
+                self.assertEqual([f["shape"] for f in features if f["ftype"] == "STATE"], [[3]], name)
+
+
 class LoadStats(unittest.TestCase):
     def _write(self, doc):
         f = tempfile.NamedTemporaryFile("w", suffix=".json", delete=False)
@@ -345,12 +383,12 @@ class LoadStats(unittest.TestCase):
 
     def test_openpi_norm_stats(self):
         # The fixture the CLI's tests read too: openpi's layout, zero-padded to the model width.
-        doc = ep.load_stats(Path(__file__).parent / "fixtures" / "openpi-norm-stats.json")
+        doc = ep.load_stats(FIXTURE)
         self.assertEqual(sorted(doc), ["action", "state"])
         self.assertEqual(doc["state"]["mean"], [0.25, 0.0, -2.0])
         self.assertEqual(doc["state"]["q99"], [1.0, 1.0, -1.0])
-        self.assertEqual(doc["action"]["q01"], [-1.0, 0.0])
-        self.assertEqual(doc["action"]["std"], [0.3, 0.4])
+        self.assertEqual(doc["action"]["q01"], [-1.0, 0.0, -0.5])
+        self.assertEqual(doc["action"]["std"], [0.3, 0.4, 0.2])
 
     def test_trim_logs_and_keeps_real_zeros(self):
         doc, notes = ep.openpi_stats(
@@ -367,11 +405,19 @@ class LoadStats(unittest.TestCase):
 
     def test_all_zero_block_is_refused_later(self):
         doc, _ = ep.openpi_stats(
-            {"norm_stats": {"state": {"mean": [0, 0], "std": [0, 0]}, "actions": {"mean": [1], "std": [1]}}}
+            {"norm_stats": {"state": {"mean": [0, 0], "std": [0, 0]}, "actions": {"mean": [0], "std": [0]}}}
         )
         self.assertEqual(doc["state"]["mean"], [])
         with self.assertRaisesRegex(ValueError, "0 values"):
             ep.apply_stats(_manifest(), doc)
+
+    def test_unequal_trim_is_refused(self):
+        # A real action dimension whose stats are all 0 trims like padding; serving it would be wrong.
+        doc = json.loads(FIXTURE.read_text())
+        for v in doc["norm_stats"]["actions"].values():
+            v[2] = 0.0
+        with self.assertRaisesRegex(ValueError, "state to 3 and action to 2 dims.*real widths"):
+            ep.load_stats(self._write(doc))
 
     def test_rejects_bad_files(self):
         for bad, msg in (
@@ -379,6 +425,10 @@ class LoadStats(unittest.TestCase):
             ({"state": {"mean": [0]}}, "\"action\""),
             ({"state": {"mean": [float("nan")]}, "action": {"mean": [0]}}, "finite"),
             ({"state": {"mean": "x"}, "action": {"mean": [0]}}, "list of finite"),
+            ({"state": {"mean": [True]}, "action": {"mean": [0]}}, "list of finite"),
+            ({"norm_stats": {"state": {"mean": [1, False]}, "actions": {"mean": [0]}}}, "list of finite"),
+            ({"norm_stats": {"state": {"mean": [float("inf")]}, "actions": {"mean": [0]}}}, "list of finite"),
+            ({"state": {"q01": [0] * 8, "q99": [1] * 7}, "action": {"mean": [0]}}, "q99 has 7 values but state.q01 has 8"),
         ):
             with self.assertRaisesRegex(ValueError, msg):
                 ep.load_stats(self._write(bad))

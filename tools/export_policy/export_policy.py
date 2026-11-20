@@ -105,8 +105,10 @@ def openpi_stats(doc: dict) -> tuple[dict, list[str]]:
     openpi stores its stats zero-padded to the model width. It normalizes at the robot's width and
     pads afterwards, so trailing dimensions where every stat is exactly 0 are padding: they are
     dropped here and padded with the identity later (IDENTITY_PAD). Kept as they are, quantiles
-    would map a zero pad to -1 (q99 - q01 = 0). Returns the doc and a line per trimmed block.
-    The CLI applies the same rule (crates/cascadia-cli/src/export_policy.rs `openpi_stats`).
+    would map a zero pad to -1 (q99 - q01 = 0). Returns the doc and a line per trimmed block (the
+    CLI prints them). A real dimension whose every stat is 0 looks the same as padding, so state
+    and action must trim to the same width, or the file is refused. The CLI applies the same rule
+    (crates/cascadia-cli/src/export_policy.rs `openpi_stats`).
     """
     if not isinstance(doc.get("norm_stats"), dict):
         return doc, []
@@ -114,24 +116,34 @@ def openpi_stats(doc: dict) -> tuple[dict, list[str]]:
     if "action" not in doc and "actions" in doc:
         doc = {**doc, "action": doc["actions"]}
         del doc["actions"]
-    notes = []
+    notes, widths = [], []
     for block in ("state", "observation.state", "action"):
         entry = doc.get(block)
         if not isinstance(entry, dict):
             continue
         lists = [v for k, v in entry.items() if k in STAT_KEYS]
-        if not lists or not all(
-            isinstance(v, list) and all(isinstance(x, (int, float)) for x in v) for v in lists
-        ):
+        if not lists or not all(isinstance(v, list) and all(map(_finite, v)) for v in lists):
             continue
         width = max(len(v) for v in lists)
         keep = max((i + 1 for v in lists for i, x in enumerate(v) if x != 0), default=0)
+        widths.append((block, min(keep, width)))
         if keep < width:
             for k in STAT_KEYS:
                 if k in entry:
                     entry[k] = entry[k][:keep]
             notes.append(f"{block}: {width} -> {keep} ({width - keep} all-zero padding dims dropped)")
+    if notes and len(widths) == 2 and widths[0][1] != widths[1][1]:
+        (state, s), (_, a) = widths
+        raise ValueError(
+            f"openpi's zero padding trims {state} to {s} and action to {a} dims; a robot dimension "
+            "whose every statistic is 0 cannot be told apart from padding, so give the stats as "
+            '{"state": {...}, "action": {...}} at the robot\'s real widths instead'
+        )
     return doc, notes
+
+
+def _finite(x) -> bool:
+    return isinstance(x, (int, float)) and not isinstance(x, bool) and math.isfinite(x)
 
 
 def load_stats(path: Path) -> dict:
@@ -140,23 +152,27 @@ def load_stats(path: Path) -> dict:
     doc = json.loads(path.read_text(encoding="utf-8"))
     if not isinstance(doc, dict):
         raise ValueError(f"{path}: expected a JSON object with \"state\" and \"action\"")
-    doc, notes = openpi_stats(doc)
-    for note in notes:
-        log(f"STATS TRIM {note}")
+    doc, _ = openpi_stats(doc)
     if "observation.state" in doc and "state" not in doc:
         doc["state"] = doc.pop("observation.state")
     for block in ("state", "action"):
         entry = doc.get(block)
         if not isinstance(entry, dict) or not any(k in entry for k in STAT_KEYS):
             raise ValueError(f"{path}: \"{block}\" needs one of {', '.join(STAT_KEYS)}")
+        first = None
         for key in STAT_KEYS:
             values = entry.get(key)
             if values is None:
                 continue
-            if not isinstance(values, list) or not all(
-                isinstance(v, (int, float)) and math.isfinite(v) for v in values
-            ):
+            if not isinstance(values, list) or not all(map(_finite, values)):
                 raise ValueError(f"{path}: {block}.{key} must be a list of finite numbers")
+            if first is None:
+                first = (key, len(values))
+            elif len(values) != first[1]:
+                raise ValueError(
+                    f"{path}: {block}.{key} has {len(values)} values but {block}.{first[0]} has "
+                    f"{first[1]}; every statistic in a block must be equally wide"
+                )
     return doc
 
 
@@ -258,6 +274,23 @@ def apply_empty_cameras(manifest: dict, names: list[str]) -> None:
     params = steps[0].get("init_args", steps[0]) if "class_path" in steps[0] else steps[0]
     params["empty_cameras"] = int(params.get("empty_cameras", 0)) + len(names)
     model["input_features"] = [f for i, f in enumerate(features) if i not in tail]
+
+
+def rewrite_package(out: Path, stats: dict | None, empty_cameras: list[str]) -> None:
+    """Apply --stats and --empty-camera to the exported package's manifest.json and config.json."""
+    for name in ("manifest.json", "config.json"):
+        path = out / name
+        if (stats is None and not empty_cameras) or not path.is_file():
+            continue
+        doc = json.loads(path.read_text(encoding="utf-8"))
+        if "model" not in doc:
+            continue
+        if stats is not None:
+            log(f"STATS OK {name}: {', '.join(apply_stats(doc, stats))}")
+        if empty_cameras:
+            apply_empty_cameras(doc, empty_cameras)
+            log(f"CAMERAS OK {name}: empty {', '.join(empty_cameras)}")
+        path.write_text(json.dumps(doc, indent=2), encoding="utf-8")
 
 
 def package_mode(kind: str, pre: dict | None, config: dict) -> str:
@@ -613,19 +646,7 @@ def export(args: argparse.Namespace) -> int:
     finally:
         shutil.rmtree(tmp, ignore_errors=True)
 
-    for name in ("manifest.json", "config.json"):
-        path = out / name
-        if (stats is None and not args.empty_camera) or not path.is_file():
-            continue
-        doc = json.loads(path.read_text(encoding="utf-8"))
-        if "model" not in doc:
-            continue
-        if stats is not None:
-            log(f"STATS OK {name}: {', '.join(apply_stats(doc, stats))}")
-        if args.empty_camera:
-            apply_empty_cameras(doc, args.empty_camera)
-            log(f"CAMERAS OK {name}: empty {', '.join(args.empty_camera)}")
-        path.write_text(json.dumps(doc, indent=2), encoding="utf-8")
+    rewrite_package(out, stats, args.empty_camera)
 
     if pre.get("license_files"):
         for name in pre["license_files"]:

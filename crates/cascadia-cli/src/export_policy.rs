@@ -224,10 +224,14 @@ fn mode_keys(mode: &str) -> &'static [&'static str] {
 /// openpi stores its stats zero-padded to the model width but normalizes at the robot's width, so
 /// trailing dimensions where every stat is exactly 0 are padding. They are dropped and the driver
 /// pads them with the identity; kept, quantiles would map a zero pad to −1 (q99 − q01 = 0). Returns
-/// a line per trimmed block. The driver applies the same rule (`export_policy.py` `openpi_stats`).
-pub(crate) fn openpi_stats(mut doc: serde_json::Value) -> (serde_json::Value, Vec<String>) {
+/// a line per trimmed block. A real dimension whose every stat is 0 looks the same as padding, so
+/// state and action must trim to the same width, or the file is refused. The driver applies the
+/// same rule (`export_policy.py` `openpi_stats`).
+pub(crate) fn openpi_stats(
+    mut doc: serde_json::Value,
+) -> std::result::Result<(serde_json::Value, Vec<String>), String> {
     let Some(inner) = doc.get_mut("norm_stats").filter(|v| v.is_object()) else {
-        return (doc, vec![]);
+        return Ok((doc, vec![]));
     };
     doc = inner.take();
     if let Some(obj) = doc.as_object_mut() {
@@ -238,6 +242,7 @@ pub(crate) fn openpi_stats(mut doc: serde_json::Value) -> (serde_json::Value, Ve
         }
     }
     let mut notes = Vec::new();
+    let mut widths = Vec::new();
     for block in ["state", "observation.state", "action"] {
         let Some(entry) = doc
             .get_mut(block)
@@ -264,6 +269,7 @@ pub(crate) fn openpi_stats(mut doc: serde_json::Value) -> (serde_json::Value, Ve
             .filter_map(|l| l.iter().rposition(|x| *x != 0.0).map(|i| i + 1))
             .max()
             .unwrap_or(0);
+        widths.push((block, keep.min(width)));
         if keep < width {
             for key in STAT_KEYS {
                 if let Some(values) = entry.get_mut(key).and_then(serde_json::Value::as_array_mut) {
@@ -276,7 +282,17 @@ pub(crate) fn openpi_stats(mut doc: serde_json::Value) -> (serde_json::Value, Ve
             ));
         }
     }
-    (doc, notes)
+    if let [(state, s), (_, a)] = widths[..] {
+        if !notes.is_empty() && s != a {
+            return Err(format!(
+                "--stats: openpi's zero padding trims {state} to {s} and action to {a} dims; a \
+                 robot dimension whose every statistic is 0 cannot be told apart from padding, so \
+                 give the stats as {{\"state\": {{...}}, \"action\": {{...}}}} at the robot's \
+                 real widths instead"
+            ));
+        }
+    }
+    Ok((doc, notes))
 }
 
 /// Why `--empty-camera` cannot drop `names` from the checkpoint's cameras, or None.
@@ -320,6 +336,7 @@ pub(crate) fn stats_refusal(stats: &serde_json::Value, p: &Preflight) -> Option<
         let Some(entry) = entry.and_then(serde_json::Value::as_object) else {
             return Some(format!("--stats: no \"{block}\" block"));
         };
+        let mut first: Option<(&str, usize)> = None;
         for key in STAT_KEYS {
             let Some(values) = entry.get(key) else {
                 continue;
@@ -339,6 +356,17 @@ pub(crate) fn stats_refusal(stats: &serde_json::Value, p: &Preflight) -> Option<
                     values.len(),
                     dim.map_or("?".into(), |d| d.to_string()),
                 ));
+            }
+            match first {
+                Some((k, n)) if n != values.len() => {
+                    return Some(format!(
+                        "--stats: {block}.{key} has {} values but {block}.{k} has {n}; every \
+                         statistic in a block must be equally wide",
+                        values.len()
+                    ));
+                }
+                None => first = Some((key, values.len())),
+                _ => {}
             }
         }
         if let Some(mode) = p.stats_mode.as_deref() {
@@ -625,7 +653,7 @@ pub(crate) fn check_inputs(args: &ExportPolicyArgs) -> Result<()> {
             std::fs::read_to_string(path).with_context(|| format!("--stats {}", path.display()))?;
         let doc: serde_json::Value = serde_json::from_str(&text)
             .with_context(|| format!("--stats {}: not JSON", path.display()))?;
-        let (doc, _) = openpi_stats(doc);
+        let (doc, _) = openpi_stats(doc).map_err(|e| anyhow!(e))?;
         let has = |k: &str| doc.get(k).is_some_and(serde_json::Value::is_object);
         if !((has("state") || has("observation.state")) && has("action")) {
             return Err(anyhow!(
@@ -802,7 +830,7 @@ pub(crate) fn run_export(args: &ExportPolicyArgs, host: &mut dyn ExportHost) -> 
     }
     if let Some(path) = &args.stats {
         let doc: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(path)?)?;
-        let (doc, notes) = openpi_stats(doc);
+        let (doc, notes) = openpi_stats(doc).map_err(|e| anyhow!(e))?;
         for note in notes {
             eprintln!("--stats: {note}");
         }
@@ -1114,22 +1142,7 @@ impl ExportHost for UvHost {
             .clone()
             .ok_or_else(|| anyhow!("export environment not prepared"))?;
         let mut cmd = self.driver(&python);
-        cmd.args(["export", "--model", &args.model, "--preflight"])
-            .arg(self.preflight_file())
-            .arg("--out")
-            .arg(dir);
-        if args.rtc {
-            cmd.arg("--rtc");
-        }
-        if let Some(stats) = &args.stats {
-            cmd.arg("--stats").arg(stats);
-        }
-        for camera in &args.empty_camera {
-            cmd.arg("--empty-camera").arg(camera);
-        }
-        if args.verify {
-            cmd.arg("--verify");
-        }
+        cmd.args(export_argv(args, &self.preflight_file(), dir));
         let status = cmd.status().context("running the export driver")?;
         if !status.success() {
             return Err(anyhow!(
@@ -1138,6 +1151,27 @@ impl ExportHost for UvHost {
         }
         Ok(())
     }
+}
+
+/// The driver's `export` arguments.
+fn export_argv(args: &ExportPolicyArgs, preflight: &Path, dir: &Path) -> Vec<std::ffi::OsString> {
+    let mut argv: Vec<std::ffi::OsString> = ["export", "--model", &args.model, "--preflight"]
+        .map(Into::into)
+        .to_vec();
+    argv.extend([preflight.into(), "--out".into(), dir.into()]);
+    if args.rtc {
+        argv.push("--rtc".into());
+    }
+    if let Some(stats) = &args.stats {
+        argv.extend(["--stats".into(), stats.into()]);
+    }
+    for camera in &args.empty_camera {
+        argv.extend(["--empty-camera".into(), camera.into()]);
+    }
+    if args.verify {
+        argv.push("--verify".into());
+    }
+    argv
 }
 
 pub fn cmd_export_policy(args: ExportPolicyArgs) -> Result<()> {
@@ -2066,6 +2100,17 @@ mod tests {
             msg.contains("quantiles") && msg.contains("q01") && msg.contains("q99"),
             "{msg}"
         );
+        let uneven = stats_json(
+            r#"{"q01": [0,0,0,0,0,0,0,0], "q99": [1,1,1,1,1,1,1]}"#,
+            r#"{"mean": [0], "std": [1]}"#,
+        );
+        assert_eq!(
+            stats_refusal(&uneven, &p).as_deref(),
+            Some(
+                "--stats: state.q99 has 7 values but state.q01 has 8; every statistic in a \
+                 block must be equally wide"
+            )
+        );
         // DROID: 8-wide stats for a 32-wide package are padded later
         let mut droid = passing("pi05");
         droid.state_dim = Some(32);
@@ -2092,18 +2137,18 @@ mod tests {
 
     #[test]
     fn openpi_norm_stats_are_unwrapped_and_trimmed() {
-        let (doc, notes) = openpi_stats(serde_json::from_str(OPENPI_STATS).unwrap());
+        let (doc, notes) = openpi_stats(serde_json::from_str(OPENPI_STATS).unwrap()).unwrap();
         assert_eq!(
             notes,
             [
                 "state: 6 -> 3 (3 all-zero padding dims dropped)",
-                "action: 5 -> 2 (3 all-zero padding dims dropped)"
+                "action: 6 -> 3 (3 all-zero padding dims dropped)"
             ]
         );
         assert_eq!(doc["state"]["mean"], serde_json::json!([0.25, 0.0, -2.0]));
         assert_eq!(doc["state"]["q99"], serde_json::json!([1.0, 1.0, -1.0]));
-        assert_eq!(doc["action"]["q01"], serde_json::json!([-1.0, 0.0]));
-        assert_eq!(doc["action"]["std"], serde_json::json!([0.3, 0.4]));
+        assert_eq!(doc["action"]["q01"], serde_json::json!([-1.0, 0.0, -0.5]));
+        assert_eq!(doc["action"]["std"], serde_json::json!([0.3, 0.4, 0.2]));
         assert!(doc.get("actions").is_none() && doc.get("norm_stats").is_none());
 
         // Our own format is left as it is, trailing zeros included.
@@ -2111,7 +2156,20 @@ mod tests {
             r#"{"mean": [1, 0], "std": [0, 0]}"#,
             r#"{"mean": [0, 0], "std": [1, 1]}"#,
         );
-        assert_eq!(openpi_stats(ours.clone()), (ours, vec![]));
+        assert_eq!(openpi_stats(ours.clone()), Ok((ours, vec![])));
+
+        // A real action dimension whose stats are all 0 trims like padding: refused, not served.
+        let mut lost = serde_json::from_str::<serde_json::Value>(OPENPI_STATS).unwrap();
+        for key in STAT_KEYS {
+            if let Some(v) = lost["norm_stats"]["actions"].get_mut(key) {
+                v[2] = 0.0.into();
+            }
+        }
+        let msg = openpi_stats(lost.clone()).unwrap_err();
+        assert!(
+            msg.contains("state to 3 and action to 2") && msg.contains("real widths"),
+            "{msg}"
+        );
 
         // DROID: 32-wide quantiles with 8 real dims pass the 32-wide package's check.
         let mut q = passing("pi05");
@@ -2129,7 +2187,7 @@ mod tests {
             stats_refusal(&droid, &q).as_deref(),
             Some("--stats: no \"state\" block")
         );
-        let (trimmed, notes) = openpi_stats(droid);
+        let (trimmed, notes) = openpi_stats(droid).unwrap();
         assert_eq!(
             notes[0],
             "state: 32 -> 2 (30 all-zero padding dims dropped)"
@@ -2141,8 +2199,43 @@ mod tests {
         let file = dir.path().join("norm_stats.json");
         std::fs::write(&file, OPENPI_STATS).unwrap();
         let mut a = args("lerobot/pi05_droid", &dir.path().join("pkg"));
-        a.stats = Some(file);
+        a.stats = Some(file.clone());
         check_inputs(&a).unwrap();
+        std::fs::write(&file, lost.to_string()).unwrap();
+        assert!(check_inputs(&a)
+            .unwrap_err()
+            .to_string()
+            .contains("cannot be told apart from padding"));
+    }
+
+    #[test]
+    fn driver_argv_carries_every_flag() {
+        let mut a = args("lerobot/pi05_droid", Path::new("pkg"));
+        a.rtc = true;
+        a.verify = true;
+        a.stats = Some("s.json".into());
+        a.empty_camera = vec!["right_wrist_0_rgb".into(), "left_wrist_0_rgb".into()];
+        let argv = export_argv(&a, Path::new("pre.json"), Path::new("stage"));
+        assert_eq!(
+            argv,
+            [
+                "export",
+                "--model",
+                "lerobot/pi05_droid",
+                "--preflight",
+                "pre.json",
+                "--out",
+                "stage",
+                "--rtc",
+                "--stats",
+                "s.json",
+                "--empty-camera",
+                "right_wrist_0_rgb",
+                "--empty-camera",
+                "left_wrist_0_rgb",
+                "--verify",
+            ]
+        );
     }
 
     #[test]
