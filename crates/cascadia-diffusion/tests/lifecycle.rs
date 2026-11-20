@@ -151,3 +151,22 @@ fn call_sequence_is_capped() {
         Err(Error::Replay)
     ));
 }
+#[test]
+fn lease_ownership_is_visible_before_buffering() {
+    let gate = Gate::new();
+    let now = Instant::now();
+    assert!(!gate.leased_to("peer-a", now));
+    let id = reserve(&gate, now);
+    assert!(gate.leased_to("peer-a", now));
+    assert!(!gate.leased_to("peer-b", now));
+    assert!(!gate.leased_to("peer-a", now + Duration::from_secs(10)));
+    gate.release("peer-a", id).unwrap();
+    assert!(!gate.leased_to("peer-a", now));
+    let id = reserve(&gate, now);
+    let execution = gate
+        .begin("peer-a", id, &"a".repeat(64), "unet_first", 1, now)
+        .unwrap();
+    gate.release("peer-a", id).unwrap();
+    assert!(!gate.leased_to("peer-a", now));
+    execution.complete(now);
+}

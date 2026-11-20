@@ -72,6 +72,13 @@ impl Gate {
     pub fn quarantined(&self) -> bool {
         self.0.lock().unwrap().quarantined
     }
+    /// True when `owner` holds a live, unexpired, uncancelled lease. Lets an
+    /// integration refuse a caller before buffering its tensor frame.
+    pub fn leased_to(&self, owner: &str, now: Instant) -> bool {
+        self.0.lock().unwrap().lease.as_ref().is_some_and(|l| {
+            l.owner == owner && !l.cancelled && now < l.expires && now < l.deadline
+        })
+    }
     pub fn occupied(&self, now: Instant) -> bool {
         let mut state = self.0.lock().unwrap();
         reap(&mut state, now);
