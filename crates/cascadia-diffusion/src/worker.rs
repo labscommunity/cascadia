@@ -21,8 +21,9 @@ use uuid::Uuid;
 
 pub type ExecuteFuture = Pin<Box<dyn Future<Output = Result<Vec<u8>>> + Send>>;
 pub trait Executor: Send + Sync + 'static {
-    /// Return only after the engine has finished. Any error is treated as
-    /// uncertain completion and permanently quarantines this worker instance.
+    /// Return only after the engine has finished. `Err(Error::Rejected)` means
+    /// this call did not run, or ran to completion and was rejected. Any other
+    /// error is uncertain and permanently quarantines this worker instance.
     fn execute(&self, frame: Vec<u8>) -> ExecuteFuture;
 }
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -91,6 +92,8 @@ impl Worker {
                 && !self.gate.draining(),
         }
     }
+    /// Registers a callback run once each execution ends, from a guard's `Drop`
+    /// that may run during a panic unwind, so it must not panic or the process aborts.
     pub fn observe_state(&self, observer: Arc<dyn Fn() + Send + Sync>) {
         let _ = self.observer.set(observer);
     }
@@ -162,22 +165,56 @@ impl Worker {
         let worker = self.clone();
         // This task and guard own the inference. Dropping the caller's future
         // merely detaches the join handle; it cannot make the engine reusable.
-        tokio::spawn(async move {
-            let response = worker.executor.execute(frame).await?;
-            let (reply, _) = wire::decode(&response)?;
-            if reply.manifest != header.manifest
-                || reply.component != header.component
-                || reply.lease != header.lease
-                || reply.sequence != header.sequence
-            {
-                return invalid("stage response belongs to another execution");
+        let result = tokio::spawn(async move {
+            // Outlives the block below that owns `execution`, so the observer
+            // sees a quarantine even when the executor panics.
+            let _changed = Changed(worker.clone());
+            let executor = worker.executor.clone();
+            let result = async move {
+                let response = match executor.execute(frame).await {
+                    Err(Error::Rejected) => {
+                        execution.complete(Instant::now());
+                        return Err(Error::Rejected);
+                    }
+                    other => other?,
+                };
+                // A malformed reply means the engine is broken; quarantine it.
+                let (reply, _) = wire::decode(&response)?;
+                if reply.manifest != header.manifest
+                    || reply.component != header.component
+                    || reply.lease != header.lease
+                    || reply.sequence != header.sequence
+                {
+                    return invalid("stage response belongs to another execution");
+                }
+                wire::expect(&reply, &expected)?;
+                execution.complete(Instant::now());
+                Ok(response)
             }
-            wire::expect(&reply, &expected)?;
-            execution.complete(Instant::now());
-            worker.changed();
-            Ok(response)
+            .await;
+            result
         })
-        .await
-        .map_err(|_| Error::Quarantined)?
+        .await;
+        // Every failure after `begin` except a rejection left the worker
+        // quarantined; report that, not the cause, so callers cannot retry it.
+        match result {
+            Ok(Err(Error::Rejected)) => Err(Error::Rejected),
+            Ok(Ok(response)) => Ok(response),
+            Ok(Err(error)) => {
+                tracing::warn!(%error, "diffusion worker quarantined");
+                Err(Error::Quarantined)
+            }
+            Err(error) => {
+                tracing::warn!(%error, "diffusion worker quarantined");
+                Err(Error::Quarantined)
+            }
+        }
+    }
+}
+/// Notifies the state observer once per execution when the task ends.
+struct Changed(Arc<Worker>);
+impl Drop for Changed {
+    fn drop(&mut self) {
+        self.0.changed();
     }
 }

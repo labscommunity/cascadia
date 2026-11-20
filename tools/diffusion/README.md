@@ -111,6 +111,16 @@ executor. The sidecar is not an unauthenticated network service: enterprise
 wraps it in admitted QUIC, reserves all stages before dispatch, and binds every
 execution to the caller, manifest, worker boot, lease, and sequence.
 
+Status codes tell the supervisor whether a call finished. On `/execute`,
+503 `busy` means this call did not run (another call holds the engine). 4xx
+(401, 404, 413, 400 for invalid framing or a rejected input or output) means
+it did not run, or ran to completion and was rejected. 500 means the outcome
+is uncertain. On `/generate`, 400
+is used only for a request rejected before any stage callback; any failure
+during or after a callback returns 502 `stage exchange failed`, and any other
+failure 500. Both 500 and 502 are uncertain. Locks are
+released before the reply is written, so an immediate next call is not busy.
+
 The internal `/generate` JSON envelope has a 256 KiB limit. This includes the
 normalized request and coordinator metadata; the enterprise public image API
 keeps its separate 64 KiB limit. The larger internal bound accommodates JSON
