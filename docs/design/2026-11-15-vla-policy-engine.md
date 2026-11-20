@@ -741,14 +741,24 @@ machine.
   failure.
 - **`--rtc`** exports the RTC port group (SmolVLA and π0.5): the policy's `rtc_enabled` is set and
   `n_action_steps` is the full chunk, so the package has no trimmer.
-- **Refusals before the checkpoint is downloaded.** Memory is checked before any environment
-  exists; the gated files and statistics are read from Hugging Face metadata only,
+- **Refusals before the checkpoint is downloaded.** Memory is checked twice: the smallest need
+  before any environment exists, and the policy kind's need once the preflight names the kind,
+  before the export environment is installed. The gated files and statistics are read from
+  Hugging Face metadata only,
   in a small environment holding `huggingface_hub` at the export environment's versions (a few MB),
   before the export environment is installed:
-  - **Memory.** Less than 32 GiB of available RAM plus free swap (the main gate), or less than
-    15 GiB of physical RAM as the OS reports it (a 16 GiB VM reports about 15.6). Measured: 14.3 GB
-    RSS plus up to 10 GB swap for π0.5, completed on a 16 GiB box with 48 GiB swap. A 38.6 GB Mac
-    with other work running froze and needed a forced restart.
+  - **Memory, per policy kind.** Available RAM plus free swap is the main gate, physical RAM as
+    the OS reports it the second (a 16 GiB VM reports about 15.6):
+    - SmolVLA: less than 10 GiB available plus swap, or less than 8 GiB physical, is refused.
+      Measured with `--verify` on a 16 GiB Linux x86-64 box: 5.85 GB of RAM plus swap above idle
+      at the peak, 6.8 GB for the largest process, 82 s.
+    - π0.5, and any kind the preflight cannot name: less than 32 GiB available plus swap, or less
+      than 15 GiB physical. Measured: 14.3 GB RSS plus up to 10 GB swap, completed on a 16 GiB box
+      with 48 GiB swap. A 38.6 GB Mac with other work running froze and needed a forced restart.
+
+    Before the preflight the kind is unknown, so only the SmolVLA need is checked there: a host
+    below it can export nothing. A π0.5 memory refusal therefore comes after the preflight's
+    environment (a few MB) is built, still before the export environment or any weights.
   - **A serving box is a warning, not a refusal**, as for `cascadia shard`: a cascadia node or
     OVMS process, or `cascadia run`, `worker` or `run-placement` (found after any global flags),
     on this host.

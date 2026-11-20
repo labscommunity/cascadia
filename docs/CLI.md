@@ -421,9 +421,12 @@ cascadia export-policy --model <MODEL> -o <DIR> [--rtc] [--stats <FILE>] [--veri
 | `--stats <FILE>` | none | Normalization statistics for a checkpoint that ships none: `{"state": {...}, "action": {...}}`. |
 | `--verify` | off | Run the traced input through PyTorch and the package's IR and print the differences. |
 
-Every refusal comes before the checkpoint is downloaded. It refuses a host
-with under 32 GiB of available RAM plus free swap or under 15 GiB of physical
-RAM (a π0.5 export peaked at 14.3 GB resident plus 10 GB of swap). Like
+Every refusal comes before the checkpoint is downloaded. The memory it needs
+depends on the policy kind, read from the checkpoint's metadata: a SmolVLA
+export is refused under 10 GiB of available RAM plus free swap or under 8 GiB
+of physical RAM (it peaked at 5.85 GB of RAM plus swap), a π0.5 export under
+32 GiB or under 15 GiB of physical RAM (it peaked at 14.3 GB resident plus
+10 GB of swap). Like
 `shard`, it warns, and exports anyway, when another process (OVMS, a cascadia
 node, `cascadia run`/`worker`) is serving on the host.
 

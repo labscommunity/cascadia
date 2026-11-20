@@ -42,10 +42,27 @@ const STAT_KEYS: [&str; 6] = ["mean", "std", "q01", "q99", "min", "max"];
 /// torch and torchvision come from here as CPU wheels; every wheel is checked against its hash.
 const TORCH_CPU_INDEX: &str = "https://download.pytorch.org/whl/cpu";
 const SUPPORTED: [&str; 2] = ["smolvla", "pi05"];
-/// Available RAM plus free swap an export needs: π0.5 peaked at 14.3 GB RSS plus up to 10 GB swap.
-const MIN_AVAILABLE: u64 = 32 * GIB;
-/// Physical RAM floor; a 16 GiB VM reports about 15.6 GiB.
-const MIN_PHYSICAL: u64 = 15 * GIB;
+/// SmolVLA peaked at 5.85 GB of RAM plus swap above idle (largest process 6.8 GB).
+const SMOLVLA_NEED: MemoryNeed = MemoryNeed {
+    what: "a SmolVLA export",
+    available: 10 * GIB,
+    physical: 8 * GIB,
+    machine: "at least 8 GiB as the OS reports it",
+    measured: "it peaked at 5.85 GB of RAM plus swap",
+};
+/// π0.5 peaked at 14.3 GB RSS plus up to 10 GB swap; a 16 GiB VM reports about 15.6 GiB.
+const PI05_NEED: MemoryNeed = MemoryNeed {
+    what: "a π0.5 export",
+    available: 32 * GIB,
+    physical: 15 * GIB,
+    machine: "a machine with at least 16 GiB (15 GiB as the OS reports it)",
+    measured: "it peaked at 14.3 GB resident plus 10 GB of swap",
+};
+/// Checked before the kind is known: a host below the smallest need can export nothing.
+const FLOOR_NEED: MemoryNeed = MemoryNeed {
+    what: "even the smallest export (SmolVLA)",
+    ..SMOLVLA_NEED
+};
 const GEMMA_TERMS: &str = "https://ai.google.dev/gemma/terms";
 const GEMMA_PROHIBITED_USE: &str = "https://ai.google.dev/gemma/prohibited_use_policy";
 
@@ -403,23 +420,57 @@ pub(crate) fn host_refusal(f: &HostFacts) -> Option<String> {
                 .into(),
         );
     }
+    memory_refusal(f, &FLOOR_NEED)
+}
+
+/// How much memory exporting one policy kind needs.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct MemoryNeed {
+    what: &'static str,
+    /// Available RAM plus free swap.
+    available: u64,
+    /// Physical RAM as the OS reports it.
+    physical: u64,
+    machine: &'static str,
+    measured: &'static str,
+}
+
+/// The need for a policy kind; π0.5's strict rule for any kind not measured, or none.
+pub(crate) fn memory_need(kind: Option<&str>) -> MemoryNeed {
+    match kind {
+        Some("smolvla") => SMOLVLA_NEED,
+        _ => PI05_NEED,
+    }
+}
+
+/// Why this host has too little memory for `need`, or None.
+pub(crate) fn memory_refusal(f: &HostFacts, need: &MemoryNeed) -> Option<String> {
     let room = headroom(f);
-    if room < MIN_AVAILABLE {
+    if room < need.available {
         return Some(format!(
-            "not enough memory to export: {} of available RAM plus free swap, and an export needs \
-             32 GiB (a π0.5 export peaked at 14.3 GB resident plus 10 GB of swap; a busy machine \
-             can freeze). Close other work, add swap, or export on a disposable Linux machine.",
-            gib(room)
+            "not enough memory to export: {} of available RAM plus free swap, and {} needs \
+             {} ({}; a busy machine can freeze). Close other work, add swap, or export on a \
+             disposable Linux machine.",
+            gib(room),
+            need.what,
+            whole_gib(need.available),
+            need.measured,
         ));
     }
-    if f.total_ram < MIN_PHYSICAL {
+    if f.total_ram < need.physical {
         return Some(format!(
-            "not enough memory to export: this host reports {} of physical RAM, and an export \
-             needs a machine with at least 16 GiB (15 GiB as the OS reports it), swap or not.",
-            gib(f.total_ram)
+            "not enough memory to export: this host reports {} of physical RAM, and {} needs {}, \
+             swap or not.",
+            gib(f.total_ram),
+            need.what,
+            need.machine,
         ));
     }
     None
+}
+
+fn whole_gib(bytes: u64) -> String {
+    format!("{} GiB", bytes / GIB)
 }
 
 /// Whether `--model` names a local checkpoint rather than a model id (see [`crate::model_arg`]).
@@ -493,20 +544,25 @@ pub(crate) fn check_inputs(args: &ExportPolicyArgs) -> Result<()> {
     Ok(())
 }
 
-/// The reason to refuse after the metadata checks, or None to export.
-pub(crate) fn preflight_refusal(p: &Preflight, model: &str, stats_given: bool) -> Option<String> {
+/// A preflight error, or a policy kind the exporter does not take.
+pub(crate) fn kind_refusal(p: &Preflight, model: &str) -> Option<String> {
     if let Some(e) = &p.error {
         return Some(e.clone());
     }
     match p.policy_type.as_deref() {
-        Some(t) if SUPPORTED.contains(&t) => {}
-        Some(t) => {
-            return Some(format!(
-                "{model} is a `{t}` policy; export-policy exports smolvla and pi05 checkpoints \
-                 (what physical-ai-studio 8f132416 exports)"
-            ))
-        }
-        None => return Some(format!("{model}: config.json names no policy type")),
+        Some(t) if SUPPORTED.contains(&t) => None,
+        Some(t) => Some(format!(
+            "{model} is a `{t}` policy; export-policy exports smolvla and pi05 checkpoints \
+             (what physical-ai-studio 8f132416 exports)"
+        )),
+        None => Some(format!("{model}: config.json names no policy type")),
+    }
+}
+
+/// The reason to refuse after the metadata checks, or None to export.
+pub(crate) fn preflight_refusal(p: &Preflight, model: &str, stats_given: bool) -> Option<String> {
+    if let Some(why) = kind_refusal(p, model) {
+        return Some(why);
     }
     if let Some(g) = p.gated.as_ref().filter(|g| !g.ok) {
         return Some(format!(
@@ -628,9 +684,24 @@ pub(crate) fn run_export(args: &ExportPolicyArgs, host: &mut dyn ExportHost) -> 
     check_inputs(args)?;
     host.prepare_preflight()?;
     let pre = host.preflight(&args.model)?;
-    if let Some(why) = preflight_refusal(&pre, &args.model, args.stats.is_some()) {
+    // The kind's memory need is checked once the preflight names the kind, before the gated and
+    // stats checks, so a host too small for the kind hears that first.
+    let need = memory_need(pre.policy_type.as_deref());
+    let why = kind_refusal(&pre, &args.model)
+        .or_else(|| memory_refusal(&facts, &need))
+        .or_else(|| preflight_refusal(&pre, &args.model, args.stats.is_some()));
+    if let Some(why) = why {
         return Err(anyhow!(why));
     }
+    eprintln!(
+        "Memory: {} of available RAM plus free swap, {} of physical RAM; {} needs {} and {} \
+         physical.",
+        gib(headroom(&facts)),
+        gib(facts.total_ram),
+        need.what,
+        whole_gib(need.available),
+        whole_gib(need.physical),
+    );
     for note in &pre.notes {
         eprintln!("note: {note}");
     }
@@ -1122,24 +1193,32 @@ mod tests {
 
     #[test]
     fn refuses_low_available_memory_plus_swap() {
+        let pi05 = memory_need(Some("pi05"));
         let f = HostFacts {
             total_ram: 64 * GIB,
             available_ram: 20 * GIB,
             free_swap: 11 * GIB,
             ..roomy()
         };
-        let msg = host_refusal(&f).unwrap();
-        assert!(msg.contains("31.0 GiB") && msg.contains("32 GiB"), "{msg}");
+        let msg = memory_refusal(&f, &pi05).unwrap();
+        for want in [
+            "31.0 GiB",
+            "a π0.5 export needs 32 GiB",
+            "a busy machine can freeze",
+        ] {
+            assert!(msg.contains(want), "missing {want:?} in {msg}");
+        }
         // exactly 32 GiB passes
         let f = HostFacts {
             free_swap: 12 * GIB,
             ..f
         };
-        assert_eq!(host_refusal(&f), None);
+        assert_eq!(memory_refusal(&f, &pi05), None);
     }
 
     #[test]
     fn refuses_low_physical_memory_even_with_swap() {
+        let pi05 = memory_need(Some("pi05"));
         // an 8 GiB box with 64 GiB swap
         let f = HostFacts {
             total_ram: 8 * GIB,
@@ -1147,14 +1226,120 @@ mod tests {
             free_swap: 64 * GIB,
             ..roomy()
         };
-        let msg = host_refusal(&f).unwrap();
-        assert!(msg.contains("physical"), "{msg}");
+        let msg = memory_refusal(&f, &pi05).unwrap();
+        assert!(msg.contains("physical") && msg.contains("π0.5"), "{msg}");
         // a 16 GiB VM reports about 15.6 GiB and passes
         let f = HostFacts {
             total_ram: 15 * GIB + 600 * (1 << 20),
             ..roomy()
         };
+        assert_eq!(memory_refusal(&f, &pi05), None);
+    }
+
+    #[test]
+    fn smolvla_needs_10_gib_of_headroom_and_8_gib_physical() {
+        let smol = memory_need(Some("smolvla"));
+        let at = HostFacts {
+            total_ram: 8 * GIB,
+            available_ram: 10 * GIB,
+            free_swap: 0,
+            ..roomy()
+        };
+        assert_eq!(memory_refusal(&at, &smol), None);
+        let msg = memory_refusal(
+            &HostFacts {
+                available_ram: 10 * GIB - 1,
+                ..at.clone()
+            },
+            &smol,
+        )
+        .unwrap();
+        for want in [
+            "a SmolVLA export needs 10 GiB",
+            "5.85 GB",
+            "a busy machine can freeze",
+        ] {
+            assert!(msg.contains(want), "missing {want:?} in {msg}");
+        }
+        let msg = memory_refusal(
+            &HostFacts {
+                total_ram: 8 * GIB - 1,
+                free_swap: 64 * GIB,
+                ..at
+            },
+            &smol,
+        )
+        .unwrap();
+        assert!(msg.contains("physical") && msg.contains("SmolVLA"), "{msg}");
+    }
+
+    #[test]
+    fn a_14_gib_box_without_swap_fits_smolvla_but_not_pi05() {
+        let f = HostFacts {
+            total_ram: 15 * GIB + 600 * (1 << 20),
+            available_ram: 14 * GIB,
+            free_swap: 0,
+            ..roomy()
+        };
         assert_eq!(host_refusal(&f), None);
+        assert_eq!(memory_refusal(&f, &memory_need(Some("smolvla"))), None);
+        assert!(memory_refusal(&f, &memory_need(Some("pi05")))
+            .unwrap()
+            .contains("32 GiB"));
+    }
+
+    #[test]
+    fn an_unknown_or_unread_kind_gets_the_strict_rule() {
+        let pi05 = memory_need(Some("pi05"));
+        assert_eq!(memory_need(None), pi05);
+        assert_eq!(memory_need(Some("act")), pi05);
+        assert_eq!(memory_need(Some("SmolVLA")), pi05);
+        assert_eq!(pi05.available, 32 * GIB);
+        assert_eq!(pi05.physical, 15 * GIB);
+    }
+
+    #[test]
+    fn the_first_gate_refuses_a_host_too_small_for_any_export() {
+        let f = HostFacts {
+            available_ram: 9 * GIB,
+            free_swap: 0,
+            ..roomy()
+        };
+        let msg = host_refusal(&f).unwrap();
+        assert!(
+            msg.contains("even the smallest export (SmolVLA) needs 10 GiB"),
+            "{msg}"
+        );
+        let f = HostFacts {
+            total_ram: 7 * GIB,
+            ..roomy()
+        };
+        assert!(host_refusal(&f).unwrap().contains("physical"));
+    }
+
+    #[test]
+    fn the_kind_gate_runs_after_the_preflight_and_before_the_export_environment() {
+        let dir = tempfile::tempdir().unwrap();
+        let small = HostFacts {
+            total_ram: 15 * GIB + 600 * (1 << 20),
+            available_ram: 14 * GIB,
+            free_swap: 0,
+            ..roomy()
+        };
+        let a = args("lerobot/smolvla_libero", &dir.path().join("smol"));
+        let (r, calls) = run_fake(small.clone(), passing("smolvla"), &a);
+        r.unwrap();
+        assert!(calls.contains(&"export"), "{calls:?}");
+
+        let a = args("lerobot/pi05_droid", &dir.path().join("pi05"));
+        // gated too: the memory refusal comes first
+        let mut pre = passing("pi05");
+        pre.gated.as_mut().unwrap().ok = false;
+        let (r, calls) = run_fake(small, pre, &a);
+        let msg = r.unwrap_err().to_string();
+        assert!(msg.contains("a π0.5 export needs 32 GiB"), "{msg}");
+        assert_eq!(calls, ["facts", "prepare_preflight", "preflight"]);
+        assert!(!a.output_dir.exists());
     }
 
     /// A local checkpoint directory is taken like `shard` takes one: it needs a config.json,
