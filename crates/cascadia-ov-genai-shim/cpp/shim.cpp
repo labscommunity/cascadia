@@ -10,6 +10,7 @@
 #include <algorithm>
 #include <cstdint>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <fstream>
 #include <memory>
@@ -1225,8 +1226,17 @@ int32_t cascadia_runtime_get_state_blob(cascadia_runtime_t* handle, uint8_t* buf
     catch (...) { set_last_error("unknown C++ exception in get_state_blob"); return 1; }
 }
 
+// Test-only: true when the environment variable `name` is "1". The prime tests use these
+// to run the prime on CPU (CASCADIA_SHIM_FORCE_PRIME) and to make it fail
+// (CASCADIA_SHIM_FAIL_PRIME). Do not set them in production.
+static bool test_env_set(const char* name) {
+    const char* v = std::getenv(name);
+    return v && std::strcmp(v, "1") == 0;
+}
+
 // True when the compiled model executes on a GPU (`GPU`, `GPU.0`, or under AUTO/HETERO).
 static bool runs_on_gpu(const ov::CompiledModel& compiled) {
+    if (test_env_set("CASCADIA_SHIM_FORCE_PRIME")) return true;
     try {
         for (const auto& d : compiled.get_property(ov::execution_devices))
             if (d.find("GPU") != std::string::npos) return true;
@@ -1276,6 +1286,8 @@ static bool prime_empty_gpu_request(cascadia_runtime_t* handle) {
             }
             handle->request->set_tensor(port, t);
         }
+        if (test_env_set("CASCADIA_SHIM_FAIL_PRIME"))
+            throw std::runtime_error("forced by CASCADIA_SHIM_FAIL_PRIME");
         handle->request->infer();
         handle->state_live = true;
         primed = true;
