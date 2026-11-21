@@ -1231,6 +1231,11 @@ static bool runs_on_gpu(const ov::CompiledModel& compiled) {
         for (const auto& d : compiled.get_property(ov::execution_devices))
             if (d.find("GPU") != std::string::npos) return true;
     } catch (...) {
+        // Fail safe: a needless prime is harmless, a skipped one is not.
+        std::fprintf(stderr,
+                     "[cascadia-shim] set_state_blob: cannot read execution devices; "
+                     "priming the empty request\n");
+        return true;
     }
     return false;
 }
