@@ -8,7 +8,9 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use cascadia_api::policy::server::{policy_router, serve_policy, PolicyServerConfig};
-use cascadia_api::policy::{decode_request, encode_metadata, encode_reply, max_payload_bytes};
+use cascadia_api::policy::{
+    decode_metadata, decode_request, encode_metadata, encode_reply, max_payload_bytes,
+};
 use cascadia_engine::{EngineError, EngineResult, MockPolicyEngine, PolicyEngine};
 use cascadia_types::{ActionChunk, NoiseMode, Observation, PolicySpec, ResizeConvention};
 use futures::{SinkExt, StreamExt};
@@ -20,6 +22,7 @@ use tokio_tungstenite::{connect_async, MaybeTlsStream, WebSocketStream};
 type Ws = WebSocketStream<MaybeTlsStream<tokio::net::TcpStream>>;
 
 const REQUEST: &[u8] = include_bytes!("fixtures/policy/request.msgpack");
+const REQUEST_HISTORY: &[u8] = include_bytes!("fixtures/policy/request-history.msgpack");
 
 fn spec() -> PolicySpec {
     PolicySpec {
@@ -41,6 +44,14 @@ fn spec() -> PolicySpec {
         server_resize: None,
         rtc_chunk_size: None,
         history: 1,
+    }
+}
+
+/// [`spec`] taking the last two observations, as `REQUEST_HISTORY` sends.
+fn history_spec() -> PolicySpec {
+    PolicySpec {
+        history: 2,
+        ..spec()
     }
 }
 
@@ -148,9 +159,14 @@ fn url(addr: SocketAddr) -> String {
 }
 
 async fn connect(addr: SocketAddr) -> Ws {
+    connect_to(addr, &spec()).await
+}
+
+/// Connects and checks the metadata frame is `spec`'s.
+async fn connect_to(addr: SocketAddr, spec: &PolicySpec) -> Ws {
     let (mut ws, _) = connect_async(url(addr)).await.unwrap();
     match next(&mut ws).await {
-        Message::Binary(b) => assert_eq!(b, encode_metadata(&spec())),
+        Message::Binary(b) => assert_eq!(b, encode_metadata(spec)),
         other => panic!("expected metadata first, got {other:?}"),
     }
     ws
@@ -229,6 +245,54 @@ async fn a_bad_request_gets_a_text_error_and_the_socket_stays_open() {
     assert!(
         m.contains(r#"cascadia_api_rejected_total{reason="invalid_request"}"#),
         "{m}"
+    );
+}
+
+async fn start_history() -> SocketAddr {
+    let engine = Box::new(MockPolicyEngine::new(history_spec()));
+    start_engine(engine, PolicyServerConfig::default()).await
+}
+
+fn expected_history_reply() -> Vec<u8> {
+    let obs = decode_request(REQUEST_HISTORY, &history_spec()).unwrap();
+    encode_reply(&MockPolicyEngine::new(history_spec()).infer(&obs).unwrap())
+}
+
+#[tokio::test]
+async fn a_history_model_states_its_history_and_answers_with_actions() {
+    let addr = start_history().await;
+    let (mut ws, _) = connect_async(url(addr)).await.unwrap();
+    match next(&mut ws).await {
+        Message::Binary(b) => {
+            assert_eq!(b, encode_metadata(&history_spec()));
+            assert_eq!(decode_metadata(&b).unwrap().0.history, 2);
+        }
+        other => panic!("expected metadata first, got {other:?}"),
+    }
+    ws.send(Message::Binary(REQUEST_HISTORY.to_vec()))
+        .await
+        .unwrap();
+    assert_eq!(
+        next_data(&mut ws).await,
+        Message::Binary(expected_history_reply())
+    );
+}
+
+#[tokio::test]
+async fn a_single_observation_to_a_history_model_gets_a_text_error_and_the_socket_stays_open() {
+    let addr = start_history().await;
+    let mut ws = connect_to(addr, &history_spec()).await;
+    ws.send(Message::Binary(REQUEST.to_vec())).await.unwrap();
+    match next_data(&mut ws).await {
+        Message::Text(t) => assert!(t.contains("expected [2, 4, 4, 3]"), "{t}"),
+        other => panic!("expected a text error, got {other:?}"),
+    }
+    ws.send(Message::Binary(REQUEST_HISTORY.to_vec()))
+        .await
+        .unwrap();
+    assert_eq!(
+        next_data(&mut ws).await,
+        Message::Binary(expected_history_reply())
     );
 }
 
