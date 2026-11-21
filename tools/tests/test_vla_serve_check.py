@@ -33,6 +33,14 @@ def _npz(**arrays):
     return f.name
 
 
+class _Npz(dict):
+    """An `NpzFile`'s arrays, with its `files`."""
+
+    @property
+    def files(self):
+        return list(self)
+
+
 def _shapes(req):
     out = {f"images.{c}": (str(v.dtype), v.shape) for c, v in req["images"].items()}
     for k in ("state", "noise"):
@@ -54,7 +62,9 @@ class Synthetic(unittest.TestCase):
     def load(self, **arrays):
         p = _npz(**arrays)
         self.paths.append(p)
-        return np.load(p)
+        # Read and closed, so tearDown can delete it on Windows too.
+        with np.load(p) as z:
+            return _Npz({k: z[k] for k in z.files})
 
     def test_pi05_droid_sends_one_frame_with_its_noise(self):
         z = self.load(
@@ -120,6 +130,31 @@ class Synthetic(unittest.TestCase):
         for bad in ({"history": 1}, {"state_len": 8}, {"noise": "constant"}, {"cameras": ["a"]}):
             with self.assertRaises(sc.CheckError, msg=bad):
                 sc.check_metadata({**meta, **bad}, req)
+
+    def test_the_default_bound_follows_the_precision_and_checkpoint(self):
+        def bound(kind, precision, cameras=(), device="GPU"):
+            meta = {"precision": precision, "cameras": list(cameras), "device": device}
+            return sc.choose_bound(kind, meta)[0]
+
+        self.assertEqual(bound("pi05_droid", "f16"), sc.PI05_DROID_F16_BOUND)
+        self.assertEqual(bound("pi05_droid", "f32", device="CPU"), 5e-3)
+        self.assertEqual((bound("xr1", "f16"), bound("xr1", "f32")), (1e-2, 1e-3))
+        libero, droid = ["wrist_image", "image"], ["exterior_1_left", "exterior_2_left", "wrist_left"]
+        self.assertEqual((bound("molmoact2", "f16", libero), bound("molmoact2", "f32", libero)),
+                         (1e-2, 1e-3))
+        self.assertEqual((bound("molmoact2", "f16", droid), bound("molmoact2", "f32", droid)),
+                         (3e-3, 1e-3))
+        self.assertEqual((bound("molmoact2", "f16", ["top", "side"]),
+                          bound("molmoact2", "f32", ["top", "side"])), (5e-2, 1e-2))
+        _, why = sc.choose_bound("molmoact2", {"precision": "f16", "cameras": droid, "device": "GPU"})
+        self.assertEqual(why, "molmoact2 DROID at f16 on GPU")
+        for kind, precision, cameras in (
+            ("molmoact2", "f16", ["image"]),  # unknown checkpoint
+            ("xr1", "", ()),  # no precision stated
+            ("pi05_droid", "int8", ()),
+        ):
+            with self.assertRaisesRegex(sc.CheckError, "pass --bound"):
+                bound(kind, precision, cameras)
 
     def test_a_wrong_shape_or_non_finite_reply_fails(self):
         want = np.zeros((2, 3), np.float32)
