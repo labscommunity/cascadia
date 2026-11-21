@@ -3268,7 +3268,64 @@ fn pi05_droid_cpu_infer_matches_lerobot() {
         (spec.noise, spec.noise_shape.clone()),
         (NoiseMode::Input, Some(vec![15, 32]))
     );
-    let (base, wrist) = (npz(&z, "base"), npz(&z, "wrist"));
+    let cases = pi05_droid_cases(&z);
+    let frames = cases.len();
+    let mut diff = DroidDiff::default();
+    for (obs, want) in &cases {
+        let a = engine.infer(obs).unwrap();
+        assert_eq!((a.steps, a.dim), (15, 32));
+        diff.add(&a.actions, want);
+    }
+    let (max, mean, mag) = diff.summary();
+    eprintln!(
+        "pi05_droid engine cpu f32 vs lerobot f32 (first 8 dims, {frames} frames): max abs {max:.3e} \
+         mean abs {mean:.3e}, mean |action| {mag:.4}"
+    );
+    assert!(max <= 5e-3, "max abs diff {max}");
+}
+
+/// π0.5 DROID on the GPU in f16 against LeRobot in f32. The 5e-2 bound is
+/// provisional until a run on an Arc GPU measures it.
+#[test]
+fn pi05_droid_gpu_infer_f16() {
+    let test = "pi05_droid_gpu_infer_f16";
+    let Some(dir) = package_from("CASCADIA_POLICY_PACKAGE_PI05_DROID", test) else {
+        return;
+    };
+    if !gpu_enabled(test) {
+        return;
+    }
+    let z = reference(&dir);
+    let opts = OvPolicyOptions {
+        device: "GPU".into(),
+        ..OvPolicyOptions::default()
+    };
+    let mut engine = OvPolicyEngine::load(&dir, &opts).unwrap();
+    let warm = engine.warmup().unwrap();
+    assert_eq!(warm.len(), WARMUP_CALLS);
+    let cases = pi05_droid_cases(&z);
+    let frames = cases.len();
+    let (mut diff, mut infer_ms) = (DroidDiff::default(), Vec::new());
+    for (obs, want) in &cases {
+        let a = engine.infer(obs).unwrap();
+        assert_eq!((a.steps, a.dim), (15, 32));
+        assert!(a.actions.iter().all(|x| x.is_finite()), "{:?}", a.actions);
+        diff.add(&a.actions, want);
+        infer_ms.push(format!("{:.1}", a.infer_ms));
+    }
+    let (max, mean, mag) = diff.summary();
+    eprintln!(
+        "pi05_droid gpu f16 vs lerobot f32 (first 8 dims, {frames} frames): max abs {max:.3e} \
+         mean abs {mean:.3e}, mean |action| {mag:.4} infer_ms={} warmup={warm:?}",
+        infer_ms.join(",")
+    );
+    assert!(max <= 5e-2, "gpu pi05_droid f16 max abs diff {max} > 5e-2");
+}
+
+/// Each reference frame as the observation openpi's DROID client sends, with
+/// LeRobot's `[15, 32]` actions for it.
+fn pi05_droid_cases(z: &[u8]) -> Vec<(Observation, Vec<f32>)> {
+    let (base, wrist) = (npz(z, "base"), npz(z, "wrist"));
     let frames = base.shape[0];
     for (key, a) in [("base", &base), ("wrist", &wrist)] {
         assert_eq!(
@@ -3278,47 +3335,60 @@ fn pi05_droid_cpu_infer_matches_lerobot() {
         );
     }
     let (states, noise, want) = (
-        npz(&z, "state").f32s(),
-        npz(&z, "noise").f32s(),
-        npz(&z, "actions").f32s(),
+        npz(z, "state").f32s(),
+        npz(z, "noise").f32s(),
+        npz(z, "actions").f32s(),
     );
-    let task = npz(&z, "task").string();
+    let task = npz(z, "task").string();
     let px = 224 * 224 * 3;
     let image = |a: &Npy, i: usize| Image {
         height: 224,
         width: 224,
         data: a.data[i * px..(i + 1) * px].to_vec(),
     };
-    let (mut max, mut sum, mut mag, mut n) = (0.0f32, 0.0f64, 0.0f64, 0usize);
-    for i in 0..frames {
-        let obs = Observation {
-            images: vec![
-                ("base_0_rgb".into(), image(&base, i)),
-                ("left_wrist_0_rgb".into(), image(&wrist, i)),
-            ],
-            state: states[i * 8..(i + 1) * 8].to_vec(),
-            prompt: task.clone(),
-            seed: None,
-            noise: Some(noise[i * 480..(i + 1) * 480].to_vec()),
-            rtc: None,
-        };
-        let a = engine.infer(&obs).unwrap();
-        assert_eq!((a.steps, a.dim), (15, 32));
-        let w = &want[i * 480..(i + 1) * 480];
-        for (g, r) in a.actions.chunks(32).zip(w.chunks(32)) {
+    (0..frames)
+        .map(|i| {
+            let obs = Observation {
+                images: vec![
+                    ("base_0_rgb".into(), image(&base, i)),
+                    ("left_wrist_0_rgb".into(), image(&wrist, i)),
+                ],
+                state: states[i * 8..(i + 1) * 8].to_vec(),
+                prompt: task.clone(),
+                seed: None,
+                noise: Some(noise[i * 480..(i + 1) * 480].to_vec()),
+                rtc: None,
+            };
+            (obs, want[i * 480..(i + 1) * 480].to_vec())
+        })
+        .collect()
+}
+
+/// The diff over DROID's 8 action dims of each 32-wide row.
+#[derive(Default)]
+struct DroidDiff {
+    max: f32,
+    sum: f64,
+    mag: f64,
+    n: usize,
+}
+
+impl DroidDiff {
+    fn add(&mut self, got: &[f32], want: &[f32]) {
+        for (g, r) in got.chunks(32).zip(want.chunks(32)) {
             for (x, y) in g[..8].iter().zip(&r[..8]) {
                 let d = (x - y).abs();
-                max = max.max(d);
-                sum += f64::from(d);
-                mag += f64::from(y.abs());
-                n += 1;
+                self.max = self.max.max(d);
+                self.sum += f64::from(d);
+                self.mag += f64::from(y.abs());
+                self.n += 1;
             }
         }
     }
-    let (mean, mag) = (sum / n as f64, mag / n as f64);
-    eprintln!(
-        "pi05_droid engine cpu f32 vs lerobot f32 (first 8 dims, {frames} frames): max abs {max:.3e} \
-         mean abs {mean:.3e}, mean |action| {mag:.4}"
-    );
-    assert!(max <= 5e-3, "max abs diff {max}");
+
+    /// Max abs diff, mean abs diff and mean |reference action|.
+    fn summary(&self) -> (f32, f64, f64) {
+        let n = self.n as f64;
+        (self.max, self.sum / n, self.mag / n)
+    }
 }
