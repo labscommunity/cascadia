@@ -185,7 +185,7 @@ included, and differences are against PyTorch f32 unless stated.
 | `xr0` | 27/30 (26/30 with Xiaomi's task format, `task.capitalize() + "."`) | 27/30 (Intel's port, CPU f32, run on the earlier package that denoised all 32 dims) | `666562fcd` | engine: GPU f16 ~216 ms, within 1.2e-3; CPU f32 5.5 s, within 2.1e-4 | supported |
 | `molmoact2` | 28/30 | 27/30 (Intel's, CPU f32) | `8da6f67c2` | engine at `7a6b19e5a`: GPU f16 ~990 ms, within 4.0e-4; CPU f32 35 s, within 3.6e-4 | supported |
 | `xr0` (XR1 RoboCasa365) | none (no LIBERO-style bar; RoboCasa365 success not measured) | — | — | engine on Xiaomi's processor inputs: GPU f16 ~660 ms, within 3.4e-3 of Xiaomi's model (f32) on the 12 served dims; CPU f32 13–25 s, within 2.9e-4, no NaN; f32 weights through OpenVINO's Python API 1.4e-6 | experimental |
-| `molmoact2` (DROID) | none (no LIBERO-style bar) | — | — | engine on the model card's sample: GPU f16 ~860 ms, within 8.8e-4; CPU f32 28–38 s, within 3.6e-4, as Intel's runtime | experimental |
+| `molmoact2` (DROID) | none (no LIBERO-style bar) | — | — | engine on the model card's sample: GPU f16 770–860 ms, within 8.8e-4; CPU f32 28–38 s, within 3.6e-4, as Intel's runtime | experimental |
 | `molmoact2` (SO-100/101) | none (no LIBERO-style bar) | — | — | engine on the model card's sample, in degrees on actions averaging 71: GPU f16 ~600 ms, within 1.1e-2; CPU f32 20–23 s, within 3.9e-3, as Intel's runtime | experimental |
 
 Every v1 kind meets the rule; π0 only just. No run had an error frame or a non-finite action. For
