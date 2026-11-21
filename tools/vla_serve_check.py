@@ -20,21 +20,47 @@ crates/cascadia-engine-openvino/tests/policy_openvino.rs does:
   `[4, H, W, 3]` array (history 4, oldest first), the `[4, 14]` `state14`, `task`, `noise1`;
   expected is `ref1` cut to its first 12 dims.
 
-The default bound per kind is the GPU f16 bound of its test (the loosest checkpoint's for
-MolmoAct2), so the check passes on a server at either device; `--bound` tightens it.
+The default bound is the engine test's own for what the server runs, read from its metadata:
+the `precision` it compiled at (`f32` on CPU or GPU at f32, `f16` on GPU by default) and, for
+MolmoAct2, the checkpoint its cameras identify (LIBERO, DROID or SO-100/101). An unknown
+precision or checkpoint fails the check; `--bound` overrides the default.
 
 Prints `SERVE_CHECK OK <kind> max_abs=... shape=...`, or `SERVE_CHECK FAILED: <why>` and exits 1.
 `--dry-run` builds the request and prints its keys, shapes and dtypes without connecting.
 
-Needs numpy, and `openpi-client` for a live check.
+Needs numpy, and `openpi-client` for a live check. On Python 3.14 openpi-client's `dm-tree`
+dependency does not build; install it without its dependencies and add the ones it uses
+(`typing_extensions` too, which it does not declare; numpy 2.x works):
+
+    pip install --no-deps openpi-client
+    pip install numpy msgpack "websockets>=11" typing_extensions
 """
 import argparse
 import sys
 
 import numpy as np
 
-# The GPU f16 bound of each kind's test (pi05_droid's is provisional until measured on Arc).
-DEFAULT_BOUND = {"pi05_droid": 5e-2, "molmoact2": 5e-2, "xr1": 1e-2}
+KINDS = ("molmoact2", "pi05_droid", "xr1")
+
+# Provisional until measured on an Arc GPU.
+PI05_DROID_F16_BOUND = 5e-2
+
+# The engine tests' bounds (crates/cascadia-engine-openvino/tests/policy_openvino.rs), by kind
+# (and MolmoAct2 checkpoint) and compiled precision.
+BOUNDS = {
+    "pi05_droid": {"f32": 5e-3, "f16": PI05_DROID_F16_BOUND},
+    "molmoact2 LIBERO": {"f32": 1e-3, "f16": 1e-2},
+    "molmoact2 DROID": {"f32": 1e-3, "f16": 3e-3},
+    "molmoact2 SO-100/101": {"f32": 1e-2, "f16": 5e-2},  # degrees
+    "xr1": {"f32": 1e-3, "f16": 1e-2},
+}
+
+# A MolmoAct2 checkpoint by the cameras it serves.
+MOLMOACT2_CHECKPOINTS = {
+    ("image", "wrist_image"): "LIBERO",
+    ("exterior_1_left", "exterior_2_left", "wrist_left"): "DROID",
+    ("side", "top"): "SO-100/101",
+}
 
 XR1_CAMERAS = {
     "agentview_left": "robot0_agentview_left",
@@ -130,6 +156,22 @@ def check_metadata(meta, req):
         raise CheckError(f"server noise mode {meta['noise']}; this check sends the reference's noise")
 
 
+def choose_bound(kind, meta):
+    """The engine test's bound for what the server runs, and why it was chosen."""
+    precision = meta.get("precision") or ""
+    key = kind
+    if kind == "molmoact2":
+        ckpt = MOLMOACT2_CHECKPOINTS.get(tuple(sorted(meta.get("cameras", []))))
+        if ckpt is None:
+            raise CheckError(f"unknown molmoact2 checkpoint (cameras {meta.get('cameras')}); "
+                             "pass --bound")
+        key = f"molmoact2 {ckpt}"
+    bound = BOUNDS[key].get(precision)
+    if bound is None:
+        raise CheckError(f"unknown precision {precision!r} in the server metadata; pass --bound")
+    return bound, f"{key} at {precision} on {meta.get('device')}"
+
+
 def compare(actions, expected, width):
     """Max abs diff of the served actions against the expected ones."""
     actions = np.asarray(actions, dtype=np.float32)
@@ -158,6 +200,11 @@ def run(args):
           f"precision={meta.get('precision')} cameras={meta['cameras']} chunk={meta['chunk']}",
           flush=True)
     check_metadata(meta, req)
+    if args.bound is None:
+        args.bound, why = choose_bound(args.kind, meta)
+        print(f"bound {args.bound:.1e}: the engine test's for {why}", flush=True)
+    else:
+        print(f"bound {args.bound:.1e}: --bound", flush=True)
     try:
         reply = client.infer(req)
     except RuntimeError as e:  # an error frame from the server
@@ -174,13 +221,13 @@ def main(argv=None):
     ap = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
     ap.add_argument("--url", help="the policy WebSocket, e.g. ws://127.0.0.1:19430/v1/policy/ws")
     ap.add_argument("--ref", required=True, help="the kind's reference .npz")
-    ap.add_argument("--kind", required=True, choices=sorted(DEFAULT_BOUND))
-    ap.add_argument("--bound", type=float, help="max abs diff allowed (default per kind)")
+    ap.add_argument("--kind", required=True, choices=KINDS)
+    ap.add_argument("--bound", type=float,
+                    help="max abs diff allowed (default: the engine test's for the server's "
+                         "precision and checkpoint)")
     ap.add_argument("--frame", type=int, default=0, help="pi05_droid: the reference frame to send")
     ap.add_argument("--dry-run", action="store_true", help="print the request and do not connect")
     args = ap.parse_args(argv)
-    if args.bound is None:
-        args.bound = DEFAULT_BOUND[args.kind]
     if not args.dry_run and not args.url:
         ap.error("--url is required unless --dry-run")
     try:
