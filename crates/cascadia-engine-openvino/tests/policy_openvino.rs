@@ -3284,8 +3284,8 @@ fn pi05_droid_cpu_infer_matches_lerobot() {
     assert!(max <= 5e-3, "max abs diff {max}");
 }
 
-/// π0.5 DROID on the GPU in f16 against LeRobot in f32. The 5e-2 bound is
-/// provisional until a run on an Arc GPU measures it.
+/// π0.5 DROID on the GPU in f16 against LeRobot in f32: within 2e-2, measured on
+/// the Arc 140V at 5.9e-3 (about 390 ms a call).
 #[test]
 fn pi05_droid_gpu_infer_f16() {
     let test = "pi05_droid_gpu_infer_f16";
@@ -3319,7 +3319,7 @@ fn pi05_droid_gpu_infer_f16() {
          mean abs {mean:.3e}, mean |action| {mag:.4} infer_ms={} warmup={warm:?}",
         infer_ms.join(",")
     );
-    assert!(max <= 5e-2, "gpu pi05_droid f16 max abs diff {max} > 5e-2");
+    assert!(max <= 2e-2, "gpu pi05_droid f16 max abs diff {max} > 2e-2");
 }
 
 /// Each reference frame as the observation openpi's DROID client sends, with

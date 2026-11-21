@@ -42,8 +42,7 @@ import numpy as np
 
 KINDS = ("molmoact2", "pi05_droid", "xr1")
 
-# Provisional until measured on an Arc GPU.
-PI05_DROID_F16_BOUND = 5e-2
+PI05_DROID_F16_BOUND = 2e-2
 
 # The engine tests' bounds (crates/cascadia-engine-openvino/tests/policy_openvino.rs), by kind
 # (and MolmoAct2 checkpoint) and compiled precision.
