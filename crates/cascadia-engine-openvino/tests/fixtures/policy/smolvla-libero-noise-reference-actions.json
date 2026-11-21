@@ -1,0 +1,10 @@
+{
+  "source": "independent numpy + OpenVINO 2026.4.1 Python pipeline (CPU, INFERENCE_PRECISION_HINT f32) over smolvla-libero-noise-f32w16-ov",
+  "inputs": {
+    "prompt": "pick up the black bowl and place it on the plate",
+    "state": [-0.05, 0.03, 0.76, 2.97, -0.22, -0.13, 0.027, -0.027],
+    "images": "512x512 RGB per camera, byte p = (p + 37 * camera_index) % 251",
+    "noise": "NoiseRng::seeded(42).normal(1600) as [1, 50, 32]"
+  },
+  "actions": [-0.07712896913290024, 0.4954390227794647, 0.08207320421934128, -0.11223972588777542, -0.026773881167173386, -0.027289165183901787, 0.9751588106155396]
+}

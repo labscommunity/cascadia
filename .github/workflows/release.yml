@@ -11,9 +11,11 @@
 # The final job promotes the release (drops the pre-release badge) once both
 # bundles are attached — a release is never "full" without its binaries.
 #
-# Flavor : `--features openvino,dashboard-embed` (real inference + the web
-#          dashboard embedded in the binary). Each bundle ships the cascadia
-#          binary PLUS the OpenVINO GenAI runtime libraries it dynamically links.
+# Flavor : `--features openvino,dashboard-embed,zenoh` (real inference, the web
+#          dashboard embedded in the binary, and the physicalai front end:
+#          `run --engine ov-policy --zenoh`, `policy-bridge`; off at run time
+#          unless asked for). Each bundle ships the cascadia binary PLUS the
+#          OpenVINO GenAI runtime libraries it dynamically links.
 #          The binary does NOT work standalone — see INSTALL.md. The dashboard
 #          SPA (web/dist is generated, not checked in) is built once in its
 #          own read-only job and downloaded by both build jobs; the
@@ -291,7 +293,7 @@ jobs:
           name: dashboard-dist
           path: crates/cascadia-dashboard/web/dist
 
-      - name: Build cascadia (openvino + dashboard)
+      - name: Build cascadia (openvino + dashboard + zenoh)
         env:
           CXX: g++-12
           # Load the bundled .so's at runtime from a lib/ dir beside the binary.
@@ -302,7 +304,7 @@ jobs:
           # (which carries no runpath) must still resolve libtbb.so.12 from
           # the same lib/ dir. RPATH applies to those transitive lookups too.
           RUSTFLAGS: "-C link-arg=-Wl,-rpath,$ORIGIN/lib -C link-arg=-Wl,--disable-new-dtags"
-        run: cargo build --release -p cascadia --features openvino,dashboard-embed
+        run: cargo build --release -p cascadia --features openvino,dashboard-embed,zenoh
 
       - name: Package bundle
         id: pkg
@@ -354,6 +356,10 @@ jobs:
             || { echo "::error::doctor did not report OpenVINO GenAI $want from the bundled lib/"; exit 1; }
           printf '%s\n' "$out" | grep -q "OpenVINO devices.*CPU" \
             || { echo "::error::doctor did not enumerate the CPU device from the bundled runtime"; exit 1; }
+          # ov-policy tokenizes prompts with the extension the bundle ships in lib/: doctor's
+          # line names its path when found, and says "not found" otherwise.
+          printf '%s\n' "$out" | grep -q "OpenVINO tokenizers extension.*openvino_tokenizers" \
+            || { echo "::error::doctor did not find the bundled openvino_tokenizers extension"; exit 1; }
 
       - name: Upload bundle to release
         if: ${{ env.DRY_RUN != 'true' }}
@@ -420,9 +426,9 @@ jobs:
           if (-not (Test-Path "$root/runtime/include")) { throw "ov_sdk did not produce an SDK root: '$root'" }
           "INTEL_OPENVINO_DIR=$root" | Out-File -FilePath $env:GITHUB_ENV -Append
 
-      - name: Build cascadia (openvino + dashboard)
+      - name: Build cascadia (openvino + dashboard + zenoh)
         shell: pwsh
-        run: cargo build --release -p cascadia --features openvino,dashboard-embed
+        run: cargo build --release -p cascadia --features openvino,dashboard-embed,zenoh
 
       - name: Package bundle
         id: pkg
@@ -464,6 +470,8 @@ jobs:
           if ($out -match "OpenVINO GenAI.*but built against") { throw "doctor reports an OpenVINO GenAI runtime/build skew in the bundled DLLs" }
           if ($out -notmatch "OpenVINO GenAI.*$([regex]::Escape($want))") { throw "doctor did not report OpenVINO GenAI $want from the bundled DLLs" }
           if ($out -notmatch "OpenVINO devices.*CPU") { throw "doctor did not enumerate the CPU device from the bundled runtime" }
+          # ov-policy's tokenizer extension, beside cascadia.exe: the line names its path when found.
+          if ($out -notmatch "OpenVINO tokenizers extension.*openvino_tokenizers") { throw "doctor did not find the bundled openvino_tokenizers extension" }
 
       - name: Upload bundle to release
         if: ${{ env.DRY_RUN != 'true' }}

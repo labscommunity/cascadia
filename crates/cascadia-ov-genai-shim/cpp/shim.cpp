@@ -19,10 +19,12 @@
 #include <string>
 #include <system_error>
 #include <unordered_map>
+#include <unordered_set>
 #include <vector>
 
 #include <openvino/openvino.hpp>
 #include <openvino/runtime/infer_request.hpp>
+#include <openvino/runtime/intel_gpu/properties.hpp>
 #include <openvino/runtime/variable_state.hpp>
 #include <openvino/genai/llm_pipeline.hpp>
 #include <openvino/genai/generation_config.hpp>
@@ -32,6 +34,7 @@
 #include <openvino/genai/chat_history.hpp>
 #include <openvino/genai/version.hpp>
 #include <openvino/core/version.hpp>
+#include <openvino/op/util/multi_subgraph_base.hpp>
 
 namespace {
 
@@ -144,6 +147,7 @@ ov::element::Type dtype_from_code(uint32_t code) {
         case CASCADIA_DTYPE_I32:  return ov::element::i32;
         case CASCADIA_DTYPE_I64:  return ov::element::i64;
         case CASCADIA_DTYPE_BF16: return ov::element::bf16;
+        case CASCADIA_DTYPE_BOOL: return ov::element::boolean;
         default:
             throw std::invalid_argument(
                 "unknown dtype code in dtype_from_code");
@@ -156,6 +160,7 @@ uint32_t code_from_dtype(const ov::element::Type& t) {
     if (t == ov::element::i32)  return CASCADIA_DTYPE_I32;
     if (t == ov::element::i64)  return CASCADIA_DTYPE_I64;
     if (t == ov::element::bf16) return CASCADIA_DTYPE_BF16;
+    if (t == ov::element::boolean) return CASCADIA_DTYPE_BOOL;
     return CASCADIA_DTYPE_F32;
 }
 
@@ -182,6 +187,21 @@ std::string join_port_names(const Set& names) {
         out += n;
     }
     return out;
+}
+
+// get_ops() lists only top-level ops; an op inside a Loop, TensorIterator or
+// If body counts too (a RandomUniform there still draws in-graph noise).
+void record_op_types(const ov::Model& model, std::unordered_set<std::string>& out) {
+    for (const auto& op : model.get_ops()) {
+        out.insert(op->get_type_name());
+        if (const auto sub = ov::as_type_ptr<ov::op::util::MultiSubGraphOp>(op)) {
+            for (size_t i = 0; i < sub->get_internal_subgraphs_size(); ++i) {
+                if (const auto& body = sub->get_function(i)) {
+                    record_op_types(*body, out);
+                }
+            }
+        }
+    }
 }
 
 }  // namespace
@@ -215,6 +235,10 @@ struct cascadia_runtime_t {
     // restore are exactly that. Deliberately survives recreate_request: the CompiledModel
     // (and thus the plugin's KV precision) is retained, so the types cannot change.
     std::unordered_map<std::string, ov::element::Type> state_dtypes;
+    // Op type names of the ov::Model, recorded by compile_inspected before
+    // compiling (the model itself is not kept).
+    bool ops_recorded = false;
+    std::unordered_set<std::string> op_types;
 };
 
 extern "C" {
@@ -956,6 +980,154 @@ int32_t cascadia_runtime_compile_gemv_offload(
     }
 }
 
+int32_t cascadia_runtime_compile_inspected(
+    const char* model_xml_path, const char* device, const char* extension_path,
+    const char* const* properties_kv, size_t properties_count,
+    cascadia_runtime_t** out_handle) {
+    if (!model_xml_path || !device || !out_handle) {
+        set_last_error("null arg in runtime_compile_inspected"); return 1;
+    }
+    try {
+        auto handle = std::make_unique<cascadia_runtime_t>();
+        auto props = collect_properties(properties_kv, properties_count);
+        if (extension_path) {
+            handle->core.add_extension(std::string(extension_path));
+        }
+        auto model = handle->core.read_model(std::string(model_xml_path));
+        record_op_types(*model, handle->op_types);
+        handle->ops_recorded = true;
+        auto compiled = handle->core.compile_model(model, std::string(device), props);
+        handle->compiled = std::make_shared<ov::CompiledModel>(std::move(compiled));
+        handle->request = std::make_shared<ov::InferRequest>(
+            handle->compiled->create_infer_request());
+        for (const auto& port : handle->compiled->inputs()) {
+            std::string name;
+            try {
+                name = port.get_any_name();
+            } catch (...) {
+                const auto& names = port.get_names();
+                name = names.empty() ? std::string{} : *names.begin();
+            }
+            handle->input_aliases.push_back(join_port_names(port.get_names()));
+            handle->input_names.push_back(std::move(name));
+        }
+        for (const auto& port : handle->compiled->outputs()) {
+            std::string name;
+            try {
+                name = port.get_any_name();
+            } catch (...) {
+                const auto& names = port.get_names();
+                name = names.empty() ? std::string{} : *names.begin();
+            }
+            handle->output_aliases.push_back(join_port_names(port.get_names()));
+            handle->output_names.push_back(std::move(name));
+        }
+        *out_handle = handle.release();
+        return 0;
+    } catch (const std::exception& e) {
+        set_last_error(e); return 1;
+    } catch (...) {
+        set_last_error("unknown C++ exception in runtime_compile_inspected"); return 1;
+    }
+}
+
+int32_t cascadia_runtime_gpu_memory_bytes(
+    cascadia_runtime_t* handle, const char* device, uint64_t* out_bytes) {
+    if (!handle || !device || !out_bytes) {
+        set_last_error("null arg in runtime_gpu_memory_bytes"); return 1;
+    }
+    try {
+        // The handle owns its Core, so the GPU plugin's engine (and these
+        // counters) hold only what this handle's model allocated.
+        auto stats = handle->core.get_property(std::string(device), ov::intel_gpu::memory_statistics);
+        uint64_t total = 0;
+        for (const auto& kv : stats) total += kv.second;
+        *out_bytes = total;
+        return 0;
+    } catch (const std::exception& e) {
+        set_last_error(e); return 1;
+    } catch (...) {
+        set_last_error("unknown C++ exception in runtime_gpu_memory_bytes"); return 1;
+    }
+}
+
+int32_t cascadia_runtime_has_op_type(cascadia_runtime_t* handle, const char* type_name) {
+    if (!handle || !type_name) {
+        set_last_error("null arg in runtime_has_op_type"); return -1;
+    }
+    if (!handle->ops_recorded) {
+        set_last_error("has_op_type: handle was not compiled with compile_inspected");
+        return -1;
+    }
+    try {
+        return handle->op_types.count(std::string(type_name)) ? 1 : 0;
+    } catch (const std::exception& e) {
+        set_last_error(e); return -1;
+    } catch (...) {
+        set_last_error("unknown C++ exception in runtime_has_op_type"); return -1;
+    }
+}
+
+int32_t cascadia_runtime_set_state_bool(
+    cascadia_runtime_t* handle, const char* name, int32_t value, int32_t* out_found) {
+    if (!handle || !handle->request || !name || !out_found) {
+        set_last_error("null arg in runtime_set_state_bool"); return 1;
+    }
+    try {
+        *out_found = 0;
+        const std::string want(name);
+        for (auto& state : handle->request->query_state()) {
+            if (state.get_name() != want) continue;
+            // A scalar boolean, as ov::genai::Tokenizer sets its own flags.
+            ov::Tensor t(ov::element::boolean, ov::Shape{});
+            *static_cast<uint8_t*>(t.data()) = value != 0 ? 1 : 0;
+            state.set_state(t);
+            *out_found = 1;
+            return 0;
+        }
+        return 0;
+    } catch (const std::exception& e) {
+        set_last_error(e); return 1;
+    } catch (...) {
+        set_last_error("unknown C++ exception in runtime_set_state_bool"); return 1;
+    }
+}
+
+int32_t cascadia_runtime_set_input_strings(
+    cascadia_runtime_t* handle, const char* tensor_name,
+    const char* const* strs, const size_t* lens, size_t count) {
+    if (!handle || !handle->request || !tensor_name) {
+        set_last_error("null arg in set_input_strings"); return 1;
+    }
+    if (count > 0 && (!strs || !lens)) {
+        set_last_error("set_input_strings: null strs/lens with count>0"); return 1;
+    }
+    size_t total = 0;
+    for (size_t i = 0; i < count; ++i) {
+        if (lens[i] > 0 && !strs[i]) {
+            set_last_error("set_input_strings: null string with len>0"); return 1;
+        }
+        if (lens[i] > MAX_TENSOR_BYTES - total) {
+            set_last_error("set_input_strings: total exceeds MAX_TENSOR_BYTES=256MiB");
+            return 1;
+        }
+        total += lens[i];
+    }
+    try {
+        ov::Tensor tensor(ov::element::string, ov::Shape{count});
+        auto* out = tensor.data<std::string>();
+        for (size_t i = 0; i < count; ++i) {
+            out[i].assign(lens[i] ? strs[i] : "", lens[i]);
+        }
+        handle->request->set_tensor(std::string(tensor_name), tensor);
+        return 0;
+    } catch (const std::exception& e) {
+        set_last_error(e); return 1;
+    } catch (...) {
+        set_last_error("unknown C++ exception in set_input_strings"); return 1;
+    }
+}
+
 int32_t cascadia_runtime_reset_state(cascadia_runtime_t* handle) {
     if (!handle || !handle->request) {
         set_last_error("null runtime handle"); return 1;
@@ -1565,6 +1737,42 @@ int32_t cascadia_runtime_input_dtype(
     catch (...) { set_last_error("unknown exception in input_dtype"); return 1; }
 }
 
+int32_t cascadia_runtime_port_info(
+    cascadia_runtime_t* handle, int32_t is_output, size_t idx,
+    uint32_t* out_dtype, int64_t* out_dims, size_t dims_cap, size_t* out_rank) {
+    if (!handle || !handle->compiled || !out_dtype || !out_rank ||
+        (dims_cap > 0 && !out_dims)) {
+        set_last_error("null arg in runtime_port_info"); return 1;
+    }
+    try {
+        const auto ports = is_output ? handle->compiled->outputs() : handle->compiled->inputs();
+        if (idx >= ports.size()) {
+            set_last_error("port_info: idx out of range"); return 1;
+        }
+        const auto& port = ports[idx];
+        const auto et = port.get_element_type();
+        const uint32_t code = code_from_dtype(et);
+        // code_from_dtype falls back to f32; report a type it does not know as OTHER.
+        *out_dtype = (code == CASCADIA_DTYPE_F32 && et != ov::element::f32)
+                         ? CASCADIA_DTYPE_OTHER : code;
+        const auto& ps = port.get_partial_shape();
+        if (ps.rank().is_dynamic()) {
+            set_last_error("port_info: port has a dynamic rank"); return 1;
+        }
+        const size_t rank = static_cast<size_t>(ps.rank().get_length());
+        *out_rank = rank;
+        if (!out_dims) return 0;
+        if (dims_cap < rank) {
+            set_last_error("port_info: dims_cap too small"); return 1;
+        }
+        for (size_t i = 0; i < rank; ++i) {
+            out_dims[i] = ps[i].is_static() ? ps[i].get_length() : -1;
+        }
+        return 0;
+    } catch (const std::exception& e) { set_last_error(e); return 1; }
+    catch (...) { set_last_error("unknown exception in port_info"); return 1; }
+}
+
 int32_t cascadia_runtime_output_byte_size(
     cascadia_runtime_t* handle, size_t output_idx, size_t* out_byte_size) {
     if (!handle || !handle->request || !out_byte_size) {
@@ -1655,3 +1863,80 @@ int32_t cascadia_ov_version(char* out_buf, size_t out_cap, size_t* out_len) {
 }
 
 }  // extern "C"
+
+// Kept at the end of the file: <windows.h> defines macros (min, max, ERROR, …)
+// that would otherwise leak into everything above.
+#if defined(_WIN32)
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
+#ifndef WIN32_LEAN_AND_MEAN
+#define WIN32_LEAN_AND_MEAN
+#endif
+#include <windows.h>
+#elif defined(__APPLE__)
+#include <mach-o/dyld.h>
+#else
+#include <link.h>
+#endif
+
+namespace {
+
+#if !defined(_WIN32)
+// Basename `libopenvino.` (macOS: libopenvino.2641.dylib) or `libopenvino.so`
+// (Linux: libopenvino.so.2641); `libopenvino_genai…` has an underscore there.
+bool is_core_library(const char* path) {
+    if (!path) return false;
+    const char* base = std::strrchr(path, '/');
+    base = base ? base + 1 : path;
+    return std::strncmp(base, "libopenvino.", 12) == 0;
+}
+#endif
+
+#if !defined(_WIN32) && !defined(__APPLE__)
+int find_core_library(struct dl_phdr_info* info, size_t, void* data) {
+    if (is_core_library(info->dlpi_name)) {
+        *static_cast<std::string*>(data) = info->dlpi_name;
+        return 1;
+    }
+    return 0;
+}
+#endif
+
+}  // namespace
+
+extern "C" int32_t cascadia_ov_core_library_path(
+    char* out_buf, size_t out_cap, size_t* out_len) {
+    try {
+        std::string path;
+#if defined(_WIN32)
+        HMODULE h = GetModuleHandleW(L"openvino.dll");
+        if (h) {
+            std::wstring buf(32768, L'\0');
+            DWORD n = GetModuleFileNameW(h, &buf[0], static_cast<DWORD>(buf.size()));
+            if (n > 0 && n < buf.size()) {
+                int bytes = WideCharToMultiByte(CP_UTF8, 0, buf.data(), static_cast<int>(n),
+                                                nullptr, 0, nullptr, nullptr);
+                if (bytes > 0) {
+                    path.resize(static_cast<size_t>(bytes));
+                    WideCharToMultiByte(CP_UTF8, 0, buf.data(), static_cast<int>(n),
+                                        &path[0], bytes, nullptr, nullptr);
+                }
+            }
+        }
+#elif defined(__APPLE__)
+        for (uint32_t i = 0, n = _dyld_image_count(); i < n; ++i) {
+            const char* name = _dyld_get_image_name(i);
+            if (is_core_library(name)) { path = name; break; }
+        }
+#else
+        dl_iterate_phdr(find_core_library, &path);
+#endif
+        if (path.empty()) {
+            set_last_error("the loaded OpenVINO core library was not found in this process");
+            return 1;
+        }
+        return copy_name_to_buf(path, out_buf, out_cap, out_len);
+    } catch (const std::exception& e) { set_last_error(e); return 1; }
+    catch (...) { set_last_error("unknown exception in ov_core_library_path"); return 1; }
+}

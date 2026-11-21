@@ -5,6 +5,8 @@
 //! (non-streaming + SSE streaming). Tools, logprobs, /events, /state,
 //! Ollama dialect deferred — see Phase 5 follow-up.
 
+pub mod policy;
+
 use std::sync::atomic::Ordering;
 use std::sync::Arc;
 use std::time::SystemTime;
@@ -553,6 +555,59 @@ pub fn make_router_with_stats(
         .layer(axum::middleware::from_fn(track_http_metrics))
 }
 
+/// The HTTP request headers must arrive within this, so a client trickling
+/// them cannot hold a connection (and its task) open.
+pub const HEADER_READ_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+
+/// Serve `app` on `listener` over HTTP/1.1: `TCP_NODELAY` on every accepted
+/// stream (per-token SSE frames leave as they are written instead of being
+/// Nagle-batched into ~1 s bursts), a deadline on the request headers, and
+/// upgrades enabled, which the policy WebSocket needs (a loop without them
+/// answers 101 and never upgrades). axum 0.7's `serve` exposes neither knob.
+pub async fn serve_http(
+    listener: tokio::net::TcpListener,
+    app: Router,
+    header_read_timeout: std::time::Duration,
+) -> std::io::Result<()> {
+    use hyper::server::conn::http1;
+    use hyper_util::rt::{TokioIo, TokioTimer};
+    use std::convert::Infallible;
+    use tower::Service;
+
+    loop {
+        let (stream, _) = match listener.accept().await {
+            Ok(v) => v,
+            Err(e) => {
+                warn!(error = %e, "accept failed; retrying after 50ms");
+                tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+                continue;
+            }
+        };
+        if let Err(e) = stream.set_nodelay(true) {
+            warn!(error = %e, "set_nodelay failed on accepted stream");
+        }
+        let app = app.clone();
+        // axum::Router is Arc-backed, so a clone per request is cheap and
+        // gives tower's `call` the `&mut self` hyper's `Fn` service cannot.
+        let svc = hyper::service::service_fn(move |req: hyper::Request<hyper::body::Incoming>| {
+            let mut router = app.clone();
+            let fut = router.call(req.map(Body::new));
+            async move { Ok::<_, Infallible>(fut.await.unwrap_or_else(|e: Infallible| match e {})) }
+        });
+        tokio::spawn(async move {
+            if let Err(e) = http1::Builder::new()
+                .timer(TokioTimer::new())
+                .header_read_timeout(header_read_timeout)
+                .serve_connection(TokioIo::new(stream), svc)
+                .with_upgrades()
+                .await
+            {
+                tracing::debug!(error = %e, "connection ended");
+            }
+        });
+    }
+}
+
 /// Request middleware: per-route request counter + latency histogram. Uses
 /// the MATCHED route template (bounded cardinality), never the raw URI; a
 /// request that matched no route is bucketed as `other`. For streaming
@@ -587,17 +642,25 @@ async fn metrics() -> impl IntoResponse {
     ([(header::CONTENT_TYPE, content_type)], body)
 }
 
-/// Marks a 5xx raised before the request ever reached the engine, so
-/// [`track_pipeline_health`] does not read it as the pipeline failing.
+/// Marks a 5xx that says nothing about the pipeline failing (raised before the
+/// request reached the engine, or a capacity refusal), so
+/// [`track_pipeline_health`] does not latch readiness on it.
 ///
-/// The readiness flip is a latch with an asymmetry: a 5xx that keeps serving
-/// other traffic (a capacity 503) heals on the next 2xx, but one that a load
-/// balancer gates on `/health` stops the traffic that would have healed it.
-/// A chat-template render failure is request-shape-determined and never
-/// touches the pipeline, so letting it latch drains a healthy node
-/// permanently on a single request.
+/// The latch heals only on a later 2xx, and a load balancer that gates on
+/// `/health` stops the traffic that would bring one. So a 5xx a client can
+/// cause must not latch, or one caller drains a healthy node: a chat-template
+/// render failure is request-shape-determined, and a capacity 503 is what a
+/// caller gets by holding every slot with open streams (their 200s were
+/// counted when the streams started).
 #[derive(Clone, Copy)]
 struct PreEngineFailure;
+
+/// Marks a streamed 200: its status is sent before the engine has done the
+/// work, so the stream itself sets readiness from how it ends (a final chunk
+/// sets it, an engine fault clears it, a refusal leaves it), as the policy
+/// server does per call.
+#[derive(Clone, Copy)]
+struct StreamedOutcome;
 
 /// Response middleware: for completion routes, flip `AppState.ready` from the
 /// response status (5xx → not ready, 2xx → ready) so `/health` reflects whether
@@ -616,7 +679,7 @@ async fn track_pipeline_health(
         let s = resp.status();
         if s.is_server_error() && resp.extensions().get::<PreEngineFailure>().is_none() {
             state.ready.store(false, Ordering::Relaxed);
-        } else if s.is_success() {
+        } else if s.is_success() && resp.extensions().get::<StreamedOutcome>().is_none() {
             state.ready.store(true, Ordering::Relaxed);
         }
     }
@@ -827,6 +890,49 @@ impl ChatCompletionRequest {
         }
     }
 
+    /// The OpenAI rules an engine would otherwise trip over with an error
+    /// that reads as its own fault: the penalty ranges, the tool shapes and
+    /// `tool_choice`.
+    fn validate(&self) -> Result<(), String> {
+        check_penalties(self.frequency_penalty, self.presence_penalty)?;
+        for (i, t) in self.tools.iter().flatten().enumerate() {
+            if t.r#type != "function" {
+                return Err(format!(
+                    "tools[{i}].type is '{}'; only \"function\" is supported",
+                    t.r#type
+                ));
+            }
+            let named = t
+                .function
+                .get("name")
+                .and_then(|n| n.as_str())
+                .is_some_and(|n| !n.is_empty());
+            if !named {
+                return Err(format!(
+                    "tools[{i}].function.name must be a non-empty string"
+                ));
+            }
+        }
+        for (i, m) in self.messages.iter().enumerate() {
+            for (j, c) in m.tool_calls.iter().flatten().enumerate() {
+                let at = format!("messages[{i}].tool_calls[{j}]");
+                if c.r#type != "function" {
+                    return Err(format!(
+                        "{at}.type is '{}'; only \"function\" is supported",
+                        c.r#type
+                    ));
+                }
+                if c.function.name.is_empty() {
+                    return Err(format!("{at}.function.name is empty"));
+                }
+                if serde_json::from_str::<serde_json::Value>(&c.function.arguments).is_err() {
+                    return Err(format!("{at}.function.arguments is not valid JSON"));
+                }
+            }
+        }
+        self.validate_tool_choice()
+    }
+
     /// `tool_choice` must be one of the OpenAI shapes: `"auto"`, `"none"`,
     /// `"required"`, or `{"type":"function","function":{"name":N}}` naming a
     /// function present in `tools`. Anything else is the caller's mistake
@@ -916,6 +1022,21 @@ impl ChatCompletionRequest {
 
 fn default_max_tokens() -> u32 {
     256
+}
+
+/// OpenAI's range for `frequency_penalty` and `presence_penalty`.
+fn check_penalties(frequency: Option<f32>, presence: Option<f32>) -> Result<(), String> {
+    for (name, v) in [
+        ("frequency_penalty", frequency),
+        ("presence_penalty", presence),
+    ] {
+        if let Some(v) = v {
+            if !(-2.0..=2.0).contains(&v) {
+                return Err(format!("{name} is {v}; it must be between -2.0 and 2.0"));
+            }
+        }
+    }
+    Ok(())
 }
 
 #[derive(Serialize)]
@@ -2449,7 +2570,7 @@ async fn chat_completions(
     Json(req): Json<ChatCompletionRequest>,
 ) -> axum::response::Response {
     let task_id = format!("chatcmpl-{}", Uuid::new_v4().simple());
-    if let Err(e) = req.validate_tool_choice() {
+    if let Err(e) = req.validate() {
         count_rejected("invalid_request");
         return (
             StatusCode::BAD_REQUEST,
@@ -2598,13 +2719,7 @@ async fn chat_completions(
         Ok(p) => p,
         Err(_) => {
             count_rejected("capacity");
-            return (
-                StatusCode::SERVICE_UNAVAILABLE,
-                Json(serde_json::json!({
-                    "error": "engine at capacity; retry after current requests complete"
-                })),
-            )
-                .into_response();
+            return capacity_response();
         }
     };
 
@@ -2659,12 +2774,7 @@ async fn chat_completions(
         // loud with a 5xx instead (e.g. a sharded chain poisoned by a
         // handshake/manifest mismatch).
         if let Some(reason) = &chunk.error {
-            warn!(task = %task_id, reason = %reason, "engine failed task; returning 503");
-            return (
-                StatusCode::SERVICE_UNAVAILABLE,
-                Json(serde_json::json!({ "error": reason })),
-            )
-                .into_response();
+            return failed_chunk_response(&task_id, reason, chunk.error_kind);
         }
         // Count every chunk, but replace the running sum when the final
         // carries authoritative usage (including hidden thinking/tools).
@@ -2772,6 +2882,14 @@ async fn completions(
         }
     };
     let task_id = format!("cmpl-{}", Uuid::new_v4().simple());
+    if let Err(e) = check_penalties(req.frequency_penalty, req.presence_penalty) {
+        count_rejected("invalid_request");
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({ "error": e })),
+        )
+            .into_response();
+    }
     if prompt.trim().is_empty() {
         count_rejected("empty_prompt");
         return (
@@ -2818,13 +2936,7 @@ async fn completions(
         Ok(p) => p,
         Err(_) => {
             count_rejected("capacity");
-            return (
-                StatusCode::SERVICE_UNAVAILABLE,
-                Json(serde_json::json!({
-                    "error": "engine at capacity; retry after current requests complete"
-                })),
-            )
-                .into_response();
+            return capacity_response();
         }
     };
     state.stats.requests_total.fetch_add(1, Ordering::Relaxed);
@@ -2864,12 +2976,7 @@ async fn completions(
     let mut logprobs_content: Vec<cascadia_types::TokenLogprobs> = Vec::new();
     while let Some(chunk) = chunk_stream.next().await {
         if let Some(reason) = &chunk.error {
-            warn!(task = %task_id, reason = %reason, "engine failed task; returning 503");
-            return (
-                StatusCode::SERVICE_UNAVAILABLE,
-                Json(serde_json::json!({ "error": reason })),
-            )
-                .into_response();
+            return failed_chunk_response(&task_id, reason, chunk.error_kind);
         }
         match marker.as_mut() {
             Some(f) => {
@@ -2972,6 +3079,7 @@ async fn stream_text_completion(
     let final_prompt = usage_prompt.clone();
     let usage_model = model.clone();
     let usage_task_id = task_id.clone();
+    let ready = state.ready.clone();
     // First-frame flag for `echo` (prepend the prompt once).
     let echo_pending = Arc::new(std::sync::Mutex::new(echo_prefix));
     let permit_carrier = StreamWithPermit {
@@ -2988,6 +3096,7 @@ async fn stream_text_completion(
             let usage_prompt = usage_prompt.clone();
             let usage_finished = usage_finished.clone();
             let echo_pending = echo_pending.clone();
+            let ready = ready.clone();
             async move {
                 // A progress marker (a long prompt still going down the
                 // pipeline, one window per engine step): nothing to send,
@@ -2999,18 +3108,17 @@ async fn stream_text_completion(
                     record_stream_tokens(&chunk, &stats, &usage_completion);
                     if chunk.is_final {
                         usage_prompt.store(chunk.prompt_tokens.unwrap_or(0), Ordering::Relaxed);
-                        usage_finished.store(chunk.finish_reason != Some(cascadia_types::FinishReason::Cancelled), Ordering::Relaxed);
+                        usage_finished.store(
+                            chunk.finish_reason != Some(cascadia_types::FinishReason::Cancelled),
+                            Ordering::Relaxed,
+                        );
+                        ready.store(true, Ordering::Relaxed);
                     }
                 }
                 if let Some(reason) = &chunk.error {
-                    warn!(task = %task_id, reason = %reason, "engine failed task mid-stream; emitting SSE error");
-                    let payload = serde_json::json!({
-                        "id": task_id,
-                        "object": "error",
-                        "error": { "message": reason, "type": "engine_error" },
-                    });
+                    let frame = stream_error_frame(&ready, &task_id, reason, chunk.error_kind);
                     tokio::task::yield_now().await;
-                    return Ok::<Bytes, std::convert::Infallible>(Bytes::from(format!("data: {payload}\n\n")));
+                    return Ok::<Bytes, std::convert::Infallible>(frame);
                 }
                 // Prepend the echo prefix to the first content frame, once.
                 let mut text = chunk.text.clone();
@@ -3067,6 +3175,7 @@ async fn stream_text_completion(
         .header(header::CONTENT_TYPE, "text/event-stream")
         .header(header::CACHE_CONTROL, "no-cache")
         .header("x-accel-buffering", "no")
+        .extension(StreamedOutcome)
         .body(Body::from_stream(body_stream))
         .unwrap()
         .into_response()
@@ -3121,6 +3230,7 @@ async fn stream_completion(
             task_id,
             model,
             include_usage,
+            ready: state.ready.clone(),
         };
         let body = stream::unfold(tool_stream, |mut s| async move {
             let frame = s.next_frame().await?;
@@ -3131,6 +3241,7 @@ async fn stream_completion(
             .header(header::CONTENT_TYPE, "text/event-stream")
             .header(header::CACHE_CONTROL, "no-cache")
             .header("x-accel-buffering", "no")
+            .extension(StreamedOutcome)
             .body(Body::from_stream(body))
             .unwrap()
             .into_response();
@@ -3171,6 +3282,7 @@ async fn stream_completion(
     // Hyper writes immediately (combined with TCP_NODELAY set on the
     // accepted connection in cascadia-cli's serve loop, this lands the
     // per-token chunk on the wire as a separate ~220 B packet).
+    let ready = state.ready.clone();
     let marker: Arc<std::sync::Mutex<Option<MarkerFilter>>> = Arc::new(std::sync::Mutex::new(
         state.marker_dialect.clone().map(MarkerFilter::new),
     ));
@@ -3183,6 +3295,7 @@ async fn stream_completion(
             let usage_prompt = usage_prompt.clone();
             let usage_finished = usage_finished.clone();
             let marker = marker.clone();
+            let ready = ready.clone();
             async move {
                 // Publish real per-chunk counts live; authoritative-only
                 // engines reconcile their full model count at completion.
@@ -3192,9 +3305,12 @@ async fn stream_completion(
                 if chunk.error.is_none() {
                     record_stream_tokens(&chunk, &stats, &usage_completion);
                     if chunk.is_final {
-                        usage_prompt
-                            .store(chunk.prompt_tokens.unwrap_or(0), Ordering::Relaxed);
-                        usage_finished.store(chunk.finish_reason != Some(cascadia_types::FinishReason::Cancelled), Ordering::Relaxed);
+                        usage_prompt.store(chunk.prompt_tokens.unwrap_or(0), Ordering::Relaxed);
+                        usage_finished.store(
+                            chunk.finish_reason != Some(cascadia_types::FinishReason::Cancelled),
+                            Ordering::Relaxed,
+                        );
+                        ready.store(true, Ordering::Relaxed);
                     }
                 }
                 // A failed task carries `error` on its final chunk. The 200
@@ -3203,14 +3319,9 @@ async fn stream_completion(
                 // downgrade to a 5xx here. Surface the failure as an explicit
                 // SSE error event instead of a silent empty delta + [DONE].
                 if let Some(reason) = &chunk.error {
-                    warn!(task = %task_id, reason = %reason, "engine failed task mid-stream; emitting SSE error");
-                    let payload = serde_json::json!({
-                        "id": task_id,
-                        "object": "error",
-                        "error": { "message": reason, "type": "engine_error" },
-                    });
+                    let frame = stream_error_frame(&ready, &task_id, reason, chunk.error_kind);
                     tokio::task::yield_now().await;
-                    return Ok::<Bytes, std::convert::Infallible>(Bytes::from(format!("data: {payload}\n\n")));
+                    return Ok::<Bytes, std::convert::Infallible>(frame);
                 }
                 // Custom (non-OpenAI) `n_tokens` field: how many model
                 // tokens this chunk carries. Spec-decode emits 1..=K+1
@@ -3301,6 +3412,7 @@ async fn stream_completion(
         .header(header::CONTENT_TYPE, "text/event-stream")
         .header(header::CACHE_CONTROL, "no-cache")
         .header("x-accel-buffering", "no")
+        .extension(StreamedOutcome)
         .body(Body::from_stream(body_stream))
         .unwrap()
         .into_response()
@@ -3345,6 +3457,8 @@ struct ToolStream {
     task_id: String,
     model: String,
     include_usage: bool,
+    /// `/health`'s flag, set from how the stream ends.
+    ready: Arc<std::sync::atomic::AtomicBool>,
 }
 
 enum ToolStreamPhase {
@@ -3379,15 +3493,11 @@ impl ToolStream {
             // The 200 headers are already on the wire: surface the failure
             // as an SSE error event. No tool_calls or usage follow it.
             if let Some(reason) = &chunk.error {
-                warn!(task = %self.task_id, reason = %reason, "engine failed tool task mid-stream; SSE error");
                 self.phase = ToolStreamPhase::Tail;
-                let payload = serde_json::json!({
-                    "id": self.task_id,
-                    "object": "error",
-                    "error": { "message": reason, "type": "engine_error" },
-                });
+                let frame =
+                    stream_error_frame(&self.ready, &self.task_id, reason, chunk.error_kind);
                 tokio::task::yield_now().await;
-                return Some(Bytes::from(format!("data: {payload}\n\n")));
+                return Some(frame);
             }
             record_stream_tokens(&chunk, &self.stats, &self.completion);
             self.held_tokens += chunk.token_count();
@@ -3403,6 +3513,7 @@ impl ToolStream {
                 self.prompt_tokens = chunk.prompt_tokens.unwrap_or(0);
                 self.finished =
                     chunk.finish_reason != Some(cascadia_types::FinishReason::Cancelled);
+                self.ready.store(true, Ordering::Relaxed);
                 self.phase = ToolStreamPhase::Tail;
                 let reason = chunk
                     .finish_reason
@@ -3537,6 +3648,76 @@ fn content_frame(
     format!("data: {payload}\n\n")
 }
 
+/// The answer for a non-streamed task that ended in an error chunk: a refused
+/// request is the caller's 4xx and leaves `/health` alone; anything else is
+/// an engine fault (503, which clears it).
+fn failed_chunk_response(
+    task_id: &str,
+    reason: &str,
+    kind: Option<cascadia_types::ChunkErrorKind>,
+) -> axum::response::Response {
+    use cascadia_types::ChunkErrorKind;
+    let status = match kind {
+        Some(ChunkErrorKind::InvalidRequest) => {
+            count_rejected("invalid_request");
+            StatusCode::BAD_REQUEST
+        }
+        Some(ChunkErrorKind::PromptTooLong) => {
+            count_rejected("prompt_over_window");
+            StatusCode::PAYLOAD_TOO_LARGE
+        }
+        None => {
+            warn!(task = %task_id, reason = %reason, "engine failed task; returning 503");
+            StatusCode::SERVICE_UNAVAILABLE
+        }
+    };
+    (status, Json(serde_json::json!({ "error": reason }))).into_response()
+}
+
+/// The SSE error event for a streamed task that failed after its 200 was
+/// sent. An engine fault clears `ready`; a refused request leaves it.
+fn stream_error_frame(
+    ready: &std::sync::atomic::AtomicBool,
+    task_id: &str,
+    reason: &str,
+    kind: Option<cascadia_types::ChunkErrorKind>,
+) -> Bytes {
+    let kind_str = match kind {
+        Some(cascadia_types::ChunkErrorKind::InvalidRequest) => {
+            count_rejected("invalid_request");
+            "invalid_request_error"
+        }
+        Some(cascadia_types::ChunkErrorKind::PromptTooLong) => {
+            count_rejected("prompt_over_window");
+            "invalid_request_error"
+        }
+        None => {
+            warn!(task = %task_id, reason = %reason, "engine failed task mid-stream; emitting SSE error");
+            ready.store(false, Ordering::Relaxed);
+            "engine_error"
+        }
+    };
+    let payload = serde_json::json!({
+        "id": task_id,
+        "object": "error",
+        "error": { "message": reason, "type": kind_str },
+    });
+    Bytes::from(format!("data: {payload}\n\n"))
+}
+
+/// The permit gate's 503; see [`PreEngineFailure`] for why it leaves readiness alone.
+fn capacity_response() -> axum::response::Response {
+    let mut resp = (
+        StatusCode::SERVICE_UNAVAILABLE,
+        Json(serde_json::json!({
+            "error": "engine at capacity; retry after current requests complete"
+        })),
+    )
+        .into_response();
+    resp.extensions_mut().insert(PreEngineFailure);
+    resp
+}
+
 fn engine_error_response(err: cascadia_engine::EngineError) -> axum::response::Response {
     use cascadia_engine::EngineError;
     // An engine-queue-full 503 is the same "at capacity" experience as the
@@ -3592,7 +3773,13 @@ fn engine_error_response(err: cascadia_engine::EngineError) -> axum::response::R
         // this node's to explain, like any other engine failure.
         EngineError::BatchAborted(_) => StatusCode::INTERNAL_SERVER_ERROR,
     };
-    (status, Json(serde_json::json!({"error": err.to_string()}))).into_response()
+    let capacity = matches!(err, EngineError::QueueFull { .. });
+    let mut resp = (status, Json(serde_json::json!({"error": err.to_string()}))).into_response();
+    // Capacity, like the permit gate's 503: not the pipeline failing.
+    if capacity {
+        resp.extensions_mut().insert(PreEngineFailure);
+    }
+    resp
 }
 
 async fn cancel(State(state): State<AppState>, Path(task_id): Path<String>) -> impl IntoResponse {
@@ -4657,6 +4844,193 @@ mod tests {
         assert_eq!(chat(app.clone(), "hello".into()).await, StatusCode::OK);
         let (s, _) = health(app.clone()).await;
         assert_eq!(s, StatusCode::OK, "health recovers after a success");
+    }
+
+    async fn health_status(app: &Router) -> StatusCode {
+        app.clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/health")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap()
+            .status()
+    }
+
+    /// POST `payload` to `uri`; the status and the whole body (SSE included).
+    async fn post_raw(app: &Router, uri: &str, payload: Value) -> (StatusCode, String) {
+        let r = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri(uri)
+                    .header("content-type", "application/json")
+                    .body(Body::from(payload.to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let st = r.status();
+        let b = to_bytes(r.into_body(), 1 << 20).await.unwrap();
+        (st, String::from_utf8_lossy(&b).into_owned())
+    }
+
+    fn chat_body(content: &str, extra: Value) -> Value {
+        let mut v = serde_json::json!({
+            "model": "mock-model",
+            "messages": [{"role": "user", "content": content}],
+        });
+        v.as_object_mut()
+            .unwrap()
+            .extend(extra.as_object().cloned().unwrap_or_default());
+        v
+    }
+
+    /// Requests a caller shapes are refused with a 4xx before or by the
+    /// engine, and none of them clears `/health`.
+    #[tokio::test]
+    async fn client_caused_failures_are_4xx_and_keep_health() {
+        let app = make_app().await;
+        let chat = "/v1/chat/completions";
+        let cases: Vec<(&str, Value, StatusCode)> = vec![
+            (
+                chat,
+                chat_body("hi", serde_json::json!({"frequency_penalty": 2.5})),
+                StatusCode::BAD_REQUEST,
+            ),
+            (
+                chat,
+                chat_body("hi", serde_json::json!({"presence_penalty": -3.0})),
+                StatusCode::BAD_REQUEST,
+            ),
+            (
+                "/v1/completions",
+                serde_json::json!({"model": "m", "prompt": "hi", "presence_penalty": 9.0}),
+                StatusCode::BAD_REQUEST,
+            ),
+            (
+                chat,
+                chat_body(
+                    "hi",
+                    serde_json::json!({"tools": [{"type": "retrieval", "function": {"name": "f"}}]}),
+                ),
+                StatusCode::BAD_REQUEST,
+            ),
+            (
+                chat,
+                chat_body(
+                    "hi",
+                    serde_json::json!({"tools": [{"type": "function", "function": {}}]}),
+                ),
+                StatusCode::BAD_REQUEST,
+            ),
+            (
+                chat,
+                serde_json::json!({"model": "m", "messages": [
+                    {"role": "user", "content": "hi"},
+                    {"role": "assistant", "content": null, "tool_calls": [
+                        {"id": "c1", "type": "function", "function": {"name": "f", "arguments": "{not json"}}]},
+                    {"role": "tool", "tool_call_id": "c1", "content": "ok"}]}),
+                StatusCode::BAD_REQUEST,
+            ),
+            (
+                chat,
+                serde_json::json!({"model": "m", "messages": [
+                    {"role": "assistant", "content": null, "tool_calls": [
+                        {"id": "c1", "type": "function", "function": {"name": "", "arguments": "{}"}}]}]}),
+                StatusCode::BAD_REQUEST,
+            ),
+            // Refused by the engine after it accepted the task.
+            (
+                chat,
+                chat_body("__invalid_request__", serde_json::json!({})),
+                StatusCode::BAD_REQUEST,
+            ),
+            (
+                chat,
+                chat_body("__prompt_too_long__", serde_json::json!({})),
+                StatusCode::PAYLOAD_TOO_LARGE,
+            ),
+            (
+                "/v1/completions",
+                serde_json::json!({"model": "m", "prompt": "__prompt_too_long__"}),
+                StatusCode::PAYLOAD_TOO_LARGE,
+            ),
+        ];
+        for (uri, body, want) in cases {
+            let (st, text) = post_raw(&app, uri, body.clone()).await;
+            assert_eq!(st, want, "{body} -> {text}");
+            assert_eq!(
+                health_status(&app).await,
+                StatusCode::OK,
+                "{body} cleared /health"
+            );
+        }
+        // A refusal inside a stream is an invalid-request SSE error and keeps health.
+        for uri in [chat, "/v1/completions"] {
+            let body = if uri == chat {
+                chat_body("__invalid_request__", serde_json::json!({"stream": true}))
+            } else {
+                serde_json::json!({"model": "m", "prompt": "__invalid_request__", "stream": true})
+            };
+            let (st, text) = post_raw(&app, uri, body).await;
+            assert_eq!(st, StatusCode::OK);
+            assert!(text.contains("invalid_request_error"), "{text}");
+            assert_eq!(health_status(&app).await, StatusCode::OK);
+        }
+        // In-range penalties still pass.
+        let (st, _) = post_raw(
+            &app,
+            chat,
+            chat_body(
+                "hi",
+                serde_json::json!({"frequency_penalty": 2.0, "presence_penalty": -2.0}),
+            ),
+        )
+        .await;
+        assert_eq!(st, StatusCode::OK);
+    }
+
+    /// A streamed 200 says nothing yet: a stream that then fails clears
+    /// `/health`, and only one that completes sets it again.
+    #[tokio::test]
+    async fn streams_set_health_from_how_they_end() {
+        let app = make_app().await;
+        let chat = "/v1/chat/completions";
+        for (uri, fail, ok) in [
+            (
+                chat,
+                chat_body("__engine_error__", serde_json::json!({"stream": true})),
+                chat_body("hello there", serde_json::json!({"stream": true})),
+            ),
+            (
+                "/v1/completions",
+                serde_json::json!({"model": "m", "prompt": "__engine_error__", "stream": true}),
+                serde_json::json!({"model": "m", "prompt": "hello there", "stream": true}),
+            ),
+        ] {
+            let (st, text) = post_raw(&app, uri, fail.clone()).await;
+            assert_eq!(st, StatusCode::OK);
+            assert!(text.contains("engine_error"), "{text}");
+            assert_eq!(
+                health_status(&app).await,
+                StatusCode::SERVICE_UNAVAILABLE,
+                "{uri}"
+            );
+            // A second failing stream must not flip it back on its 200.
+            post_raw(&app, uri, fail).await;
+            assert_eq!(
+                health_status(&app).await,
+                StatusCode::SERVICE_UNAVAILABLE,
+                "{uri}"
+            );
+            let (st, _) = post_raw(&app, uri, ok).await;
+            assert_eq!(st, StatusCode::OK);
+            assert_eq!(health_status(&app).await, StatusCode::OK, "{uri}");
+        }
     }
 
     #[tokio::test]
@@ -7261,7 +7635,7 @@ level={{ effort_map[eff] }}";
             .unwrap();
         let app = make_router(Arc::new(runner), "queuefull-model");
         let (status, _) = post_chat(
-            app,
+            app.clone(),
             serde_json::json!({
                 "model": "queuefull-model",
                 "messages": [{"role": "user", "content": "hi"}],
@@ -7269,6 +7643,20 @@ level={{ effort_map[eff] }}";
         )
         .await;
         assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+        let health = app
+            .oneshot(
+                Request::builder()
+                    .uri("/health")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            health.status(),
+            StatusCode::OK,
+            "a capacity 503 must not latch /health"
+        );
         let capacity_after = cascadia_metrics::API_REJECTED_TOTAL
             .with_label_values(&["capacity"])
             .get();
@@ -7276,6 +7664,60 @@ level={{ effort_map[eff] }}";
             capacity_after > capacity_before,
             "QueueFull 503 must count as a capacity rejection ({capacity_before} -> {capacity_after})"
         );
+    }
+
+    /// The permit gate's 503 is what a caller gets by holding every slot, so it
+    /// must not latch `/health` (no slots here stands in for all of them held).
+    #[tokio::test]
+    async fn permit_gate_503_does_not_latch_health() {
+        let runner = Runner::new(Box::new(MockBuilder::new()));
+        runner
+            .start(
+                PeerLayout::single_stage(),
+                ShardSpec::single_stage("mock-model", "CPU"),
+            )
+            .await
+            .unwrap();
+        let cfg = Config {
+            max_concurrent_requests: 0,
+            ..Config::default()
+        };
+        let app = make_router_with_config(Arc::new(runner), "mock-model", cfg);
+        for (uri, body) in [
+            (
+                "/v1/chat/completions",
+                serde_json::json!({"model": "mock-model", "messages": [{"role": "user", "content": "hi"}]}),
+            ),
+            (
+                "/v1/completions",
+                serde_json::json!({"model": "mock-model", "prompt": "hi"}),
+            ),
+        ] {
+            let r = app
+                .clone()
+                .oneshot(
+                    Request::builder()
+                        .method("POST")
+                        .uri(uri)
+                        .header("content-type", "application/json")
+                        .body(Body::from(body.to_string()))
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(r.status(), StatusCode::SERVICE_UNAVAILABLE, "{uri}");
+            let health = app
+                .clone()
+                .oneshot(
+                    Request::builder()
+                        .uri("/health")
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(health.status(), StatusCode::OK, "{uri}");
+        }
     }
 
     /// Engine that emits a token every step and NEVER finishes. Only

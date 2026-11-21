@@ -45,6 +45,39 @@ transport encryption.
 * No mDNS authentication.
 * No supply-chain pinning beyond `Cargo.lock`.
 
+## Robot model endpoints (`ov-policy`)
+
+`cascadia run --engine ov-policy` serves `GET /v1/policy/metadata` and the
+WebSocket `/v1/policy/ws`, and with `--zenoh` Intel's physicalai protocol.
+Their replies become a robot's motor commands, and they have **no
+authentication and no TLS**, like the chat API. So:
+
+* The robot model API binds `127.0.0.1:8000` unless `--api` is given, and both
+  `--api` and `--zenoh` refuse a non-loopback host unless
+  `--policy-allow-all-interfaces` is given. The chat API still binds all
+  interfaces by default and logs a warning when it does.
+  Bound to a network address, anyone who can reach the port can drive the
+  robot; OSS single-box mode has no way to restrict who calls.
+* A WebSocket upgrade whose `Origin` is not in `--policy-allow-origin`
+  (empty by default) is refused, so a browser page cannot open the socket.
+  Clients that send no `Origin` are allowed: this is not authentication.
+* Inputs are bounded before any work: per-message size cap from the
+  model's spec, 1 KiB prompt, at most `CASCADIA_API_MAX_CONCURRENT`
+  connections, default 4 (503 beyond), checked array
+  sizes before allocation, and a missed ping closes the connection.
+* Model files: chat and robot model files are parsed and compiled by
+  OpenVINO, and a robot model's manifest decides how actions are scaled.
+  Load them only from sources you trust. For a robot model, compare the
+  metadata's `package_sha256` with the one you vetted.
+
+To serve a robot over a network, keep the server on loopback and put an
+authenticated TLS hop in front, or use `cascadia policy-bridge
+--token-file` against a gateway that checks the token. The bridge's own
+port is loopback and unauthenticated: any process on the bridge's host can
+call the remote robot model through it, with the bridge's token. Run the bridge
+only on a host you trust, such as the robot's own machine. See
+[docs/engines/ov-policy.md](docs/engines/ov-policy.md#security).
+
 ## Deploying beyond a trusted LAN
 
 Terminate TLS + auth at a reverse proxy in front of the `--api` port,

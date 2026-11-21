@@ -20,8 +20,9 @@ Frontier models don't fit on a single laptop. Cloud APIs are expensive, opaque, 
 
 - **OpenAI-compatible API**: `/v1/chat/completions` with SSE streaming; point existing clients at it unchanged
 - **Pipeline parallelism**: shard a model into stages and run each stage on a different machine, activations relayed over TCP
-- **Built-in sharder**: `cascadia shard` cuts a HuggingFace model into INT4 per-stage shards; no external tooling
-- **Seven engines**: `mock`, `ov-genai`, `ov-runtime`, `ov-dist-spec` (distributed speculative decoding), `gemma4`, a CPU-targeted `sparse-moe` engine for large mixture-of-experts models (Kimi K2.6, MiniMax-M2, GLM-5, DeepSeek-V4, Inkling), and `qwen35` for the Qwen3.5 hybrid family (Qwen3.6 MoE, dense Qwen3.8)
+- **Built-in sharder**: `cascadia shard` cuts a HuggingFace model (or a local one) into INT4 per-stage shards; no external tooling
+- **Nine engines**: `mock`, `ov-genai`, `ov-runtime`, `ov-dist-spec` (distributed speculative decoding), `gemma4`, a CPU-targeted `sparse-moe` engine for large mixture-of-experts models (Kimi K2.6, MiniMax-M2, GLM-5, DeepSeek-V4, Inkling), `qwen35` for the Qwen3.5 hybrid family (Qwen3.6 MoE, dense Qwen3.8), `sycl-llama` (GGUF through a spawned llama.cpp SYCL `llama-server`), and `ov-policy` for robot models
+- **Robot models (VLA policies)**: `cascadia run --engine ov-policy` serves an exported SmolVLA, π0.5 or other robot model over an openpi-compatible WebSocket (and Intel's physicalai protocol over Zenoh), loopback-only by default; `cascadia export-policy` exports LeRobot SmolVLA and π0.5 checkpoints. See [docs/engines/ov-policy.md](docs/engines/ov-policy.md)
 - **Single static binary per node**: Rust only at runtime; no Python on workers
 - **Zero-config peer discovery**: `cascadia discover` finds LAN peers over mDNS
 - **`cascadia doctor`**: diagnoses the one failure everyone hits: OpenVINO silently not seeing your GPU
@@ -188,7 +189,9 @@ $ cascadia engines
   ov-dist-spec   multi-stage spec decode (mask-based KV rewind); v5 shards
   gemma4         Gemma 4 multi-stage (per-layer-type attn, KV-sharing, PLI, sliding window); gemma4_cached_v1.x shards
   sparse-moe     sparse mixture-of-experts on CPU: Kimi K2.6 (AVX-512 int4 GEMM), MiniMax-M2 (OV-IR shells), GLM-5 / DeepSeek-V4 / Inkling (Rust shells + int4 mmap experts, N-rank pipeline)
+  sycl-llama     external llama.cpp SYCL server (GGUF, spawned subprocess); bin via --llama-bin / CASCADIA_LLAMA_BIN / PATH; --elastic = GGML_STREAM_WEIGHTS device-side streaming (needs a streaming build, scripts/build-llama-stream.sh)
   qwen35         Qwen3.5-family staged chain (GatedDeltaNet; 3.5/3.6 MoE or 3.8 dense); qwen3_5* IR-surgery shards (alias: qwen36-moe)
+  ov-policy      robot models (VLA policies): SmolVLA / pi0.5 / pi0 / X-VLA / EVO1 / VLA-JEPA / XR0 / XR1 / GR00T N1.7 / MolmoAct2 on GPU or CPU, openpi-compatible WebSocket; `cascadia run` only
 ```
 
 `sparse-moe` consumes a `manifest.json` + per-expert artefact tree, not `cascadia shard` output, see [docs/architectures/moe.md](docs/architectures/moe.md). In-repo exporters: `tools/export_minimax_m2.py`, `export_glm5.py`, `export_deepseek_v4.py`, `export_inkling.py` (per-family pages under `docs/architectures/`); the Kimi K2.6 artefacts come from an external pipeline that is not part of this repo. Tuning: [docs/perf/A3_TOPK_REDUCTION.md](docs/perf/A3_TOPK_REDUCTION.md), [docs/perf/CHESS_PER_CHANNEL.md](docs/perf/CHESS_PER_CHANNEL.md).
@@ -207,7 +210,7 @@ Cascadia is a Cargo workspace; one concern per crate. The `Engine` + `Builder` t
 - `cascadia-metrics/`: Prometheus metric registry shared by the API, runner, and transport
 - `cascadia-runner/`: Per-stage runner; concurrent-safe chunk streaming
 - `cascadia-engine/`: `Engine` + `Builder` traits (the plugin seam)
-- `cascadia-engine-openvino/`: Five OV engines (`ov-genai`, `ov-runtime`, `ov-dist-spec`, `gemma4`, `qwen35`)
+- `cascadia-engine-openvino/`: Five OV engines (`ov-genai`, `ov-runtime`, `ov-dist-spec`, `gemma4`, `qwen35`) and the `ov-policy` robot-policy engine
 - `cascadia-engine-sparse-moe/`: Sparse-MoE engine; routes only the top-k experts per token
 - `cascadia-int4-gemm/`: hand-rolled AVX-512 INT4 GEMM kernels for the MoE expert path
 - `cascadia-ov-genai-shim/`: C++ FFI shim wrapping `openvino-genai`

@@ -2,10 +2,9 @@
 
 use anyhow::Result;
 use cascadia_cli::Cli;
-use clap::Parser;
 
 fn main() -> Result<()> {
-    let cli = Cli::parse();
+    let cli = Cli::parse_args();
 
     // The elastic memory posture (`--elastic`) may re-execute this process with
     // an allocator interposer preloaded. That must happen BEFORE the async

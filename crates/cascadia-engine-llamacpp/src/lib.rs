@@ -1277,6 +1277,7 @@ impl LlamaCppEngine {
             // Skip response headers.
             let mut chunked = false;
             let mut status = String::new();
+            let mut content_length: Option<usize> = None;
             loop {
                 let mut line = String::new();
                 if reader.read_line(&mut line).unwrap_or(0) == 0 {
@@ -1286,17 +1287,39 @@ impl LlamaCppEngine {
                 if status.is_empty() {
                     status = line.trim().to_string();
                 }
-                if line.to_lowercase().contains("transfer-encoding:")
-                    && line.to_lowercase().contains("chunked")
-                {
+                let lower = line.to_lowercase();
+                if lower.contains("transfer-encoding:") && lower.contains("chunked") {
                     chunked = true;
+                }
+                if let Some(v) = lower.strip_prefix("content-length:") {
+                    content_length = v.trim().parse().ok();
                 }
                 if line == "\r\n" {
                     break;
                 }
             }
             if !status.contains(" 200") {
-                send(Err(EngineError::Backend(format!("server {status}"))));
+                // llama-server explains a refusal in an OpenAI error body;
+                // read it so a caller's mistake is not booked as our fault.
+                let code = status
+                    .split_whitespace()
+                    .nth(1)
+                    .and_then(|c| c.parse().ok());
+                let mut body = Vec::new();
+                if let Some(n) = content_length.filter(|&n| n <= ERROR_BODY_MAX) {
+                    body.resize(n, 0);
+                    if reader.read_exact(&mut body).is_err() {
+                        body.clear();
+                    }
+                }
+                let err = serde_json::from_slice::<serde_json::Value>(&body)
+                    .ok()
+                    .map(|v| v.get("error").cloned().unwrap_or(v));
+                send(Err(classify_server_error(
+                    code,
+                    err.as_ref(),
+                    &format!("server {status}"),
+                )));
                 return;
             }
             // Body is one byte stream of SSE `data: ...` lines, possibly
@@ -1525,6 +1548,35 @@ impl SseState {
     }
 }
 
+/// Largest llama-server error body read back; its errors are a few hundred bytes.
+const ERROR_BODY_MAX: usize = 64 * 1024;
+
+/// An llama-server error (HTTP status and/or its OpenAI error object) as the
+/// engine error the API answers with: a prompt over the context is a 413, a
+/// request it calls invalid is a 400, the rest are the server failing.
+fn classify_server_error(
+    http_code: Option<u16>,
+    err: Option<&serde_json::Value>,
+    fallback: &str,
+) -> EngineError {
+    let msg = err
+        .and_then(|e| e["message"].as_str().or_else(|| e.as_str()))
+        .unwrap_or(fallback)
+        .to_string();
+    let kind = err.and_then(|e| e["type"].as_str()).unwrap_or("");
+    let code = err
+        .and_then(|e| e["code"].as_u64())
+        .and_then(|c| u16::try_from(c).ok())
+        .or(http_code);
+    if kind == "exceed_context_size_error" {
+        EngineError::PromptTooLong(msg)
+    } else if kind == "invalid_request_error" || matches!(code, Some(400 | 413 | 422)) {
+        EngineError::InvalidConfig(msg)
+    } else {
+        EngineError::Backend(msg)
+    }
+}
+
 /// Parse one SSE `data: ...` line; returns false when the stream is
 /// terminal (`[DONE]` was handled and the final chunk emitted).
 fn handle_sse_line(
@@ -1562,12 +1614,11 @@ fn handle_sse_line(
     // letting the stream end as an ambiguous EOF. A literal `"error": null`
     // is not an error — filter it before probing for message.
     if let Some(err) = v.get("error").filter(|e| !e.is_null()) {
-        let msg = err["message"]
-            .as_str()
-            .or_else(|| err.as_str())
-            .unwrap_or("llama-server stream error")
-            .to_string();
-        send(Ok((tid.clone(), Chunk::error(tid.clone(), msg))));
+        let chunk = match classify_server_error(None, Some(err), "llama-server stream error") {
+            EngineError::Backend(msg) => Chunk::error(tid.clone(), msg),
+            refused => refused.to_chunk(tid.clone()),
+        };
+        send(Ok((tid.clone(), chunk)));
         st.sent_final = true;
         return false;
     }
@@ -1756,7 +1807,7 @@ impl Engine for LlamaCppEngine {
                     // an orphaned step() error.
                     let err_chunk = |e: EngineError, active: &Option<TaskId>| {
                         let tid = active.clone().unwrap_or_default();
-                        (tid.clone(), Chunk::error(tid, e.to_string()))
+                        (tid.clone(), e.to_chunk(tid))
                     };
                     let (tid, chunk) = item.unwrap_or_else(|e| err_chunk(e, &self.active));
                     if chunk.is_final {
@@ -1807,7 +1858,7 @@ impl Engine for LlamaCppEngine {
             }
             self.active_retry = None;
             let tid = self.active.clone().unwrap_or_default();
-            out.push((tid.clone(), Chunk::error(tid, e.to_string())));
+            out.push((tid.clone(), e.to_chunk(tid)));
             done = true;
         }
         if done {
@@ -2119,6 +2170,24 @@ mod tests {
         );
         let (_, out) = collect(r#"data: {"error":{"message":"cancelled"}}"#, &tid, &mut st);
         assert_eq!(out[0].as_ref().unwrap().1.completion_tokens, None);
+    }
+
+    /// The same refusal arriving inside a 200 stream keeps its kind.
+    #[test]
+    fn sse_error_object_keeps_its_refusal_kind() {
+        let tid = "t".to_string();
+        let mut st = SseState::default();
+        let (_, out) = collect(
+            r#"data: {"error":{"code":400,"message":"bad role","type":"invalid_request_error"}}"#,
+            &tid,
+            &mut st,
+        );
+        let c = &out[0].as_ref().unwrap().1;
+        assert_eq!(
+            c.error_kind,
+            Some(cascadia_types::ChunkErrorKind::InvalidRequest)
+        );
+        assert_eq!(c.error.as_deref(), Some("bad role"));
     }
 
     /// A literal `"error": null` is not an error object; a real one ends
@@ -2791,6 +2860,69 @@ mod unix_tests {
             "{last:?}"
         );
         server.join().unwrap();
+    }
+
+    fn final_chunk_for(status: &'static str, body: &'static str) -> Chunk {
+        let (port, server) = mock_server(move |_, s| {
+            let head = format!(
+                "HTTP/1.1 {status}\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n",
+                body.len()
+            );
+            s.write_all(head.as_bytes()).unwrap();
+            s.write_all(body.as_bytes()).unwrap();
+        });
+        let mut engine = test_engine(port);
+        engine.submit(chat_task()).unwrap();
+        let chunks = drain(&mut engine);
+        server.join().unwrap();
+        chunks.last().unwrap().1.clone()
+    }
+
+    /// A prompt over `--llama-ctx` is the caller's to shorten (413), not the
+    /// server failing.
+    #[test]
+    fn exceed_context_400_is_a_prompt_too_long_refusal() {
+        let last = final_chunk_for(
+            "400 Bad Request",
+            r#"{"error":{"code":400,"message":"request (9000 tokens) exceeds the available context size (4096 tokens), try increasing it","type":"exceed_context_size_error","n_prompt_tokens":9000,"n_ctx":4096}}"#,
+        );
+        assert_eq!(
+            last.error_kind,
+            Some(cascadia_types::ChunkErrorKind::PromptTooLong)
+        );
+        assert!(
+            last.error.as_deref().unwrap().contains("9000 tokens"),
+            "{last:?}"
+        );
+    }
+
+    #[test]
+    fn invalid_request_400_is_a_refusal() {
+        let last = final_chunk_for(
+            "400 Bad Request",
+            r#"{"error":{"code":400,"message":"Unsupported param: tools[0].type","type":"invalid_request_error"}}"#,
+        );
+        assert_eq!(
+            last.error_kind,
+            Some(cascadia_types::ChunkErrorKind::InvalidRequest)
+        );
+        assert_eq!(
+            last.error.as_deref(),
+            Some("Unsupported param: tools[0].type")
+        );
+    }
+
+    #[test]
+    fn server_error_body_stays_a_fault() {
+        let last = final_chunk_for(
+            "500 Internal Server Error",
+            r#"{"error":{"code":500,"message":"decode failed","type":"server_error"}}"#,
+        );
+        assert_eq!(last.error_kind, None);
+        assert!(
+            last.error.as_deref().unwrap().contains("decode failed"),
+            "{last:?}"
+        );
     }
 
     /// A quiet child (prefill, a long inter-token gap) must not hold the

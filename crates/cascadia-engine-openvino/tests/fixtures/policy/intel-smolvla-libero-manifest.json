@@ -1,0 +1,104 @@
+{
+  "policy": {
+    "name": "smolvla",
+    "source": {
+      "class_path": "physicalai.policies.smolvla.policy.SmolVLA"
+    }
+  },
+  "model": {
+    "runner": {
+      "class_path": "physicalai.inference.runners.single_pass.SinglePass"
+    },
+    "artifacts": {
+      "openvino": "smolvla.xml"
+    },
+    "preprocessors": [
+      {
+        "type": "smolvla_resize",
+        "image_resolution": [
+          512,
+          512
+        ]
+      },
+      {
+        "type": "new_line"
+      },
+      {
+        "type": "normalize",
+        "stats": {
+          "state": {
+            "name": "state",
+            "shape": [
+              8
+            ],
+            "type": "STATE",
+            "mean": [
+              -0.04651878401637077,
+              0.034409068524837494,
+              0.7645524740219116,
+              2.9722094535827637,
+              -0.22046978771686554,
+              -0.12557940185070038,
+              0.02691425383090973,
+              -0.027190783992409706
+            ],
+            "std": [
+              0.10494395345449448,
+              0.15176619589328766,
+              0.37851670384407043,
+              0.3442734479904175,
+              0.9069468379020691,
+              0.32539188861846924,
+              0.014175903983414173,
+              0.014058894477784634
+            ]
+          }
+        },
+        "mode": "mean_std"
+      },
+      {
+        "type": "ov_tokenizer",
+        "artifact": "tokenizer.xml"
+      }
+    ],
+    "postprocessors": [
+      {
+        "type": "denormalize",
+        "stats": {
+          "action": {
+            "name": "action",
+            "shape": [
+              7
+            ],
+            "type": "ACTION",
+            "mean": [
+              0.06278156489133835,
+              0.08684080839157104,
+              -0.09037306159734726,
+              0.0005407430580817163,
+              0.005643379874527454,
+              -0.0052290987223386765,
+              -0.0496407225728035
+            ],
+            "std": [
+              0.33552372455596924,
+              0.3784469962120056,
+              0.4447286128997803,
+              0.03924354165792465,
+              0.06339296698570251,
+              0.07797027379274368,
+              0.9987671375274658
+            ]
+          }
+        },
+        "mode": "mean_std"
+      },
+      {
+        "type": "action_chunk_trimmer",
+        "n_action_steps": 1
+      }
+    ]
+  },
+  "format": "policy_package",
+  "version": "1.0"
+}

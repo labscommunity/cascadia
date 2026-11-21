@@ -8,13 +8,20 @@ license.workspace = true
 repository.workspace = true
 description = "OpenAI-compatible HTTP server (axum). Wraps cascadia-runner with /health, /v1/models, /v1/chat/completions."
 
+[features]
+default = []
+# Intel physicalai remote-inference front end (Zenoh) for the policy server.
+zenoh = ["dep:zenoh", "dep:tokio-tungstenite", "dep:rustls"]
+
 [dependencies]
 cascadia-types = { workspace = true }
 cascadia-engine = { workspace = true }
 cascadia-metrics = { workspace = true }
 cascadia-runner = { workspace = true }
 tokio = { workspace = true }
-axum = { workspace = true }
+axum = { workspace = true, features = ["ws"] }
+hyper = { version = "1", features = ["server", "http1"] }
+hyper-util = { version = "0.1", features = ["tokio"] }
 tower = { workspace = true }
 tower-http = { workspace = true }
 serde = { workspace = true }
@@ -35,8 +42,22 @@ bytes = { workspace = true }
 # formatter, silently stripping tools from the prompt.
 minijinja = { version = "2", default-features = false, features = ["builtins", "serde", "macros", "multi_template", "json", "adjacent_loop_items"] }
 minijinja-contrib = { version = "2", default-features = false, features = ["pycompat"] }
+# JPEG frames in physicalai requests: pure Rust, no C toolchain, maintained as
+# the `image` crate's JPEG decoder.
+zune-jpeg = "0.5.15"
+# Pinned to the eclipse-zenoh release physicalai locks; TCP is the only link
+# its client opens.
+zenoh = { version = "=1.9.0", default-features = false, features = ["transport_tcp"], optional = true }
+sha2 = "0.10"
+# The policy bridge's openpi client (wss through rustls).
+tokio-tungstenite = { version = "0.24", features = ["rustls-tls-webpki-roots"], optional = true }
+# `--ca-file`: the bridge's own root store, on the ring provider the rest of
+# the tree already uses.
+rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"], optional = true }
 
 [dev-dependencies]
 tokio = { workspace = true }
 cascadia-engine-mock = { workspace = true }
 async-trait = { workspace = true }
+tokio-tungstenite = "0.24"
+tempfile = { workspace = true }

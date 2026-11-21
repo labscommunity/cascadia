@@ -1,0 +1,154 @@
+<?xml version="1.0"?>
+<net name="loop_random" version="11">
+	<layers>
+		<layer id="0" name="x" type="Parameter" version="opset1">
+			<data shape="2" element_type="f32" />
+			<output>
+				<port id="0" precision="FP32" names="x">
+					<dim>2</dim>
+				</port>
+			</output>
+		</layer>
+		<layer id="1" name="Constant_16" type="Const" version="opset1">
+			<data element_type="i64" shape="" offset="0" size="8" />
+			<output>
+				<port id="0" precision="I64" />
+			</output>
+		</layer>
+		<layer id="2" name="Constant_18" type="Const" version="opset1">
+			<data element_type="boolean" shape="" offset="8" size="1" />
+			<output>
+				<port id="0" precision="BOOL" />
+			</output>
+		</layer>
+		<layer id="3" name="Loop_19" type="Loop" version="opset5">
+			<port_map>
+				<input external_port_id="2" internal_layer_id="0" />
+				<output external_port_id="3" internal_layer_id="8" />
+				<output external_port_id="-1" internal_layer_id="7" purpose="execution_condition" />
+			</port_map>
+			<back_edges>
+				<edge from-layer="8" to-layer="0" />
+			</back_edges>
+			<input>
+				<port id="0" precision="I64" />
+				<port id="1" precision="BOOL" />
+				<port id="2" precision="FP32">
+					<dim>2</dim>
+				</port>
+			</input>
+			<output>
+				<port id="3" precision="FP32" names="Result_20">
+					<dim>2</dim>
+				</port>
+			</output>
+			<body>
+				<layers>
+					<layer id="0" name="bx" type="Parameter" version="opset1">
+						<data shape="2" element_type="f32" />
+						<output>
+							<port id="0" precision="FP32" names="bx">
+								<dim>2</dim>
+							</port>
+						</output>
+					</layer>
+					<layer id="1" name="Constant_3" type="Const" version="opset1">
+						<data element_type="i64" shape="1" offset="9" size="8" />
+						<output>
+							<port id="0" precision="I64">
+								<dim>1</dim>
+							</port>
+						</output>
+					</layer>
+					<layer id="2" name="Constant_5" type="Const" version="opset1">
+						<data element_type="f32" shape="" offset="17" size="4" />
+						<output>
+							<port id="0" precision="FP32" />
+						</output>
+					</layer>
+					<layer id="3" name="Constant_7" type="Const" version="opset1">
+						<data element_type="f32" shape="" offset="21" size="4" />
+						<output>
+							<port id="0" precision="FP32" />
+						</output>
+					</layer>
+					<layer id="4" name="RandomUniform_8" type="RandomUniform" version="opset8">
+						<data output_type="f32" op_seed="2" global_seed="1" alignment="tensorflow" />
+						<input>
+							<port id="0" precision="I64">
+								<dim>1</dim>
+							</port>
+							<port id="1" precision="FP32" />
+							<port id="2" precision="FP32" />
+						</input>
+						<output>
+							<port id="3" precision="FP32">
+								<dim>2</dim>
+							</port>
+						</output>
+					</layer>
+					<layer id="5" name="Add_9" type="Add" version="opset1">
+						<data auto_broadcast="numpy" />
+						<input>
+							<port id="0" precision="FP32">
+								<dim>2</dim>
+							</port>
+							<port id="1" precision="FP32">
+								<dim>2</dim>
+							</port>
+						</input>
+						<output>
+							<port id="2" precision="FP32" names="Result_13">
+								<dim>2</dim>
+							</port>
+						</output>
+					</layer>
+					<layer id="6" name="Constant_11" type="Const" version="opset1">
+						<data element_type="boolean" shape="" offset="8" size="1" />
+						<output>
+							<port id="0" precision="BOOL" names="Result_12" />
+						</output>
+					</layer>
+					<layer id="7" name="Result_12" type="Result" version="opset1" output_names="Result_12">
+						<input>
+							<port id="0" precision="BOOL" />
+						</input>
+					</layer>
+					<layer id="8" name="Result_13" type="Result" version="opset1" output_names="Result_13">
+						<input>
+							<port id="0" precision="FP32">
+								<dim>2</dim>
+							</port>
+						</input>
+					</layer>
+				</layers>
+				<edges>
+					<edge from-layer="0" from-port="0" to-layer="5" to-port="0" />
+					<edge from-layer="1" from-port="0" to-layer="4" to-port="0" />
+					<edge from-layer="2" from-port="0" to-layer="4" to-port="1" />
+					<edge from-layer="3" from-port="0" to-layer="4" to-port="2" />
+					<edge from-layer="4" from-port="3" to-layer="5" to-port="1" />
+					<edge from-layer="5" from-port="2" to-layer="8" to-port="0" />
+					<edge from-layer="6" from-port="0" to-layer="7" to-port="0" />
+				</edges>
+				<rt_info />
+			</body>
+		</layer>
+		<layer id="4" name="Result_20" type="Result" version="opset1" output_names="Result_20">
+			<input>
+				<port id="0" precision="FP32">
+					<dim>2</dim>
+				</port>
+			</input>
+		</layer>
+	</layers>
+	<edges>
+		<edge from-layer="0" from-port="0" to-layer="3" to-port="2" />
+		<edge from-layer="1" from-port="0" to-layer="3" to-port="0" />
+		<edge from-layer="2" from-port="0" to-layer="3" to-port="1" />
+		<edge from-layer="3" from-port="3" to-layer="4" to-port="0" />
+	</edges>
+	<rt_info>
+		<info name="OpenVINO Runtime" value="2026.4.1-22982-e213a147257-releases/2026/4" />
+	</rt_info>
+</net>

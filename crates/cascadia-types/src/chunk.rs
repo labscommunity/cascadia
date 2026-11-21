@@ -45,6 +45,16 @@ impl FinishReason {
     }
 }
 
+/// Why an engine refused a request it had already accepted; see `Chunk::error_kind`.
+#[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum ChunkErrorKind {
+    /// The request's shape or values (a 400).
+    InvalidRequest,
+    /// The prompt does not fit the context window (a 413).
+    PromptTooLong,
+}
+
 /// One token (or final marker) produced by an engine for a task.
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
 pub struct Chunk {
@@ -84,6 +94,11 @@ pub struct Chunk {
     /// loud (5xx). `None` on every normal token/final chunk.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub error: Option<String>,
+    /// Set with `error` when the request itself was refused (a caller can
+    /// cause it), so the API answers with a 4xx and leaves `/health` alone.
+    /// `None` with `error` set is an engine fault.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub error_kind: Option<ChunkErrorKind>,
     /// Why generation ended. Set on the FINAL chunk by engines that can tell
     /// `length` (hit max_tokens) from `stop` (EOS / stop sequence). `None` on
     /// non-final chunks and on engines that don't distinguish — the API then
@@ -113,6 +128,7 @@ impl Chunk {
             prompt_tokens: None,
             completion_tokens: None,
             error: None,
+            error_kind: None,
             finish_reason: None,
             token_ids: Vec::new(),
         }
@@ -135,6 +151,7 @@ impl Chunk {
             prompt_tokens: None,
             completion_tokens: None,
             error: None,
+            error_kind: None,
             finish_reason: None,
         }
     }
@@ -155,6 +172,7 @@ impl Chunk {
             prompt_tokens: None,
             completion_tokens: None,
             error: None,
+            error_kind: None,
             finish_reason: None,
             token_ids: Vec::new(),
         }
@@ -174,9 +192,21 @@ impl Chunk {
             prompt_tokens: None,
             completion_tokens: None,
             error: Some(reason.into()),
+            error_kind: None,
             finish_reason: None,
             token_ids: Vec::new(),
         }
+    }
+
+    /// A final chunk for a request the engine refused (see `error_kind`).
+    pub fn refused(
+        task_id: impl Into<TaskId>,
+        reason: impl Into<String>,
+        kind: ChunkErrorKind,
+    ) -> Self {
+        let mut c = Self::error(task_id, reason);
+        c.error_kind = Some(kind);
+        c
     }
 
     pub fn with_prompt_tokens(mut self, n: u32) -> Self {
@@ -268,6 +298,7 @@ mod tests {
             prompt_tokens: None,
             completion_tokens: None,
             error: None,
+            error_kind: None,
             finish_reason: None,
             token_ids: Vec::new(),
         };

@@ -275,6 +275,31 @@ int32_t cascadia_runtime_import_blob(
     size_t properties_count,
     cascadia_runtime_t** out_handle);
 
+/// Compile like cascadia_runtime_compile, but read the model first and
+/// record its op types for cascadia_runtime_has_op_type (the handle keeps
+/// only the compiled model). When `extension_path` is non-null, that
+/// OpenVINO extension library (e.g. openvino_tokenizers) is added to this
+/// handle's Core before the read.
+int32_t cascadia_runtime_compile_inspected(
+    const char* model_xml_path,
+    const char* device,
+    const char* extension_path,
+    const char* const* properties_kv,
+    size_t properties_count,
+    cascadia_runtime_t** out_handle);
+
+/// Bytes the GPU plugin currently holds for this handle's Core, summed over
+/// allocation types (ov::intel_gpu::memory_statistics). Fails off GPU.
+int32_t cascadia_runtime_gpu_memory_bytes(
+    cascadia_runtime_t* handle,
+    const char* device,
+    uint64_t* out_bytes);
+
+/// 1 when the model read by cascadia_runtime_compile_inspected contains an op
+/// of type `type_name` (e.g. "RandomUniform"), 0 when not, -1 on a null
+/// argument or a handle compiled another way.
+int32_t cascadia_runtime_has_op_type(cascadia_runtime_t* handle, const char* type_name);
+
 /// Serialize the last inference's per-node profiling info (requires the
 /// model to have been compiled with the PERF_COUNT=YES plugin property) as
 /// TSV lines "node_name\tnode_type\texec_type\treal_us\tcpu_us\n" into
@@ -315,14 +340,16 @@ int32_t cascadia_runtime_output_name_all(
     cascadia_runtime_t* handle, size_t idx,
     char* out_buf, size_t out_cap, size_t* out_len);
 
-/// Element type codes — keep in sync with cascadia-transport's DType.
-/// 0 = f32, 1 = f16, 2 = i8, 3 = i32, 4 = i64, 5 = bf16.
+/// Element type codes — keep 0..4 in sync with cascadia-transport's DType.
+/// 0 = f32, 1 = f16, 2 = i8, 3 = i32, 4 = i64, 5 = bf16, 6 = boolean (one
+/// byte per element, 0 or 1).
 #define CASCADIA_DTYPE_F32  0u
 #define CASCADIA_DTYPE_F16  1u
 #define CASCADIA_DTYPE_I8   2u
 #define CASCADIA_DTYPE_I32  3u
 #define CASCADIA_DTYPE_I64  4u
 #define CASCADIA_DTYPE_BF16 5u
+#define CASCADIA_DTYPE_BOOL 6u
 
 /// Bind an input tensor by name. `shape` is `rank` element counts (no
 /// padding); `data` is row-major raw bytes whose total length must equal
@@ -335,6 +362,24 @@ int32_t cascadia_runtime_set_input(
     size_t rank,
     const void* data,
     size_t data_size);
+
+/// Bind a 1-D string tensor of `count` elements by name; element i is the
+/// `lens[i]` bytes at `strs[i]` (not NUL-terminated). For tokenizer IRs.
+int32_t cascadia_runtime_set_input_strings(
+    cascadia_runtime_t* handle,
+    const char* tensor_name,
+    const char* const* strs,
+    const size_t* lens,
+    size_t count);
+
+/// Set the infer request's variable state `name` to a boolean scalar
+/// (`value` != 0 is true). `*out_found` is 1 when the state exists, 0 when it
+/// does not (then nothing changes and the call still returns 0).
+int32_t cascadia_runtime_set_state_bool(
+    cascadia_runtime_t* handle,
+    const char* name,
+    int32_t value,
+    int32_t* out_found);
 
 /// Run inference. Inputs must have been set via cascadia_runtime_set_input.
 int32_t cascadia_runtime_infer(cascadia_runtime_t* handle);
@@ -367,6 +412,17 @@ int32_t cascadia_runtime_input_shape(
 int32_t cascadia_runtime_input_dtype(
     cascadia_runtime_t* handle, size_t input_idx, uint32_t* out_dtype);
 
+/// Compiled-model facts of input (`is_output` == 0) or output port `idx`,
+/// read from the port rather than a request tensor, so they hold before any
+/// inference and for string or dynamic ports: the element type code
+/// (CASCADIA_DTYPE_*, or CASCADIA_DTYPE_OTHER for a type without one, e.g.
+/// string) and the dims, -1 where dynamic. Pass `out_dims=NULL, dims_cap=0`
+/// to learn the rank in `*out_rank`. A port of dynamic rank is an error.
+#define CASCADIA_DTYPE_OTHER 255u
+int32_t cascadia_runtime_port_info(
+    cascadia_runtime_t* handle, int32_t is_output, size_t idx,
+    uint32_t* out_dtype, int64_t* out_dims, size_t dims_cap, size_t* out_rank);
+
 /// Copy the output tensor's raw bytes into `out_buf`. `out_buf_size` must
 /// equal byte_size of the output tensor (call output_byte_size first).
 int32_t cascadia_runtime_output_byte_size(
@@ -396,6 +452,11 @@ int32_t cascadia_core_list_devices(
 int32_t cascadia_core_get_property(
     const char* device, const char* property,
     char* out_buf, size_t out_cap, size_t* out_len);
+
+/// Full path of the OpenVINO core library this process loaded (openvino.dll,
+/// libopenvino.so.*, libopenvino.*.dylib). Extensions such as
+/// openvino_tokenizers ship next to it. Pass `(NULL, 0, &len)` to size-query.
+int32_t cascadia_ov_core_library_path(char* out_buf, size_t out_cap, size_t* out_len);
 
 /// OpenVINO versions, four '\n'-separated fields:
 ///   1. GenAI version this shim was COMPILED against (from version.hpp)

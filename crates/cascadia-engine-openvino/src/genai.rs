@@ -448,7 +448,9 @@ impl Engine for OvGenaiEngine {
                 // tokens. Same class as the poisoned-head bug guarded in
                 // qwen36.rs. This is the default engine, so it was the common
                 // failure that the failure metric could not see.
-                let final_chunk = Chunk::error(task.task_id.clone(), err.to_string());
+                // map_ov_err keeps a prompt the shim refuses (an interior
+                // NUL) a 400, as add_request's `?` does on the CB pipeline.
+                let final_chunk = map_ov_err(err).to_chunk(task.task_id.clone());
                 return Ok(vec![(task.task_id, final_chunk)]);
             }
         };
@@ -1022,6 +1024,19 @@ impl OvGenaiEngine {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A prompt the shim cannot pass to C (interior NUL) fails the plain
+    /// pipeline's task as a 400 refusal, not a 503 engine fault.
+    #[test]
+    fn shim_string_refusal_is_a_refused_chunk() {
+        let c = map_ov_err(OvError::Utf8("nul byte found".into())).to_chunk("t");
+        assert_eq!(
+            c.error_kind,
+            Some(cascadia_types::ChunkErrorKind::InvalidRequest)
+        );
+        let native = map_ov_err(OvError::Native("device lost".into())).to_chunk("t");
+        assert_eq!(native.error_kind, None);
+    }
 
     use std::collections::VecDeque;
     use std::sync::{Arc, Mutex};

@@ -1,0 +1,66 @@
+# Policy fixtures
+
+Copied, unmodified:
+
+- `intel-pi05-libero-manifest.json`: `manifest.json` of Hugging Face `OpenVINO/pi05-libero-fp16-ov`.
+- `intel-smolvla-libero-manifest.json`: `manifest.json` of Hugging Face `OpenVINO/smolvla-libero-fp16-ov`.
+- `pi05-droid-placeholder-manifest.json`: our `lerobot/pi05_droid` export (physicalai-train 0.3.0),
+  whose stats are identity placeholders; the loader must refuse it.
+- `smolvla-libero-noise-manifest.json`: our export of `HuggingFaceVLA/smolvla_libero` with
+  physical-ai-studio `8f132416` and the physicalai runtime `e3dd944`, dtype float32 with fp16
+  weights. New style: `noise` is a model input (`[1, 50, 32]`) and cameras are named
+  `images.images.<name>`.
+- `pi0-libero-manifest.json`: our export of `lerobot/pi0_libero_finetuned_v044` (Intel's π0.5
+  exporter at physical-ai-studio `8f132416`, patched with LeRobot's π0 action expert), f32 with
+  fp16 weights, `noise` as an input, `policy.name` set to `pi0`.
+- `xvla-libero-manifest.json`: our export of `lerobot/xvla-libero` (LeRobot 0.7.0 modules in
+  Intel's manifest format), f32 with fp16 weights, `noise` as an input, `image2` flipped on the
+  host by `image_flip`, actions served 7 wide by `xvla_rotation_6d_to_axis_angle`.
+- `vlajepa-libero-manifest.json`: our export of `lerobot/VLA-JEPA-LIBERO` (Intel's draft VLA-JEPA
+  exporter, physical-ai-studio PR 1416), f32 with fp16 weights, the prompt padded right to 288
+  tokens for a static graph; state normalization and action denormalization are graph constants.
+- `evo1-libero-manifest.json`: our export of `zuoxingdong/evo1_libero` (LeRobot `e40b58a8` modules
+  in Intel's manifest format), f32 with fp16 weights, `noise` as an input, both cameras flipped on
+  the host, the action head's pooling FC split for the GPU at f16; `"resize": "stretch"` added to
+  its `smolvla_resize` step.
+- `xr0-libero-manifest.json`: our export of `XiaomiRobotics/Xiaomi-Robotics-0-LIBERO` (Intel's
+  exporter, physical-ai-studio `8f132416`, runtime `e3dd944`), f32 with fp16 weights, the in-graph
+  noise replaced by a `noise` input and a `noise` step after `xr0`, the denoised action masked to
+  the checkpoint's real dims (`std > 1e-5`, 7 of 32) as Xiaomi's model does, a 10-action chunk.
+- `xr1-robocasa365-manifest.json`: our export of `XiaomiRobotics/Xiaomi-Robotics-1-RoboCasa365`
+  (revision `3a6d0293`; Intel's XR0 exporter at physical-ai-studio `8f132416`, patched for XR1),
+  f32 with fp16 weights, `noise` an input. Edited after export: the `xr0` step gains `processor:
+  "xr1"`, `history: 4` and `camera_labels`, and `xr0_denormalize`'s `action_std` is the
+  checkpoint's own (1 on the 12 served dims, 0 on the padding; Intel's exporter pads it with 1,
+  which reads as placeholder stats). Served values are unchanged.
+- `gr00t-libero-spatial-manifest.json`: our export of `nvidia/GR00T-N1.7-LIBERO`
+  (`libero_spatial`, revision `65854032`) with Intel's edge-ai-suites single-IR exporter
+  (`decbb06f`, Isaac-GR00T `3df8b382`), f32 with fp16 weights, static shapes and named ports, the
+  noise an input (`actions`). Built on NVIDIA Cosmos; licensed by NVIDIA Corporation under the
+  NVIDIA Open Model License.
+- `molmoact2-libero-manifest.json`: Intel's export of `allenai/MolmoAct2-LIBERO` (revision
+  `0d24a92b`; physical-ai-studio `8f132416`, runtime `e3dd944`), f32 with fp16 weights, no noise
+  input (flow matching starts from zeros in the graph).
+
+Generated:
+
+- `gr00t-area-resize-cv2.json`: FNV-1a 64 hashes and first rows of `cv2.resize(..., INTER_AREA)`
+  (opencv-python-headless 4.11.0.86) on a fixed uint8 pattern, for upscales and one stretch along
+  a single axis; GR00T resizes its 243-pixel crop back to 256 this way.
+
+- `xvla-rotation-reference.json`: rows of LeRobot 0.7.0's X-VLA `rotate6d_to_axis_angle`
+  (`lerobot/policies/xvla/utils.py`, numpy 1.26.4) on float32 6-D rotations built from
+  axis-angles near π and below, plus a scaled non-orthogonal row, the identity and a near-identity
+  row.
+
+- `xr1-processor-32px.npz`: Xiaomi's XR1 processor (`processing_mibot.py` at `3a6d0293`,
+  transformers 4.57.1, torch 2.11.0 CPU) on seeded random 32×32 frames, 3 cameras × 4, cropped as
+  Xiaomi's RoboCasa365 client does, a 4-row state and a task; `tools/xr1_processor_fixture.py make
+  <processor files> 32 <out>`. Holds the cropped frames, the prompt text and ids, `pixel_values`
+  and the bf16 state, saved uncompressed.
+
+- `smolvla-libero-noise-reference-actions.json`: the served actions for the fixed inputs of
+  `tests/policy_openvino.rs`, from an independent numpy + OpenVINO Python pipeline (own
+  tokenizer call, image scaling, normalize, xoshiro noise and denormalize) on CPU at f32.
+
+Fixtures generated from Intel's `physicalai` runtime by `tools/vla_reference.py` land here too.

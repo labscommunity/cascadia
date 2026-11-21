@@ -1,8 +1,8 @@
 # Engine deep-dives
 
-Cascadia ships eight engines (`cascadia engines` lists them). The
-OpenVINO pipeline engines and the external llama.cpp engine are
-documented here:
+Cascadia ships nine engines (`cascadia engines` lists them). The
+OpenVINO pipeline engines, the robot-policy engine and the external
+llama.cpp engine are documented here:
 
 - [`ov-genai.md`](./ov-genai.md) — single-stage
   `openvino_genai.LLMPipeline`; FastDraft + Prompt Lookup decoding.
@@ -13,6 +13,11 @@ documented here:
 - [`sycl-llama.md`](./sycl-llama.md) — external llama.cpp SYCL engine
   (GGUF via a spawned `llama-server`); `--elastic` = device-side weight
   streaming.
+- [`ov-policy.md`](./ov-policy.md) — robot models (VLA policies): one
+  model per process, `cascadia run` only, behind the sibling
+  `PolicyEngine` trait rather than `Engine`; serves
+  `/v1/policy/metadata`, the openpi WebSocket `/v1/policy/ws` and,
+  with `--zenoh`, Intel's physicalai protocol.
 
 The remaining engines are documented with their model families under
 [`../architectures/`](../architectures/):

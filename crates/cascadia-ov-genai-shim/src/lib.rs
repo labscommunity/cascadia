@@ -221,6 +221,46 @@ mod sys {
             out_handle: *mut *mut cascadia_runtime_t,
         ) -> c_int;
 
+        pub fn cascadia_runtime_compile_inspected(
+            model_xml_path: *const c_char,
+            device: *const c_char,
+            extension_path: *const c_char,
+            properties_kv: *const *const c_char,
+            properties_count: usize,
+            out_handle: *mut *mut cascadia_runtime_t,
+        ) -> c_int;
+        pub fn cascadia_runtime_has_op_type(
+            handle: *mut cascadia_runtime_t,
+            type_name: *const c_char,
+        ) -> c_int;
+        pub fn cascadia_runtime_gpu_memory_bytes(
+            handle: *mut cascadia_runtime_t,
+            device: *const c_char,
+            out_bytes: *mut u64,
+        ) -> c_int;
+        pub fn cascadia_runtime_set_state_bool(
+            handle: *mut cascadia_runtime_t,
+            name: *const c_char,
+            value: i32,
+            out_found: *mut i32,
+        ) -> c_int;
+        pub fn cascadia_runtime_set_input_strings(
+            handle: *mut cascadia_runtime_t,
+            tensor_name: *const c_char,
+            strs: *const *const c_char,
+            lens: *const usize,
+            count: usize,
+        ) -> c_int;
+
+        pub fn cascadia_runtime_port_info(
+            handle: *mut cascadia_runtime_t,
+            is_output: i32,
+            idx: usize,
+            out_dtype: *mut u32,
+            out_dims: *mut i64,
+            dims_cap: usize,
+            out_rank: *mut usize,
+        ) -> c_int;
         pub fn cascadia_runtime_destroy(handle: *mut cascadia_runtime_t);
         pub fn cascadia_runtime_reset_state(handle: *mut cascadia_runtime_t) -> c_int;
         pub fn cascadia_runtime_profiling(
@@ -333,6 +373,12 @@ mod sys {
         ) -> c_int;
 
         pub fn cascadia_core_list_devices(
+            out_buf: *mut c_char,
+            out_cap: usize,
+            out_len: *mut usize,
+        ) -> c_int;
+
+        pub fn cascadia_ov_core_library_path(
             out_buf: *mut c_char,
             out_cap: usize,
             out_len: *mut usize,
@@ -1102,7 +1148,7 @@ impl Drop for CbHandle {
     }
 }
 
-/// dtype codes shared with cascadia-transport's `DType` enum.
+/// dtype codes; 0..=4 are shared with cascadia-transport's `DType` enum.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 #[repr(u32)]
 pub enum DType {
@@ -1112,6 +1158,8 @@ pub enum DType {
     I32 = 3,
     I64 = 4,
     Bf16 = 5,
+    /// OpenVINO `boolean`: one byte per element, 0 or 1.
+    Bool = 6,
 }
 
 impl DType {
@@ -1122,6 +1170,7 @@ impl DType {
             3 => Self::I32,
             4 => Self::I64,
             5 => Self::Bf16,
+            6 => Self::Bool,
             _ => Self::F32,
         }
     }
@@ -1129,10 +1178,21 @@ impl DType {
         match self {
             Self::F32 | Self::I32 => 4,
             Self::F16 | Self::Bf16 => 2,
-            Self::I8 => 1,
+            Self::I8 | Self::Bool => 1,
             Self::I64 => 8,
         }
     }
+}
+
+/// A compiled model's input or output port, as declared (no inference needed).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PortInfo {
+    /// Every tensor name of the port.
+    pub aliases: Vec<String>,
+    /// `None` for an element type without a [`DType`] (e.g. string).
+    pub dtype: Option<DType>,
+    /// `None` where the dim is dynamic.
+    pub dims: Vec<Option<usize>>,
 }
 
 /// Safe wrapper around the low-level OV Core/CompiledModel/InferRequest.
@@ -1181,6 +1241,148 @@ impl Runtime {
             return Err(Error::Native(last_native_error()));
         }
         Ok(Self { handle })
+    }
+
+    /// Compile like [`Runtime::compile`], reading the model first so its op
+    /// types can be queried with [`Runtime::has_op_type`]. `extension`, when
+    /// set, is an OpenVINO extension library (see
+    /// [`find_tokenizers_extension`]) added to this handle's Core first.
+    pub fn compile_inspected(
+        model_xml_path: &str,
+        device: &str,
+        extension: Option<&str>,
+        plugin: &PluginConfig,
+    ) -> Result<Self> {
+        #[cfg(not(feature = "openvino"))]
+        {
+            let _ = (model_xml_path, device, extension, plugin);
+            Err(Error::Stub)
+        }
+        #[cfg(feature = "openvino")]
+        {
+            let path_c = cstr(model_xml_path)?;
+            let device_c = cstr(device)?;
+            let ext_c = extension.map(cstr).transpose()?;
+            let mut owned: Vec<CString> = Vec::with_capacity(plugin.entries.len() * 2);
+            for (k, v) in &plugin.entries {
+                owned.push(cstr(k)?);
+                owned.push(cstr(v)?);
+            }
+            let ptrs: Vec<*const c_char> = owned.iter().map(|s| s.as_ptr()).collect();
+            let mut handle: *mut sys::cascadia_runtime_t = ptr::null_mut();
+            let rc = unsafe {
+                sys::cascadia_runtime_compile_inspected(
+                    path_c.as_ptr(),
+                    device_c.as_ptr(),
+                    ext_c.as_ref().map_or(ptr::null(), |c| c.as_ptr()),
+                    ptrs.as_ptr(),
+                    plugin.entries.len(),
+                    &mut handle,
+                )
+            };
+            if rc != 0 {
+                return Err(Error::Native(last_native_error()));
+            }
+            Ok(Self { handle })
+        }
+    }
+
+    /// GPU memory this handle's model holds now: OpenVINO's
+    /// `GPU_MEMORY_STATISTICS` for `device` on the handle's own Core, summed over
+    /// allocation types. An error off GPU or where the plugin has no such property.
+    pub fn gpu_memory_bytes(&self, device: &str) -> Result<u64> {
+        #[cfg(not(feature = "openvino"))]
+        {
+            let _ = device;
+            Err(Error::Stub)
+        }
+        #[cfg(feature = "openvino")]
+        {
+            let dev = cstr(device)?;
+            let mut out = 0u64;
+            let rc = unsafe {
+                sys::cascadia_runtime_gpu_memory_bytes(self.handle, dev.as_ptr(), &mut out)
+            };
+            if rc != 0 {
+                return Err(Error::Native(last_native_error()));
+            }
+            Ok(out)
+        }
+    }
+
+    /// Whether the model had an op of type `type_name` (e.g. `RandomUniform`)
+    /// before compiling. Only for a [`Runtime::compile_inspected`] handle.
+    pub fn has_op_type(&self, type_name: &str) -> Result<bool> {
+        #[cfg(not(feature = "openvino"))]
+        {
+            let _ = type_name;
+            Err(Error::Stub)
+        }
+        #[cfg(feature = "openvino")]
+        {
+            let ty = cstr(type_name)?;
+            match unsafe { sys::cascadia_runtime_has_op_type(self.handle, ty.as_ptr()) } {
+                1 => Ok(true),
+                0 => Ok(false),
+                _ => Err(Error::Native(last_native_error())),
+            }
+        }
+    }
+
+    /// Set the infer request's variable state `name` to a boolean scalar.
+    /// `Ok(false)` when the model has no such state (nothing changes).
+    pub fn set_state_bool(&mut self, name: &str, value: bool) -> Result<bool> {
+        #[cfg(not(feature = "openvino"))]
+        {
+            let _ = (name, value);
+            Err(Error::Stub)
+        }
+        #[cfg(feature = "openvino")]
+        {
+            let name_c = cstr(name)?;
+            let mut found: i32 = 0;
+            let rc = unsafe {
+                sys::cascadia_runtime_set_state_bool(
+                    self.handle,
+                    name_c.as_ptr(),
+                    i32::from(value),
+                    &mut found,
+                )
+            };
+            if rc != 0 {
+                return Err(Error::Native(last_native_error()));
+            }
+            Ok(found != 0)
+        }
+    }
+
+    /// Bind a 1-D string tensor (`[values.len()]`) by name, for tokenizer IRs.
+    pub fn set_input_strings(&mut self, name: &str, values: &[&str]) -> Result<()> {
+        #[cfg(not(feature = "openvino"))]
+        {
+            let _ = (name, values);
+            Err(Error::Stub)
+        }
+        #[cfg(feature = "openvino")]
+        {
+            let name_c = cstr(name)?;
+            let ptrs: Vec<*const c_char> =
+                values.iter().map(|v| v.as_ptr() as *const c_char).collect();
+            let lens: Vec<usize> = values.iter().map(|v| v.len()).collect();
+            let rc = unsafe {
+                sys::cascadia_runtime_set_input_strings(
+                    self.handle,
+                    name_c.as_ptr(),
+                    ptrs.as_ptr(),
+                    lens.as_ptr(),
+                    values.len(),
+                )
+            };
+            if rc != 0 {
+                return Err(Error::Native(last_native_error()));
+            }
+            Ok(())
+        }
     }
 
     /// Import a precompiled blob (from `ov::CompiledModel::export_model`,
@@ -1508,6 +1710,65 @@ impl Runtime {
         Ok(v)
     }
 
+    /// Input port `idx` as the compiled model declares it.
+    pub fn input_port(&self, idx: usize) -> Result<PortInfo> {
+        Ok(PortInfo {
+            aliases: self.input_aliases(idx)?,
+            ..self.port_facts(false, idx)?
+        })
+    }
+
+    /// Output port `idx` as the compiled model declares it.
+    pub fn output_port(&self, idx: usize) -> Result<PortInfo> {
+        Ok(PortInfo {
+            aliases: self.output_aliases(idx)?,
+            ..self.port_facts(true, idx)?
+        })
+    }
+
+    fn port_facts(&self, is_output: bool, idx: usize) -> Result<PortInfo> {
+        #[cfg(not(feature = "openvino"))]
+        {
+            let _ = (is_output, idx);
+            Err(Error::Stub)
+        }
+        #[cfg(feature = "openvino")]
+        unsafe {
+            let (mut code, mut rank) = (0u32, 0usize);
+            let out = i32::from(is_output);
+            let rc = sys::cascadia_runtime_port_info(
+                self.handle,
+                out,
+                idx,
+                &mut code,
+                ptr::null_mut(),
+                0,
+                &mut rank,
+            );
+            if rc != 0 {
+                return Err(Error::Native(last_native_error()));
+            }
+            let mut dims = vec![0i64; rank];
+            let rc = sys::cascadia_runtime_port_info(
+                self.handle,
+                out,
+                idx,
+                &mut code,
+                dims.as_mut_ptr(),
+                rank,
+                &mut rank,
+            );
+            if rc != 0 {
+                return Err(Error::Native(last_native_error()));
+            }
+            Ok(PortInfo {
+                aliases: Vec::new(),
+                dtype: (code != 255).then(|| DType::from_code(code)),
+                dims: dims.iter().map(|&d| usize::try_from(d).ok()).collect(),
+            })
+        }
+    }
+
     /// Bind input by name. `data` must be `product(shape) * dtype.bytes_per_element` bytes.
     pub fn set_input(
         &mut self,
@@ -1661,6 +1922,102 @@ pub fn list_devices() -> Result<Vec<String>> {
                 s.split('\n').map(str::to_owned).collect()
             }
         })
+}
+
+/// Path of the OpenVINO core library this process loaded.
+#[cfg(not(feature = "openvino"))]
+pub fn ov_core_library_path() -> Result<std::path::PathBuf> {
+    Err(Error::Stub)
+}
+
+#[cfg(feature = "openvino")]
+pub fn ov_core_library_path() -> Result<std::path::PathBuf> {
+    unsafe {
+        fetch_buffered_string(|buf, cap, len| sys::cascadia_ov_core_library_path(buf, cap, len))
+    }
+    .map(std::path::PathBuf::from)
+}
+
+/// The SDK layout one platform uses, for locating the tokenizers extension.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct SdkLayout {
+    /// File name of the `openvino_tokenizers` extension library.
+    pub extension: &'static str,
+    /// Where the SDK keeps it, relative to `INTEL_OPENVINO_DIR`.
+    pub sdk_subdir: &'static str,
+}
+
+impl SdkLayout {
+    /// Windows SDKs keep Release and Debug builds side by side; only the
+    /// Release one (`openvino_tokenizers.dll`, not `openvino_tokenizersd.dll`)
+    /// matches the Release core the binary links.
+    pub const WINDOWS: Self = Self {
+        extension: "openvino_tokenizers.dll",
+        sdk_subdir: "runtime/bin/intel64/Release",
+    };
+    pub const LINUX: Self = Self {
+        extension: "libopenvino_tokenizers.so",
+        sdk_subdir: "runtime/lib/intel64",
+    };
+    pub const MACOS_ARM64: Self = Self {
+        extension: "libopenvino_tokenizers.dylib",
+        sdk_subdir: "runtime/lib/arm64/Release",
+    };
+
+    pub fn host() -> Self {
+        if cfg!(windows) {
+            Self::WINDOWS
+        } else if cfg!(target_os = "macos") {
+            Self::MACOS_ARM64
+        } else {
+            Self::LINUX
+        }
+    }
+}
+
+/// Where to look for the tokenizers extension, in order: next to the loaded
+/// core library (an SDK's own directory, or a release bundle's), then under
+/// `INTEL_OPENVINO_DIR`.
+pub fn tokenizers_extension_candidates(
+    layout: SdkLayout,
+    core_library: Option<&std::path::Path>,
+    ov_dir: Option<&std::path::Path>,
+) -> Vec<std::path::PathBuf> {
+    let mut out = Vec::new();
+    if let Some(dir) = core_library.and_then(std::path::Path::parent) {
+        out.push(dir.join(layout.extension));
+    }
+    if let Some(root) = ov_dir {
+        let p = root.join(layout.sdk_subdir).join(layout.extension);
+        if !out.contains(&p) {
+            out.push(p);
+        }
+    }
+    out
+}
+
+/// Locate the `openvino_tokenizers` extension the loaded runtime can use,
+/// naming every path tried when none exists.
+pub fn find_tokenizers_extension() -> Result<std::path::PathBuf> {
+    let core = ov_core_library_path().ok();
+    let ov_dir = std::env::var_os("INTEL_OPENVINO_DIR")
+        .filter(|v| !v.is_empty())
+        .map(std::path::PathBuf::from);
+    let tried =
+        tokenizers_extension_candidates(SdkLayout::host(), core.as_deref(), ov_dir.as_deref());
+    if let Some(p) = tried.iter().find(|p| p.is_file()) {
+        return Ok(p.clone());
+    }
+    let list: Vec<String> = tried.iter().map(|p| p.display().to_string()).collect();
+    Err(Error::Native(format!(
+        "the OpenVINO tokenizers extension ({}) was not found; tried: {}",
+        SdkLayout::host().extension,
+        if list.is_empty() {
+            "nothing (no loaded OpenVINO core library and INTEL_OPENVINO_DIR unset)".into()
+        } else {
+            list.join(", ")
+        }
+    )))
 }
 
 /// The OpenVINO GenAI / core versions this binary was compiled against and
@@ -1975,6 +2332,13 @@ mod holdback_tests {
 mod tests {
     use super::*;
 
+    /// An interior NUL is the caller's string, reported as `Utf8` so the
+    /// engines answer it with a 400.
+    #[test]
+    fn interior_nul_is_a_utf8_error() {
+        assert!(matches!(cstr("a\0b"), Err(Error::Utf8(_))));
+    }
+
     #[cfg(not(feature = "openvino"))]
     #[test]
     fn stub_construct_returns_error() {
@@ -2110,5 +2474,89 @@ mod tests {
             )
         };
         assert_eq!(kind, 0, "partial-numeric value must fall back to string");
+    }
+}
+
+#[cfg(test)]
+mod policy_support_tests {
+    use super::*;
+    use std::path::{Path, PathBuf};
+
+    #[test]
+    fn bool_dtype_round_trips_as_one_byte() {
+        assert_eq!(DType::from_code(DType::Bool as u32), DType::Bool);
+        assert_eq!(DType::Bool as u32, 6);
+        assert_eq!(DType::Bool.bytes_per_element(), 1);
+    }
+
+    #[test]
+    fn tokenizers_extension_is_looked_up_next_to_the_core_then_in_the_sdk() {
+        let got = tokenizers_extension_candidates(
+            SdkLayout::WINDOWS,
+            Some(Path::new("C:/sdk/runtime/bin/intel64/Release/openvino.dll")),
+            Some(Path::new("C:/other")),
+        );
+        assert_eq!(
+            got,
+            vec![
+                PathBuf::from("C:/sdk/runtime/bin/intel64/Release/openvino_tokenizers.dll"),
+                PathBuf::from("C:/other/runtime/bin/intel64/Release/openvino_tokenizers.dll"),
+            ]
+        );
+        assert!(got.iter().all(|p| !p.to_string_lossy().contains("Debug")));
+        // A release bundle: the libs sit in lib/ beside the binary.
+        let got = tokenizers_extension_candidates(
+            SdkLayout::LINUX,
+            Some(Path::new("/opt/cascadia/lib/libopenvino.so.2641")),
+            None,
+        );
+        assert_eq!(
+            got,
+            vec![PathBuf::from("/opt/cascadia/lib/libopenvino_tokenizers.so")]
+        );
+        // The SDK path is not listed twice when the core lives in it.
+        let got = tokenizers_extension_candidates(
+            SdkLayout::LINUX,
+            Some(Path::new("/sdk/runtime/lib/intel64/libopenvino.so.2641")),
+            Some(Path::new("/sdk")),
+        );
+        assert_eq!(got.len(), 1);
+        assert!(tokenizers_extension_candidates(SdkLayout::LINUX, None, None).is_empty());
+    }
+
+    #[cfg(not(feature = "openvino"))]
+    #[test]
+    fn policy_entry_points_are_clean_errors_in_the_stub_build() {
+        assert!(matches!(
+            Runtime::compile_inspected("m.xml", "CPU", Some("ext"), &PluginConfig::new()),
+            Err(Error::Stub)
+        ));
+        assert!(matches!(ov_core_library_path(), Err(Error::Stub)));
+    }
+
+    #[cfg(feature = "openvino")]
+    #[test]
+    fn the_loaded_core_and_its_tokenizers_extension_are_found() {
+        // Loading a plugin list forces the core library into the process.
+        list_devices().unwrap();
+        let core = ov_core_library_path().unwrap();
+        assert!(core.is_file(), "{}", core.display());
+        let ext = find_tokenizers_extension().unwrap();
+        assert!(ext.is_file(), "{}", ext.display());
+    }
+
+    #[cfg(feature = "openvino")]
+    #[test]
+    fn op_types_include_ops_inside_a_loop_body() {
+        // tests/fixtures/loop_random.xml: RandomUniform only inside a Loop body.
+        let xml = concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/tests/fixtures/loop_random.xml"
+        );
+        let plugin = PluginConfig::new().with("INFERENCE_PRECISION_HINT", "f32");
+        let rt = Runtime::compile_inspected(xml, "CPU", None, &plugin).unwrap();
+        assert!(rt.has_op_type("Loop").unwrap());
+        assert!(rt.has_op_type("RandomUniform").unwrap());
+        assert!(!rt.has_op_type("Multiply").unwrap());
     }
 }

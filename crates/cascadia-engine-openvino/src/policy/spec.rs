@@ -1,0 +1,754 @@
+//! `PolicySpec` derivation: what the manifest settles, plus the IR facts the
+//! OpenVINO loader reads from the compiled model's ports.
+
+use cascadia_engine::{EngineError, EngineResult};
+use cascadia_types::{NoiseMode, PolicySpec, ResizeConvention, ServerResize};
+
+use super::cameras::{CameraLayout, CameraPlan};
+use super::manifest::{ImageStep, PolicyManifest, PostStep, PreStep, StatsStep, Xr0Processor};
+use super::pipeline::PREV_CHUNK_LEFT_OVER;
+
+/// Facts only the compiled model can give.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct IrFacts {
+    /// First dimension of the `images` input (VLA-JEPA: cameras in `pixel_values`).
+    pub image_slots: usize,
+    /// `[H, W]` of the `images` input, when static.
+    pub image_hw: Option<[u32; 2]>,
+    /// Length of the `state` input.
+    pub state_len: usize,
+    /// `[T, D]` of the action output, batch dimension removed.
+    pub action_shape: [usize; 2],
+    pub noise: NoiseMode,
+    /// Dims of the `noise` input after its batch of 1; `Some` exactly when the model has one.
+    pub noise_shape: Option<Vec<usize>>,
+    /// The model has the real-time chunking port group, its leftover `[1, *action_shape]`.
+    pub rtc: bool,
+}
+
+/// Facts the server decides.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ServerFacts {
+    pub model: String,
+    pub device: String,
+    pub prompt_max_bytes: usize,
+}
+
+/// The manifest's share of the spec, settled before the IR is read.
+#[derive(Clone, Debug, PartialEq)]
+pub struct ManifestSpec {
+    pub cameras: CameraPlan,
+    pub image_hw: Option<[u32; 2]>,
+    pub resize: ResizeConvention,
+    pub n_action_steps: Option<usize>,
+    /// The noise the manifest draws (`noise.shape` or `pi05`/`pi0` `noise_shape`), batch excluded.
+    pub noise_shape: Option<Vec<usize>>,
+    /// The package's own first resize, when the API runs it exactly for frames
+    /// of another size; never with an `image_flip` before it (a flip then a
+    /// padded letterbox is not a letterbox then a flip).
+    pub server_resize: Option<ServerResize>,
+    /// Observations per request (an `xr0` step's `history`), else 1.
+    pub history: usize,
+}
+
+fn refuse<T>(msg: impl std::fmt::Display) -> EngineResult<T> {
+    Err(EngineError::InvalidConfig(format!("policy spec: {msg}")))
+}
+
+impl ManifestSpec {
+    pub fn from_manifest(m: &PolicyManifest) -> EngineResult<Self> {
+        let (image_hw, resize) = match m.image_step() {
+            ImageStep::Pi05(p) => (p.image_resolution, ResizeConvention::Center),
+            ImageStep::SmolVlaResize(s) if s.stretch => {
+                (s.image_resolution, ResizeConvention::Stretch)
+            }
+            ImageStep::SmolVlaResize(s) => (s.image_resolution, ResizeConvention::TopLeft),
+            ImageStep::VlaJepa(j) => (Some(j.image_resolution), ResizeConvention::Stretch),
+            ImageStep::Xr0(x) => {
+                let [h, w] = super::xr0::geometry(m, x)?.hw;
+                (Some([h as u32, w as u32]), ResizeConvention::Stretch)
+            }
+            // Square frames only, so letterboxing them is the identity.
+            ImageStep::Gr00t(g) => {
+                let side = g.shortest_edge as u32;
+                (Some([side, side]), ResizeConvention::Center)
+            }
+            ImageStep::MolmoAct2(s) => (
+                Some(s.image_size.map(|d| d as u32)),
+                ResizeConvention::Stretch,
+            ),
+        };
+        let mut noise_shape: Option<Vec<usize>> = None;
+        for step in &m.preprocessors {
+            let shape = match step {
+                PreStep::Noise { shape, .. } => shape,
+                PreStep::Pi05(p) | PreStep::Pi0(p) => match &p.noise_shape {
+                    Some(s) => s,
+                    None => continue,
+                },
+                _ => continue,
+            };
+            match &noise_shape {
+                Some(prev) if prev != shape => {
+                    return refuse(format!("noise shapes {prev:?} and {shape:?} disagree"))
+                }
+                _ => noise_shape = Some(shape.clone()),
+            }
+        }
+        let ported = match m.image_step() {
+            // physicalai's `pi05`, LeRobot's `pi0` (openpi's `resize_with_pad`):
+            // the same bilinear letterbox.
+            ImageStep::Pi05(_) => Some(ServerResize::Letterbox),
+            ImageStep::SmolVlaResize(r) if !r.stretch => Some(ServerResize::Letterbox),
+            ImageStep::VlaJepa(_) => Some(ServerResize::Area),
+            // On x86, physicalai's OpenCV resizes these with Intel IPP, which the
+            // API does not reproduce; see `XR0_CUBIC_EXACT` there.
+            // Xiaomi's XR1 processor never resizes (`do_resize=False`).
+            ImageStep::Xr0(x) if x.processor == Xr0Processor::Xr1 => None,
+            ImageStep::Xr0(x) if cfg!(target_arch = "aarch64") => {
+                Some(ServerResize::SmartResizeCubic {
+                    factor: x.image_factor as u32,
+                    max_pixels: x.image_max_pixels as u32,
+                })
+            }
+            // EVO1's antialiased bicubic stretch, GR00T's INTER_AREA square and
+            // MolmoAct2's processor are not ported.
+            _ => None,
+        };
+        let flips = m
+            .preprocessors
+            .iter()
+            .any(|s| matches!(s, PreStep::ImageFlip { .. }));
+        Ok(Self {
+            server_resize: ported.filter(|_| !flips),
+            cameras: CameraPlan::from_manifest(m)?,
+            image_hw,
+            resize,
+            n_action_steps: m.n_action_steps(),
+            noise_shape,
+            history: match m.image_step() {
+                ImageStep::Xr0(x) => x.history,
+                _ => 1,
+            },
+        })
+    }
+}
+
+/// Combine the manifest, IR and server facts into the served spec.
+///
+/// Refuses a manifest that disagrees with the IR (resolution, slot count,
+/// stats length, noise) at load, not at the first call.
+pub fn derive_spec(
+    m: &PolicyManifest,
+    ir: &IrFacts,
+    server: ServerFacts,
+) -> EngineResult<(PolicySpec, CameraLayout)> {
+    let ms = ManifestSpec::from_manifest(m)?;
+    let layout = ms.cameras.resolve(ir.image_slots)?;
+    let [height, width] = match (ms.image_hw, ir.image_hw) {
+        (Some(a), Some(b)) if a != b => {
+            return refuse(format!(
+                "image_resolution {a:?} does not match the model's {b:?}"
+            ))
+        }
+        (Some(hw), _) | (None, Some(hw)) => hw,
+        (None, None) => return refuse("no image_resolution and a dynamic images input"),
+    };
+    for cam in m.flipped_cameras() {
+        if !layout.names.contains(cam) {
+            return refuse(format!(
+                "image_flip camera {cam:?} is not one of the package's cameras {:?}",
+                layout.names
+            ));
+        }
+    }
+    let [ir_steps, ir_dim] = ir.action_shape;
+    let check_len = |steps: &mut dyn Iterator<Item = &StatsStep>, key, want: usize| {
+        for step in steps {
+            if let Some(s) = step.stats_for(key) {
+                let len = [&s.mean, &s.std, &s.q01, &s.q99, &s.min, &s.max]
+                    .into_iter()
+                    .flatten()
+                    .map(Vec::len)
+                    .find(|&l| l != want);
+                if let Some(len) = len {
+                    return refuse(format!(
+                        "{key} stats have {len} values; the model has {want}"
+                    ));
+                }
+            }
+        }
+        Ok(())
+    };
+    // A π0.5 normalize with `pad_to` takes the robot's width and pads it to the state port's.
+    let state_len = match m.normalize().find_map(|s| s.pad_to.map(|n| (n, s))) {
+        Some((n, s)) if matches!(m.image_step(), ImageStep::Pi05(_)) => {
+            if n != ir.state_len {
+                return refuse(format!(
+                    "normalize pad_to {n} differs from the model's state length {}",
+                    ir.state_len
+                ));
+            }
+            s.stats_for("state")
+                .and_then(|f| [&f.mean, &f.q01, &f.min].into_iter().flatten().next())
+                .map_or(n, Vec::len)
+        }
+        _ => ir.state_len,
+    };
+    check_len(&mut m.normalize(), "state", state_len)?;
+    // The served width is what the postprocessors leave, not the IR's.
+    let mut dim = ir_dim;
+    let mut rows = ir_steps;
+    for step in &m.postprocessors {
+        match step {
+            PostStep::Denormalize(s) => check_len(&mut std::iter::once(s), "action", dim)?,
+            PostStep::Xr0Denormalize(s) if s.action_mean.len() != rows => {
+                return refuse(format!(
+                    "xr0_denormalize stats have {} rows; the actions have {rows}",
+                    s.action_mean.len()
+                ))
+            }
+            PostStep::ActionChunkTrimmer { n_action_steps } => rows = rows.min(*n_action_steps),
+            _ => {}
+        }
+        dim = step.out_dim(dim)?;
+    }
+    if (ir.noise == NoiseMode::Input) != ir.noise_shape.is_some() {
+        return refuse(format!(
+            "IR facts disagree: noise mode {:?} with noise shape {:?}",
+            ir.noise, ir.noise_shape
+        ));
+    }
+    match (&ms.noise_shape, &ir.noise_shape) {
+        (Some(m), None) => {
+            return refuse(format!(
+                "the manifest draws noise {m:?}, but the model has no noise input"
+            ))
+        }
+        (None, Some(i)) => {
+            return refuse(format!(
+                "the model takes noise {i:?}, but the manifest draws none"
+            ))
+        }
+        (Some(m), Some(i)) if m != i => {
+            return refuse(format!(
+                "the manifest's noise shape {m:?} does not match the model's {i:?}"
+            ))
+        }
+        _ => {}
+    }
+    // The trimmer only shortens (action_chunk_trimmer.py: `shape[1] > n`).
+    let steps = ms.n_action_steps.map_or(ir_steps, |n| n.min(ir_steps));
+    let rtc_chunk_size = if ir.rtc {
+        // The client resends what it has not executed of the chunk it was
+        // served, so the served chunk must be the model's, row for row.
+        if [steps, dim] != ir.action_shape {
+            return refuse(format!(
+                "an RTC package must serve the whole chunk; it serves [{steps}, {dim}] of \
+                 the model's {:?}",
+                ir.action_shape
+            ));
+        }
+        if let Some(Err(e)) = m.normalize().find_map(|s| s.rtc_leftover.as_ref()) {
+            return refuse(format!("prev_chunk_left_over stats: {e}"));
+        }
+        if !m
+            .normalize()
+            .any(|s| s.stats_for(PREV_CHUNK_LEFT_OVER).is_some())
+        {
+            return refuse(
+                "the model takes RTC inputs, but the manifest has no normalize stats for \
+                 prev_chunk_left_over",
+            );
+        }
+        check_len(&mut m.normalize(), PREV_CHUNK_LEFT_OVER, ir_dim)?;
+        Some(ir_steps)
+    } else {
+        None
+    };
+    let spec = PolicySpec {
+        model: server.model,
+        device: server.device,
+        cameras: layout.names.clone(),
+        height,
+        width,
+        state_len,
+        chunk: [steps, dim],
+        noise: ir.noise,
+        noise_shape: ir.noise_shape.clone(),
+        resize: ms.resize,
+        prompt_max_bytes: server.prompt_max_bytes,
+        attribution: m.attribution.clone(),
+        manifest_sha256: String::new(),
+        precision: String::new(),
+        package_sha256: String::new(),
+        server_resize: ms.server_resize,
+        rtc_chunk_size,
+        history: ms.history,
+    };
+    if let Err(EngineError::InvalidConfig(m)) = cascadia_engine::payload_cap(&spec) {
+        return refuse(m);
+    }
+    Ok((spec, layout))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::policy::manifest::LoadOptions;
+
+    const PI05_LIBERO: &str =
+        include_str!("../../tests/fixtures/policy/intel-pi05-libero-manifest.json");
+    const SMOLVLA_LIBERO: &str =
+        include_str!("../../tests/fixtures/policy/intel-smolvla-libero-manifest.json");
+    const SMOLVLA_NOISE: &str =
+        include_str!("../../tests/fixtures/policy/smolvla-libero-noise-manifest.json");
+
+    const PI0_LIBERO: &str = include_str!("../../tests/fixtures/policy/pi0-libero-manifest.json");
+    const XVLA_LIBERO: &str = include_str!("../../tests/fixtures/policy/xvla-libero-manifest.json");
+
+    /// The real IR ports of our xvla-libero export.
+    fn xvla_ir() -> IrFacts {
+        IrFacts {
+            image_slots: 2,
+            image_hw: Some([224, 224]),
+            state_len: 8,
+            action_shape: [30, 20],
+            noise: NoiseMode::Input,
+            noise_shape: Some(vec![30, 20]),
+            rtc: false,
+        }
+    }
+
+    /// Which packages' own first resize the server runs, never after an `image_flip`.
+    #[test]
+    fn only_ported_letterboxes_are_resized_on_the_server() {
+        let letterbox = Some(ServerResize::Letterbox);
+        let cases = [
+            ("intel-pi05-libero-manifest.json", letterbox),
+            ("intel-smolvla-libero-manifest.json", letterbox),
+            ("smolvla-libero-noise-manifest.json", letterbox),
+            ("pi0-libero-manifest.json", letterbox),
+            ("vlajepa-libero-manifest.json", Some(ServerResize::Area)),
+            (
+                "xr0-libero-manifest.json",
+                Some(ServerResize::SmartResizeCubic {
+                    factor: 32,
+                    max_pixels: 90000,
+                })
+                .filter(|_| cfg!(target_arch = "aarch64")),
+            ),
+            ("xvla-libero-manifest.json", None),
+            ("evo1-libero-manifest.json", None),
+            ("gr00t-libero-spatial-manifest.json", None),
+            ("molmoact2-libero-manifest.json", None),
+        ];
+        let opts = LoadOptions {
+            allow_identity_stats: true,
+        };
+        for (file, want) in cases {
+            let path = format!(
+                "{}/tests/fixtures/policy/{file}",
+                env!("CARGO_MANIFEST_DIR")
+            );
+            let m = PolicyManifest::parse(&std::fs::read_to_string(&path).unwrap(), opts)
+                .unwrap_or_else(|e| panic!("{file}: {e}"));
+            let ms = ManifestSpec::from_manifest(&m).unwrap_or_else(|e| panic!("{file}: {e}"));
+            assert_eq!(ms.server_resize, want, "{file}");
+        }
+    }
+
+    fn server() -> ServerFacts {
+        ServerFacts {
+            model: "pkg".into(),
+            device: "GPU".into(),
+            prompt_max_bytes: 1024,
+        }
+    }
+
+    fn pi05() -> PolicyManifest {
+        PolicyManifest::parse(PI05_LIBERO, LoadOptions::default()).unwrap()
+    }
+
+    fn pi05_ir() -> IrFacts {
+        IrFacts {
+            image_slots: 3,
+            image_hw: Some([224, 224]),
+            state_len: 8,
+            action_shape: [50, 7],
+            noise: NoiseMode::InGraphRandom,
+            noise_shape: None,
+            rtc: false,
+        }
+    }
+
+    #[test]
+    fn intel_pi05_libero_spec() {
+        let (spec, layout) = derive_spec(&pi05(), &pi05_ir(), server()).unwrap();
+        assert_eq!(spec.cameras, vec!["image", "image2"]);
+        assert_eq!((spec.height, spec.width), (224, 224));
+        assert_eq!(spec.state_len, 8);
+        assert_eq!(spec.chunk, [10, 7]);
+        assert_eq!(spec.noise, NoiseMode::InGraphRandom);
+        assert_eq!(spec.resize, ResizeConvention::Center);
+        assert_eq!((spec.model.as_str(), spec.device.as_str()), ("pkg", "GPU"));
+        assert_eq!(layout.slots, vec![Some(0), Some(1), None]);
+    }
+
+    #[test]
+    fn pi0_libero_spec() {
+        let m = PolicyManifest::parse(PI0_LIBERO, LoadOptions::default()).unwrap();
+        let ir = IrFacts {
+            noise: NoiseMode::Input,
+            noise_shape: Some(vec![50, 32]),
+            ..pi05_ir()
+        };
+        let (spec, layout) = derive_spec(&m, &ir, server()).unwrap();
+        assert_eq!(spec.cameras, vec!["image", "image2"]);
+        assert_eq!(layout.slots, vec![Some(0), Some(1), None]);
+        assert_eq!((spec.height, spec.width), (224, 224));
+        assert_eq!(spec.chunk, [50, 7]);
+        assert_eq!(spec.resize, ResizeConvention::Center);
+        assert_eq!(spec.noise_shape, Some(vec![50, 32]));
+    }
+
+    #[test]
+    fn xvla_spec_serves_the_rotation_steps_width() {
+        let m = PolicyManifest::parse(XVLA_LIBERO, LoadOptions::default()).unwrap();
+        let (spec, layout) = derive_spec(&m, &xvla_ir(), server()).unwrap();
+        assert_eq!(spec.cameras, vec!["image", "image2"]);
+        assert_eq!(layout.slots, vec![Some(0), Some(1)]);
+        assert_eq!(spec.resize, ResizeConvention::TopLeft);
+        assert_eq!(spec.chunk, [30, 7], "the IR's 20-wide ee6d becomes 7");
+        assert_eq!(spec.noise_shape, Some(vec![30, 20]));
+        // The metadata JSON carries the same width.
+        let v = serde_json::to_value(&spec).unwrap();
+        assert_eq!(v["chunk"], serde_json::json!([30, 7]));
+
+        let mut narrow = xvla_ir();
+        narrow.action_shape = [30, 9];
+        narrow.noise_shape = Some(vec![30, 9]);
+        let mut v: serde_json::Value = serde_json::from_str(XVLA_LIBERO).unwrap();
+        v["model"]["preprocessors"][2]["shape"] = serde_json::json!([30, 9]);
+        let m9 = PolicyManifest::parse(&v.to_string(), LoadOptions::default()).unwrap();
+        let e = derive_spec(&m9, &narrow, server()).unwrap_err().to_string();
+        assert!(e.contains("at least 10 wide; they are 9"), "{e}");
+    }
+
+    #[test]
+    fn xr0_spec_serves_seven_of_the_graphs_thirty_two() {
+        const XR0: &str = include_str!("../../tests/fixtures/policy/xr0-libero-manifest.json");
+        let m = PolicyManifest::parse(XR0, LoadOptions::default()).unwrap();
+        let ir = IrFacts {
+            image_slots: 2,
+            image_hw: None,
+            state_len: 8,
+            action_shape: [10, 32],
+            noise: NoiseMode::Input,
+            noise_shape: Some(vec![10, 32]),
+            rtc: false,
+        };
+        let (spec, layout) = derive_spec(&m, &ir, server()).unwrap();
+        assert_eq!(spec.cameras, vec!["base", "wrist_left"]);
+        assert_eq!(layout.slots, vec![Some(0), Some(1)]);
+        assert_eq!((spec.height, spec.width), (256, 256));
+        assert_eq!(spec.resize, ResizeConvention::Stretch);
+        assert_eq!((spec.state_len, spec.chunk), (8, [10, 7]));
+        // The stats must match the graph's output shape.
+        let short = IrFacts {
+            action_shape: [30, 32],
+            noise_shape: Some(vec![30, 32]),
+            ..ir.clone()
+        };
+        let e = derive_spec(&m, &short, server()).unwrap_err().to_string();
+        assert!(e.contains("10 rows; the actions have 30"), "{e}");
+        let narrow = IrFacts {
+            action_shape: [10, 16],
+            noise_shape: Some(vec![10, 16]),
+            ..ir
+        };
+        let e = derive_spec(&m, &narrow, server()).unwrap_err().to_string();
+        assert!(e.contains("stats are 32 wide; the actions are 16"), "{e}");
+    }
+
+    #[test]
+    fn evo1_spec_is_a_stretch_with_a_binarized_gripper() {
+        const EVO1: &str = include_str!("../../tests/fixtures/policy/evo1-libero-manifest.json");
+        let m = PolicyManifest::parse(EVO1, LoadOptions::default()).unwrap();
+        let ir = IrFacts {
+            image_slots: 2,
+            image_hw: Some([448, 448]),
+            state_len: 8,
+            action_shape: [50, 7],
+            noise: NoiseMode::Input,
+            noise_shape: Some(vec![50, 7]),
+            rtc: false,
+        };
+        let (spec, _) = derive_spec(&m, &ir, server()).unwrap();
+        assert_eq!(spec.cameras, vec!["image", "image2"]);
+        assert_eq!((spec.height, spec.width), (448, 448));
+        assert_eq!(spec.resize, ResizeConvention::Stretch);
+        assert_eq!(spec.chunk, [14, 7]);
+        // The gripper index is checked against the width at its step, at load.
+        let mut v: serde_json::Value = serde_json::from_str(EVO1).unwrap();
+        v["model"]["postprocessors"][2]["index"] = serde_json::json!(7);
+        let m = PolicyManifest::parse(&v.to_string(), LoadOptions::default()).unwrap();
+        let e = derive_spec(&m, &ir, server()).unwrap_err().to_string();
+        assert!(e.contains("index 7 is outside actions 7 wide"), "{e}");
+    }
+
+    #[test]
+    fn vlajepa_spec_is_a_plain_stretch_at_the_image_resolution() {
+        const VLAJEPA: &str =
+            include_str!("../../tests/fixtures/policy/vlajepa-libero-manifest.json");
+        let m = PolicyManifest::parse(VLAJEPA, LoadOptions::default()).unwrap();
+        let ir = IrFacts {
+            image_slots: 2,
+            image_hw: None,
+            state_len: 8,
+            action_shape: [7, 7],
+            noise: NoiseMode::Input,
+            noise_shape: Some(vec![7, 7]),
+            rtc: false,
+        };
+        let (spec, layout) = derive_spec(&m, &ir, server()).unwrap();
+        assert_eq!(spec.cameras, vec!["image", "image2"]);
+        assert_eq!(layout.slots, vec![Some(0), Some(1)]);
+        assert_eq!((spec.height, spec.width), (224, 224));
+        assert_eq!(spec.resize, ResizeConvention::Stretch);
+        assert_eq!(spec.chunk, [7, 7]);
+        assert_eq!(spec.noise_shape, Some(vec![7, 7]));
+        let v = serde_json::to_value(&spec).unwrap();
+        assert_eq!(v["resize"], "stretch");
+        // pixel_values holding a different number of cameras than image_keys.
+        let three = IrFacts {
+            image_slots: 3,
+            ..ir
+        };
+        assert!(derive_spec(&m, &three, server()).is_err());
+    }
+
+    #[test]
+    fn image_flip_names_must_be_cameras_of_the_package() {
+        let mut v: serde_json::Value = serde_json::from_str(XVLA_LIBERO).unwrap();
+        v["model"]["preprocessors"][0]["cameras"] = serde_json::json!(["wrist"]);
+        let m = PolicyManifest::parse(&v.to_string(), LoadOptions::default()).unwrap();
+        let e = derive_spec(&m, &xvla_ir(), server())
+            .unwrap_err()
+            .to_string();
+        assert!(
+            e.contains(
+                "image_flip camera \"wrist\" is not one of the package's cameras [\"image\", \"image2\"]"
+            ),
+            "{e}"
+        );
+        // The feature key is not the advertised name.
+        v["model"]["preprocessors"][0]["cameras"] = serde_json::json!(["images.image2"]);
+        let m = PolicyManifest::parse(&v.to_string(), LoadOptions::default()).unwrap();
+        assert!(derive_spec(&m, &xvla_ir(), server()).is_err());
+    }
+
+    #[test]
+    fn denormalize_stats_are_checked_against_the_width_at_that_step() {
+        let with_post = |post: serde_json::Value| {
+            let mut v: serde_json::Value = serde_json::from_str(XVLA_LIBERO).unwrap();
+            v["model"]["postprocessors"] = post;
+            PolicyManifest::parse(&v.to_string(), LoadOptions::default()).unwrap()
+        };
+        let denorm = |n: usize| {
+            serde_json::json!({"type": "denormalize", "mode": "mean_std",
+                "stats": {"action": {"mean": vec![0.5; n], "std": vec![2.0; n]}}})
+        };
+        let rot = serde_json::json!({"type": "xvla_rotation_6d_to_axis_angle"});
+        let spec = |post| derive_spec(&with_post(post), &xvla_ir(), server());
+        // Before the rotation the actions are 20 wide, after it 7.
+        spec(serde_json::json!([denorm(20), rot])).unwrap();
+        spec(serde_json::json!([rot, denorm(7)])).unwrap();
+        let e = spec(serde_json::json!([rot, denorm(20)]))
+            .unwrap_err()
+            .to_string();
+        assert!(
+            e.contains("action stats have 20 values; the model has 7"),
+            "{e}"
+        );
+    }
+
+    #[test]
+    fn intel_smolvla_libero_spec() {
+        let m = PolicyManifest::parse(SMOLVLA_LIBERO, LoadOptions::default()).unwrap();
+        let ir = IrFacts {
+            image_slots: 2,
+            image_hw: Some([512, 512]),
+            state_len: 8,
+            action_shape: [50, 7],
+            noise: NoiseMode::Constant,
+            noise_shape: None,
+            rtc: false,
+        };
+        let (spec, _) = derive_spec(&m, &ir, server()).unwrap();
+        assert_eq!(spec.cameras, vec!["camera_0", "camera_1"]);
+        assert_eq!(spec.chunk, [1, 7]);
+        assert_eq!(spec.resize, ResizeConvention::TopLeft);
+    }
+
+    /// The real IR ports of our smolvla_libero export (noise is `[1, 50, 32]`).
+    fn smolvla_noise_ir() -> IrFacts {
+        IrFacts {
+            image_slots: 2,
+            image_hw: Some([512, 512]),
+            state_len: 8,
+            action_shape: [50, 7],
+            noise: NoiseMode::Input,
+            noise_shape: Some(vec![50, 32]),
+            rtc: false,
+        }
+    }
+
+    fn smolvla_noise() -> PolicyManifest {
+        PolicyManifest::parse(SMOLVLA_NOISE, LoadOptions::default()).unwrap()
+    }
+
+    #[test]
+    fn new_style_smolvla_spec() {
+        let (spec, layout) = derive_spec(&smolvla_noise(), &smolvla_noise_ir(), server()).unwrap();
+        assert_eq!(spec.cameras, vec!["image", "image2"]);
+        assert_eq!(layout.slots, vec![Some(0), Some(1)]);
+        assert_eq!((spec.height, spec.width), (512, 512));
+        assert_eq!(spec.chunk, [1, 7]);
+        assert_eq!(spec.noise, NoiseMode::Input);
+        assert_eq!(spec.noise_shape, Some(vec![50, 32]));
+        assert_eq!(spec.resize, ResizeConvention::TopLeft);
+    }
+
+    #[test]
+    fn noise_disagreements_are_refused() {
+        let e = |m: &PolicyManifest, ir: &IrFacts| {
+            derive_spec(m, ir, server()).unwrap_err().to_string()
+        };
+        // A noise step over a model without a noise input.
+        let mut ir = smolvla_noise_ir();
+        ir.noise = NoiseMode::Constant;
+        ir.noise_shape = None;
+        assert!(e(&smolvla_noise(), &ir).contains("no noise input"));
+        // A model noise input with no noise in the manifest.
+        let mut ir = pi05_ir();
+        ir.noise = NoiseMode::Input;
+        ir.noise_shape = Some(vec![50, 32]);
+        assert!(e(&pi05(), &ir).contains("the manifest draws none"));
+        // The manifest's noise.shape disagrees with the port.
+        let mut ir = smolvla_noise_ir();
+        ir.noise_shape = Some(vec![50, 16]);
+        assert!(e(&smolvla_noise(), &ir).contains("does not match the model's [50, 16]"));
+        // IR facts that contradict themselves.
+        let mut ir = smolvla_noise_ir();
+        ir.noise = NoiseMode::InGraphRandom;
+        assert!(e(&smolvla_noise(), &ir).contains("IR facts disagree"));
+        // pi05.noise_shape: matched, mismatched, and disagreeing with a noise step.
+        let with_shape = |extra: Option<serde_json::Value>| {
+            let mut v: serde_json::Value = serde_json::from_str(PI05_LIBERO).unwrap();
+            v["model"]["preprocessors"][1]["noise_shape"] = serde_json::json!([50, 32]);
+            if let Some(step) = extra {
+                v["model"]["preprocessors"]
+                    .as_array_mut()
+                    .unwrap()
+                    .insert(2, step);
+            }
+            PolicyManifest::parse(&v.to_string(), LoadOptions::default()).unwrap()
+        };
+        let mut ir = pi05_ir();
+        ir.noise = NoiseMode::Input;
+        ir.noise_shape = Some(vec![50, 32]);
+        let spec = derive_spec(&with_shape(None), &ir, server()).unwrap().0;
+        assert_eq!(spec.noise_shape, Some(vec![50, 32]));
+        ir.noise_shape = Some(vec![10, 32]);
+        assert!(e(&with_shape(None), &ir).contains("does not match"));
+        let mut no_noise = pi05_ir();
+        no_noise.noise = NoiseMode::Constant;
+        assert!(e(&with_shape(None), &no_noise).contains("no noise input"));
+        let both = with_shape(Some(
+            serde_json::json!({"type": "noise", "shape": [50, 16]}),
+        ));
+        assert!(e(&both, &ir).contains("disagree"));
+    }
+
+    #[test]
+    fn pi05_pad_to_serves_the_robot_width() {
+        let mut v: serde_json::Value = serde_json::from_str(PI05_LIBERO).unwrap();
+        v["model"]["preprocessors"][0]["pad_to"] = serde_json::json!(32);
+        let m = PolicyManifest::parse(&v.to_string(), LoadOptions::default()).unwrap();
+        let mut ir = pi05_ir();
+        ir.state_len = 32;
+        let (spec, _) = derive_spec(&m, &ir, server()).unwrap();
+        assert_eq!(spec.state_len, 8);
+        ir.state_len = 16;
+        let e = derive_spec(&m, &ir, server()).unwrap_err().to_string();
+        assert!(
+            e.contains("pad_to 32 differs from the model's state length 16"),
+            "{e}"
+        );
+        // Other kinds may not pad.
+        let mut v: serde_json::Value = serde_json::from_str(PI0_LIBERO).unwrap();
+        v["model"]["preprocessors"][0]["pad_to"] = serde_json::json!(32);
+        let e = PolicyManifest::parse(&v.to_string(), LoadOptions::default())
+            .unwrap_err()
+            .to_string();
+        assert!(e.contains("pad_to needs policy.name"), "{e}");
+    }
+
+    #[test]
+    fn ir_disagreements_are_refused() {
+        let mut ir = pi05_ir();
+        ir.image_hw = Some([256, 256]);
+        let e = derive_spec(&pi05(), &ir, server()).unwrap_err().to_string();
+        assert!(e.contains("does not match"), "{e}");
+        let mut ir = pi05_ir();
+        ir.state_len = 32;
+        let e = derive_spec(&pi05(), &ir, server()).unwrap_err().to_string();
+        assert!(
+            e.contains("state stats have 8 values; the model has 32"),
+            "{e}"
+        );
+        let mut ir = pi05_ir();
+        ir.action_shape = [50, 32];
+        let e = derive_spec(&pi05(), &ir, server()).unwrap_err().to_string();
+        assert!(e.contains("action stats have 7"), "{e}");
+        let mut ir = pi05_ir();
+        ir.image_slots = 2;
+        assert!(derive_spec(&pi05(), &ir, server()).is_err());
+    }
+
+    #[test]
+    fn a_package_over_the_websocket_limit_is_refused() {
+        let mut v: serde_json::Value = serde_json::from_str(PI05_LIBERO).unwrap();
+        let step = v["model"]["preprocessors"][1].as_object_mut().unwrap();
+        step.remove("image_resolution");
+        let m = PolicyManifest::parse(&v.to_string(), LoadOptions::default()).unwrap();
+        let mut ir = pi05_ir();
+        // Two 1500x1500 frames are 12.9 MiB.
+        ir.image_hw = Some([1500, 1500]);
+        let e = derive_spec(&m, &ir, server()).unwrap_err().to_string();
+        assert!(e.contains("WebSocket limit"), "{e}");
+    }
+
+    #[test]
+    fn ir_fills_what_the_manifest_leaves_open() {
+        let mut ir = pi05_ir();
+        ir.image_hw = None;
+        assert_eq!(derive_spec(&pi05(), &ir, server()).unwrap().0.height, 224);
+        // A trimmer longer than the model's chunk keeps the model's chunk.
+        let mut ir = pi05_ir();
+        ir.action_shape = [4, 7];
+        assert_eq!(derive_spec(&pi05(), &ir, server()).unwrap().0.chunk, [4, 7]);
+        let mut v: serde_json::Value = serde_json::from_str(PI05_LIBERO).unwrap();
+        let step = v["model"]["preprocessors"][1].as_object_mut().unwrap();
+        assert_eq!(step["type"], "pi05");
+        step.remove("image_resolution");
+        let m = PolicyManifest::parse(&v.to_string(), LoadOptions::default()).unwrap();
+        let mut ir = pi05_ir();
+        ir.image_hw = Some([256, 192]);
+        let spec = derive_spec(&m, &ir, server()).unwrap().0;
+        assert_eq!((spec.height, spec.width), (256, 192));
+        ir.image_hw = None;
+        assert!(derive_spec(&m, &ir, server()).is_err());
+    }
+}

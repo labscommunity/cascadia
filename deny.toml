@@ -8,14 +8,35 @@
 # real security gate: a NEW vulnerability, unsound, or unmaintained advisory
 # turns CI red and forces a review.
 #
-# The list below is the *accepted baseline* — advisories present as of
-# 2026-07-02 whose fix is not a compatible-version bump away. Each is `unsound`
-# or `unmaintained` (there are no open `vulnerability`-class advisories). Each
-# entry states its actual blocker; remove the entry when the blocker clears.
+# The list below is the *accepted baseline* — advisories whose fix is not a
+# compatible-version bump away. Each entry states its actual blocker; remove the
+# entry when the blocker clears. CI checks with `--all-features`, so the
+# optional `zenoh` tree (cascadia-api/cascadia-cli `--features zenoh`) counts.
 ignore = [
     "RUSTSEC-2025-0119", # number_prefix 0.4.0 (unmaintained) — transitive via indicatif → hf-hub → cascadia-download; no safe upgrade.
     "RUSTSEC-2024-0436", # paste 1.0.15 (unmaintained) — transitive via tokenizers; no safe upgrade.
     "RUSTSEC-2025-0141", # bincode 2.0.1 (unmaintained) — direct dep of cascadia-kv-wire for KV snapshot codec; team ceased development but considers 2.x complete/stable, no vulnerability. Keep until a maintained equivalent is vetted.
+    # lz4_flex 0.10.0 (vulnerability: block decompression of invalid data can leak memory) via zenoh-transport 1.9.0, `zenoh` feature only.
+    # Blocked by `zenoh = "=1.9.0"`, the release physicalai's client pins (`eclipse-zenoh==1.9.0`); zenoh-transport 1.10.2, the newest 1.x, still requires lz4_flex ^0.10.
+    # Not reachable: lz4_flex's only decompress call (`decompress_into` in zenoh-transport's batch.rs) is compiled only with zenoh-transport's
+    # `transport_compression` feature, which our tree does not enable (`cargo tree -e features -i zenoh-transport` shows only `transport_tcp`).
+    # Revisit when physicalai moves off zenoh 1.9.0 or a zenoh release takes lz4_flex >= 0.11.6, or if `transport_compression` is ever enabled.
+    "RUSTSEC-2026-0041",
+    # unsafe-libyaml 0.2.11 (unmaintained) via serde_yaml → zenoh-config 1.9.0, `zenoh` feature only; zenoh-config 1.10.2 still requires serde_yaml.
+    # Not reachable: zenoh-config parses YAML only when loading a `.yaml` config file; our sessions start from `Config::default()` plus
+    # `insert_json5` keys (cascadia-api policy/zenoh_server.rs `secure_config`) and never read a config file or ZENOH_CONFIG.
+    # Revisit on the zenoh bump above.
+    "RUSTSEC-2024-0449",
+    # humantime 2.4.0 (unmaintained, no vulnerability) via uhlc 0.8.2 and zenoh-util 1.9.0, `zenoh` feature only; both require it
+    # unconditionally (`humantime ^2.2` / `^2.3`) and every humantime release is covered, so no bump clears it under `zenoh = "=1.9.0"`.
+    # Low exposure: it only formats and parses RFC 3339 timestamps inside zenoh (uhlc NTP64 Display/FromStr, zenoh-util time ranges);
+    # our code never hands it a time string. Revisit on the zenoh bump above, or when uhlc/zenoh-util drop humantime.
+    "RUSTSEC-2026-0542",
+    # chrono 0.4.44 (unmaintained, no vulnerability; every release covered, so no upgrade) — direct dep, also on main.
+    # Used only for wall-clock reads: `Utc::now().timestamp()` (cascadia-api response `created`, cascadia-download `pulled_at`)
+    # and `Utc::now().format(..)` in the chat-template `strftime_now` (cascadia-api); nothing parses untrusted input with it.
+    # cascadia-topology declares it but does not use it. Revisit by moving these call sites to jiff (already in the tree) or std time.
+    "RUSTSEC-2026-0543",
 ]
 # Never ship a version that has been yanked from the registry.
 yanked = "deny"

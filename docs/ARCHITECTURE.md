@@ -4,14 +4,16 @@ Cascadia is a Cargo workspace at the repo root. Each crate has a single responsi
 
 ## Design decisions
 
-- **Engine plurality: OpenVINO-first, pluggable.** The `Engine` + `Builder` traits live in `cascadia-engine`; seven engines ship behind them (`mock`, `ov-genai`, `ov-runtime`, `ov-dist-spec`, `gemma4`, `sparse-moe`, `qwen35`). Future engines (IPEX, OneAPI direct) plug behind the same trait.
+- **Engine plurality: OpenVINO-first, pluggable.** The `Engine` + `Builder` traits live in `cascadia-engine`; seven engines ship behind them (`mock`, `ov-genai`, `ov-runtime`, `ov-dist-spec`, `gemma4`, `sparse-moe`, `qwen35`). Future engines (IPEX, OneAPI direct) plug behind the same trait. Robot models (`ov-policy`) take tensors in and one action chunk out rather than streaming tokens, so they sit behind a sibling `PolicyEngine` trait with their own serve path, and `Engine` is untouched.
 - **Discovery: zero-config peer-to-peer.** Workers find each other over mDNS; no central control plane.
 - **Topology stores measured latency + bandwidth.** Latency is the dominant placement signal on Intel fleets — a 50 ms WAN hop drops throughput 65% — so Cascadia's topology graph stores per-link measurements, not just edge types.
-- **Rust-only workers.** One static binary per node; no runtime Python dependency, no pip install on workers. Python is only needed at export time (`cascadia shard`).
+- **Rust-only workers.** One static binary per node; no runtime Python dependency, no pip install on workers. Python is only needed at export time (`cascadia shard`, and `cascadia export-policy` in a uv environment of its own).
 
 ## `cascadia-api`
 
-OpenAI-compatible HTTP server (axum). Routes: `/health`, `/v1/models`, `/v1/chat/completions` (non-streaming + SSE streaming), `/v1/cancel/<task_id>`. Backpressure via a concurrent-request semaphore (default 16); request body cap and rendered-prompt cap (both `--api-max-body-mb`, default 1 MiB, on every engine) enforce 413 / 503 responses on oversized or over-capacity input.
+OpenAI-compatible HTTP server (axum). Routes: `/health`, `/v1/models`, `/v1/chat/completions` (non-streaming + SSE streaming), `/v1/cancel/<task_id>`. Backpressure via a concurrent-request semaphore (default 16); request body cap and rendered-prompt cap (both `--api-max-body-mb`, default 1 MiB, on every chat engine) enforce 413 / 503 responses on oversized or over-capacity input. `ov-policy` refuses `--api-max-body-mb`: its message cap comes from the package's spec.
+
+The policy server (`policy` module) is a separate router on its own state, served instead of the chat routes for `ov-policy`: `/health` (503 `degraded` after an engine failure, as for chat), `/metrics`, `GET /v1/policy/metadata` and `WS /v1/policy/ws` (openpi's msgpack framing), with per-message size caps, a connection cap (default 4, HTTP 503 beyond it), ping-based dead-connection cleanup and an `Origin` allowlist. Its codec is public (`cascadia_api::policy`) for other front ends. Behind the `zenoh` feature, the same module serves Intel's physicalai remote-inference protocol over Zenoh and the `policy-bridge` (physicalai on loopback, an openpi WebSocket upstream). See [engines/ov-policy.md](engines/ov-policy.md).
 
 ## `cascadia-runner`
 
@@ -19,20 +21,22 @@ Per-stage `Runner`. Connects upstream + downstream transports, loads weights, bu
 
 ## `cascadia-engine`
 
-Two trait definitions — the plugin seam:
+Three trait definitions — the plugin seam:
 
 - `Engine`: `warmup`, `submit`, `step`, `cancel`, `close`. `submit` returns `EngineError::QueueFull` when the per-engine pending cap is reached.
 - `Builder`: `configure_listen`, `connect`, `load`, `build`, `close`.
+- `PolicyEngine` (sibling of `Engine`, for robot models): `spec`, `warmup`, `infer` (one `Observation` in, one `ActionChunk` out), `close`. `MockPolicyEngine` is its deterministic test double.
 
 ## `cascadia-engine-openvino`
 
-Five engines:
+Six engines:
 
 - `ov-genai` — single-stage `openvino_genai.LLMPipeline` via the C++ FFI shim. FastDraft + Prompt Lookup variants.
 - `ov-runtime` — multi-stage stateful KV cache. Pre-exported per-stage v3+ shards; each stage owns its layer range and runs SDPA attention with internal RoPE.
 - `ov-dist-spec` — multi-stage spec decode with mask-based KV-cache rewind on rejected drafts. v5 shards (canonical optimum-style inputs).
 - `gemma4` — Gemma 4 multi-stage: per-layer-type attention, KV-sharing, per-layer-input embeddings. `gemma4_cached_v1.x` shards.
 - `qwen35` (alias `qwen36-moe`) — Qwen3.5-family staged chain (GatedDeltaNet; Qwen3.6 MoE or dense Qwen3.8) from `qwen3_5*` IR-surgery shards; single-box or N-rank pipeline; in-process prefix cache. See [architectures/qwen36-moe-support.md](architectures/qwen36-moe-support.md).
+- `ov-policy` — robot models (VLA policies) from a `policy_package` (`policy` module): executes the manifest's pre- and postprocessing steps and runs the policy IR on GPU or CPU, implementing `PolicyEngine`. See [engines/ov-policy.md](engines/ov-policy.md).
 
 ## `cascadia-engine-mock`
 
@@ -56,7 +60,7 @@ C++ FFI shim wrapping `openvino-genai`. `extern "C"` only; every entry point cat
 
 ## `cascadia-types`
 
-Engine-agnostic core types (serde-serializable): generation tasks and chunks, shard descriptions, peer layout. Only `serde` + `thiserror` as dependencies, so downstream crates share vocabulary without version-lockstep.
+Engine-agnostic core types (serde-serializable): generation tasks and chunks, shard descriptions, peer layout, and the policy `Observation`, `ActionChunk` and `PolicySpec`. Only `serde` + `thiserror` as dependencies, so downstream crates share vocabulary without version-lockstep.
 
 ## `cascadia-transport`
 
@@ -76,4 +80,4 @@ Model registry plus on-demand HuggingFace pull. **Not wired into the CLI** — n
 
 ## `cascadia-cli` + `cascadia`
 
-`cascadia worker --rank N --total M --engine <name> --model <dir> ...` is the core serving subcommand; `run` is its single-machine sugar. Other subcommands: `shard` (bundled exporter), `doctor` (environment checks), `discover` (mDNS browse), `engines`, `completions` (shell completions), `profile-devices` / `profile-stages` / `place` / `run-placement` (placement tooling). The `cascadia` crate is the binary entry point and depends on `cascadia-cli`.
+`cascadia worker --rank N --total M --engine <name> --model <dir> ...` is the core serving subcommand; `run` is its single-machine sugar. `run --engine ov-policy <package>` takes its own path: it loads one robot model and serves the policy router instead of the chat routes, on loopback unless `--api` says otherwise. Other subcommands: `policy-bridge` (physicalai over Zenoh to an openpi upstream, `zenoh` feature), `shard` (bundled exporter), `export-policy` (LeRobot policy checkpoint to a `policy_package`), `doctor` (environment checks), `discover` (mDNS browse), `engines`, `completions` (shell completions), `profile-devices` / `profile-stages` / `place` / `run-placement` (placement tooling). The `cascadia` crate is the binary entry point and depends on `cascadia-cli`.

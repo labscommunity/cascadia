@@ -14,14 +14,20 @@
 use std::pin::Pin;
 
 use async_trait::async_trait;
-use cascadia_types::{Chunk, GenerationTask, LoadProgress, PeerLayout, ShardSpec, TaskId};
+use cascadia_types::{
+    Chunk, ChunkErrorKind, GenerationTask, LoadProgress, PeerLayout, ShardSpec, TaskId,
+};
 use futures::Stream;
 use thiserror::Error;
 
 #[cfg(feature = "kv_coord")]
 pub mod kv_handoff;
+pub mod policy;
 #[cfg(feature = "kv_coord")]
 pub use kv_handoff::{KvHandoffMailbox, KvHandoffSlot};
+pub use policy::{
+    check_observation, payload_cap, MockPolicyEngine, PolicyEngine, PAYLOAD_MAX_BYTES, WARMUP_CALLS,
+};
 
 #[derive(Debug, Error)]
 pub enum EngineError {
@@ -95,6 +101,22 @@ impl EngineError {
         match self {
             EngineError::Task { task_id, .. } => Some(task_id),
             _ => None,
+        }
+    }
+
+    /// The final chunk that fails `task_id` with this error, keeping a
+    /// refusal (bad request, prompt over the window) apart from a fault.
+    pub fn to_chunk(&self, task_id: impl Into<TaskId>) -> Chunk {
+        match self {
+            EngineError::Task { source, .. } => source.to_chunk(task_id),
+            // The caller's own mistake, in the words the engine gave it.
+            EngineError::InvalidConfig(m) => {
+                Chunk::refused(task_id, m.clone(), ChunkErrorKind::InvalidRequest)
+            }
+            EngineError::PromptTooLong(_) => {
+                Chunk::refused(task_id, self.to_string(), ChunkErrorKind::PromptTooLong)
+            }
+            _ => Chunk::error(task_id, self.to_string()),
         }
     }
 
