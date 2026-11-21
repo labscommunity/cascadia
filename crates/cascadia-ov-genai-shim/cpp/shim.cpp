@@ -34,6 +34,16 @@
 #include <openvino/genai/version.hpp>
 #include <openvino/core/version.hpp>
 
+#ifdef _WIN32
+#ifndef WIN32_LEAN_AND_MEAN
+#define WIN32_LEAN_AND_MEAN
+#endif
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
+#include <windows.h>
+#endif
+
 namespace {
 
 thread_local std::string g_last_error;
@@ -1229,9 +1239,18 @@ int32_t cascadia_runtime_get_state_blob(cascadia_runtime_t* handle, uint8_t* buf
 // Test-only: true when the environment variable `name` is "1". The prime tests use these
 // to run the prime on CPU (CASCADIA_SHIM_FORCE_PRIME) and to make it fail
 // (CASCADIA_SHIM_FAIL_PRIME). Do not set them in production.
+// On Windows, std::getenv reads the CRT copy of the environment from process start.
+// That copy does not see Rust `std::env::set_var`, which calls SetEnvironmentVariableW.
+// Thus Windows reads the process environment directly with GetEnvironmentVariableA.
 static bool test_env_set(const char* name) {
+#ifdef _WIN32
+    char buf[8];
+    DWORD n = GetEnvironmentVariableA(name, buf, sizeof buf);
+    return n == 1 && buf[0] == '1';
+#else
     const char* v = std::getenv(name);
     return v && std::strcmp(v, "1") == 0;
+#endif
 }
 
 // True when the compiled model executes on a GPU (`GPU`, `GPU.0`, or under AUTO/HETERO).
