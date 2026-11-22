@@ -547,7 +547,6 @@ dependencies = [
 name = "cascadia-topology"
 version = "0.2.7"
 dependencies = [
- "chrono",
  "parking_lot",
  "serde",
 ]
