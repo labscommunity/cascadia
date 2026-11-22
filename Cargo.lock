@@ -367,7 +367,6 @@ dependencies = [
 name = "cascadia-download"
 version = "0.2.7"
 dependencies = [
- "chrono",
  "hf-hub",
  "parking_lot",
  "serde",
