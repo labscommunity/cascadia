@@ -92,7 +92,9 @@ tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
 # Utilities
 bytes = "1"
 uuid = { version = "1", features = ["v4", "serde"] }
-chrono = { version = "0.4", features = ["serde"] }
+# jiff replaces chrono (RUSTSEC-2026-0543: chrono is unmaintained). Only `std`:
+# the code formats UTC timestamps and needs no time zone database.
+jiff = { version = "0.2.40", default-features = false, features = ["std"] }
 url = "2"
 
 # OpenVINO binding is the C++ FFI shim (cascadia-ov-genai-shim), not the

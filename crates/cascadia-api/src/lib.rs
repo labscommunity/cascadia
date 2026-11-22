@@ -19,7 +19,6 @@ use axum::{Json, Router};
 use bytes::Bytes;
 use cascadia_runner::Runner;
 use cascadia_types::{ChatTurn, GenerationTask};
-use chrono::Utc;
 use futures::stream::{self, Stream};
 use futures::StreamExt;
 use serde::{Deserialize, Serialize};
@@ -1055,7 +1054,7 @@ struct CompletionResponse {
 }
 
 fn now_unix() -> i64 {
-    Utc::now().timestamp()
+    jiff::Timestamp::now().as_second()
 }
 
 /// Last-resort formatting when no chat template is available.
@@ -1419,9 +1418,11 @@ fn build_chat_env(template_src: &str) -> Result<minijinja::Environment<'static>,
     // nodes need not share a timezone. An unsupported format is an error, not
     // an empty string: a blank date reads as a model quirk, not a bug.
     env.add_function("strftime_now", |fmt: String| -> Result<Value, Error> {
-        use std::fmt::Write as _;
-        let mut out = String::new();
-        write!(out, "{}", chrono::Utc::now().format(&fmt)).map_err(|_| {
+        // jiff's strict `strtime::format` rejects an unknown directive (the
+        // `Display` form of `Timestamp::strftime` would echo it). A UTC `Zoned`
+        // makes `%Z` render "UTC".
+        let now = jiff::Timestamp::now().to_zoned(jiff::tz::TimeZone::UTC);
+        let out = jiff::fmt::strtime::format(&fmt, &now).map_err(|_| {
             Error::new(
                 ErrorKind::InvalidOperation,
                 format!("strftime_now: unsupported format string {fmt:?}"),
@@ -6413,7 +6414,12 @@ level={{ effort_map[eff] }}";
         assert_eq!(out.len(), 4, "expected a 4-digit year, got {out:?}");
         assert!(out.chars().all(|c| c.is_ascii_digit()), "{out:?}");
 
-        let bad = build_chat_env(r#"{{ strftime_now("%Q") }}"#).unwrap();
+        // The date is rendered in UTC, as with chrono's `Utc::now()`.
+        let utc = build_chat_env(r#"{{ strftime_now("%Z") }}"#).unwrap();
+        let out = render_with_chat_env(&utc, &msgs, "", "", true, None, None).unwrap();
+        assert_eq!(out, "UTC");
+
+        let bad = build_chat_env(r#"{{ strftime_now("%J") }}"#).unwrap();
         assert!(
             render_with_chat_env(&bad, &msgs, "", "", true, None, None).is_err(),
             "an unsupported strftime specifier must error, not render empty"
