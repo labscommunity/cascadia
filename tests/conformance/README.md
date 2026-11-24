@@ -21,7 +21,8 @@ Guards, so a pass means something:
   does (`O_TMPFILE` + `ftruncate`, free space for the pool cap the shim will see,
   including an ambient `ELASTIC_POOL_MB` on forced-interposer legs). Unit tests:
   `python3 -m pytest -q tests/conformance/test_guard_unit.py`. Full-disk
-  fallback (Linux, needs `sudo`): `bash tests/conformance/test_enospc_fallback.sh`;
+  fallback: `bash tests/conformance/test_enospc_fallback.sh` escapes a tmpfs
+  dir to a small `/var/tmp` inside a private mount namespace (Linux, needs `sudo`);
 - the interposer `.so` is selected by **mtime**, not lexicographic order: cargo
   leaves the previous build's `.so` beside the new one, and picking the wrong
   one silently measures an unpatched hook (this cost a whole C1 leg once);

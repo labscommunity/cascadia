@@ -23,10 +23,14 @@
  * the pool, per-inference scratch pays an mmap round trip every step — the
  * eager-return anti-pattern exp 097 measured (v1 of this shim: -35% decode).
  *
- * On ext4/xfs each tmpfile's blocks are reserved with fallocate when it is
- * created, so a full disk makes that allocation fall back to anonymous memory
- * instead of SIGBUSing on a later write fault. Other filesystems (btrfs,
- * overlayfs, NFS...) keep a sparse file, which can still SIGBUS when full.
+ * When the shim itself moved the backing dir (tmpfs escape) to ext4/xfs, each
+ * tmpfile's blocks are reserved with fallocate, so a full disk falls back to
+ * anonymous memory instead of SIGBUSing, and the shim leaves DIR_HEADROOM free
+ * on that disk the user did not choose. Each file is reserved at its full
+ * size, so an allocation larger than the free space minus that headroom stays
+ * anonymous. A MAP_NORESERVE mmap, a dir the user configured and any other
+ * filesystem keep a sparse file, which can still SIGBUS when that disk fills:
+ * the user owns its free space.
  *
  * Env:  ELASTIC_MIN_MB   threshold in MB (default 1)
  *       ELASTIC_DIR      backing dir for the tmpfiles (default $TMPDIR or /tmp)
@@ -136,11 +140,12 @@ static int dir_usable(const char *dir) {
     return ok;
 }
 
-/* Filesystems that overwrite in place, where a preallocated block is good for
- * every later write to it. Not copy-on-write ones (btrfs: rewriting a page
- * that was written back needs new space, so a full disk can still SIGBUS) and
- * not overlayfs (its upper layer may be tmpfs, where fallocate commits the
- * pages up front). Those keep the sparse file. */
+/* Asked only of a dir the shim escaped to. True for filesystems that
+ * overwrite in place, where a preallocated block is good for every later write
+ * to it. Not copy-on-write ones (btrfs: rewriting a page that was written back
+ * needs new space, so a full disk can still SIGBUS) and not overlayfs (its
+ * upper layer may be tmpfs, where fallocate commits the pages up front).
+ * Those keep the sparse file. */
 static int dir_can_prealloc(const char *dir) {
     struct statfs st;
     if (!dir || statfs(dir, &st) != 0) return 0;
@@ -153,13 +158,40 @@ static unsigned long long dir_free_bytes(const char *dir) {
     return (unsigned long long)st.f_bavail * (unsigned long long)st.f_frsize;
 }
 
+#define DIR_HEADROOM (1ULL << 30)   /* free space left on a dir the shim picked */
+static int g_prealloc;   /* set at init: the shim escaped to g_dir and it is ext4/xfs */
+
+/* Size a fresh tmpfile. A sparse file (ftruncate) is accepted even when the
+ * disk cannot hold it and then SIGBUSes on the first write fault that needs a
+ * block. With prealloc the blocks are reserved now instead, so a full disk
+ * fails here and the caller falls back to anonymous memory; a reservation that
+ * would leave less than DIR_HEADROOM free is refused the same way.
+ * Only the escaped dir gets prealloc: fallocate reserves the FULL virtual size,
+ * so on a dir the user sized themselves a reserve-heavy workload (a mostly
+ * untouched fixed-size KV cache) would fill the disk and push other writers to
+ * ENOSPC. Everywhere else, and for MAP_NORESERVE, the file stays sparse, as
+ * does one on a filesystem without fallocate. */
+static int reserve_tmpfile(int fd, off_t len, int prealloc) {
+    if (prealloc) {
+        if (dir_free_bytes(g_dir) < (unsigned long long)len + DIR_HEADROOM) {
+            errno = ENOSPC;
+            return -1;
+        }
+        int r;
+        do r = fallocate(fd, 0, 0, len); while (r != 0 && errno == EINTR);
+        if (r == 0) return 0;
+        if (errno != EOPNOTSUPP && errno != ENOSYS) return -1;
+    }
+    return ftruncate(fd, len);
+}
+
 static void warn_write(const char *msg, size_t cap) {   /* write(), not fprintf() */
     size_t n = strnlen(msg, cap);
     if (n) (void)!write(STDERR_FILENO, msg, n);
 }
 
-/* Fallback needs free space for the unlinked pool extents plus 1 GB headroom.
- * Whole GB in the message: no %f inside do_init. */
+/* Fallback needs free space for the unlinked pool extents plus DIR_HEADROOM
+ * (1 GB). Whole GB in the message: no %f inside do_init. */
 static void resolve_backing_dir(void) {
     static char home_cache[PATH_MAX];
     static char m[4 * PATH_MAX + 320];    /* static: do_init may be a shallow thread */
@@ -194,7 +226,7 @@ static void resolve_backing_dir(void) {
     const char *h = getenv("HOME");
     if (h && *h) snprintf(home_cache, sizeof home_cache, "%s/.cache", h);
     const char *cand[] = { "/var/tmp", home_cache, NULL };
-    unsigned long long need = (unsigned long long)g_pool_cap + (1ULL << 30);
+    unsigned long long need = (unsigned long long)g_pool_cap + DIR_HEADROOM;
 
     for (int i = 0; cand[i]; i++) {
         if (!*cand[i] || strcmp(cand[i], g_dir) == 0) continue;
@@ -207,6 +239,7 @@ static void resolve_backing_dir(void) {
             g_dir, cand[i], g_dir);
         warn_write(m, sizeof m);
         g_dir = cand[i];
+        g_prealloc = dir_can_prealloc(g_dir);
         return;
     }
 
@@ -216,22 +249,6 @@ static void resolve_backing_dir(void) {
         " Set ELASTIC_DIR or ELASTIC_ALLOW_TMPFS=1.\n",
         g_dir, (unsigned)(need >> 30));
     warn_write(m, sizeof m);
-}
-
-/* Size a fresh tmpfile. With prealloc (ext4/xfs) the blocks are reserved now,
- * so a full filesystem fails here and the caller falls back to anonymous
- * memory; a sparse file (ftruncate) is accepted and then SIGBUSes on the first
- * write the disk cannot hold. Every other filesystem (tmpfs/ramfs, btrfs,
- * overlayfs, NFS...) keeps the sparse file, as does one without fallocate. */
-static int g_prealloc;                 /* set at init: g_dir is ext4/xfs */
-static int reserve_tmpfile(int fd, off_t len, int prealloc) {
-    if (prealloc) {
-        int r;
-        do r = fallocate(fd, 0, 0, len); while (r != 0 && errno == EINTR);
-        if (r == 0) return 0;
-        if (errno != EOPNOTSUPP && errno != ENOSYS) return -1;
-    }
-    return ftruncate(fd, len);
 }
 
 static void do_init(void) {
@@ -262,7 +279,6 @@ static void do_init(void) {
     g_mmap_on = !((v = getenv("ELASTIC_MMAP")) && *v == '0');
     /* A memory-backed dir makes the posture a no-op under a cap: escape it. */
     resolve_backing_dir();
-    g_prealloc = dir_can_prealloc(g_dir);
     /* Same warning, different failure mode: on a rotational device the
      * mechanism still works, but the page-ins are seek-bound, so "slow but
      * alive" degrades into "dead". Decode re-reads every weight on every
