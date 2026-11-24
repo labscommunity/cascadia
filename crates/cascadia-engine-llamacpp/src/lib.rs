@@ -3126,7 +3126,11 @@ mod unix_tests {
     async fn load_health_timeout_is_error() {
         let dir = tempfile::tempdir().unwrap();
         let bin = write_script(dir.path(), "llama-server", "#!/bin/sh\nsleep 30\n");
-        let mut b = LlamaCppBuilder::new(cfg_for(bin, 0));
+        // One retry: a parallel test's fork can make the first exec of the
+        // just-written script fail with ETXTBSY (see
+        // relative_binary_sources_launch_exact_selected_file); the retry
+        // absorbs that, and the last attempt still ends in the health timeout.
+        let mut b = LlamaCppBuilder::new(cfg_for(bin, 1));
         let t0 = Instant::now();
         let err = b.load(dummy_shard()).await.err().unwrap().to_string();
         assert!(t0.elapsed() < Duration::from_secs(20));
