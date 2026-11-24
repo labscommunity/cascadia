@@ -943,6 +943,7 @@ impl Builder for Qwen36Builder {
             scrub_pending: false,
             decision_scrub_deferred: false,
             infer_failed: false,
+            recovery_scrub_failed: false,
             retry: None,
             #[cfg(test)]
             retry_disabled_for_test: false,
@@ -1880,6 +1881,9 @@ pub struct Qwen36Engine {
     /// request may still be marked busy, and OpenVINO blocks forever releasing a busy request.
     /// The next `reset_all` makes every request idle first ([`make_idle`]), Task 46.
     infer_failed: bool,
+    /// A recovery's cheap scrub (`reset_state`) failed. The next `reset_all` recreates the dirty
+    /// stage, and if that fails too it fails the engine: `infer_failed` is clear by then.
+    recovery_scrub_failed: bool,
     /// Task 57, single box: the task [`Self::fail_local`] just re-queued at the front of `pending`
     /// after a native infer failure. Taken by the next admission, which is the retry and runs in
     /// the same `step`.
@@ -2633,9 +2637,12 @@ impl Qwen36Engine {
         // A failed scrub leaves whatever was in the requests live; no snapshot of it may enter the
         // prefix cache until a reset succeeds (a warm restore overwrites it and is still allowed).
         self.stages_dirty = !all_ok;
-        // A recovery whose scrub fails fails the engine, so the server exits for a restart. A
+        // A recovery whose recreate fails fails the engine, so the server exits for a restart. A
         // later admission sees a dirty stage but no fault, and would refuse every task for ever.
-        if recovering && !all_ok {
+        // A failed cheap reset first gets the recreate of the next `reset_all` (the stage is dirty).
+        let recovery = recovering || self.recovery_scrub_failed;
+        self.recovery_scrub_failed = recovery && !all_ok;
+        if recovery && !all_ok && recreate {
             let why = "stage state reset failed after a failed infer".to_string();
             error!(reason = %why, "qwen36: engine failed; every later task is refused until a restart");
             self.fail_engine(why);
@@ -5607,6 +5614,7 @@ mod tests {
             scrub_pending: false,
             decision_scrub_deferred: false,
             infer_failed: false,
+            recovery_scrub_failed: false,
             retry: None,
             retry_disabled_for_test: false,
             retried_in_step: false,
@@ -7218,8 +7226,11 @@ mod tests {
         refuse_set: bool,
         /// Task 56: `abandon_request` fails, so the request can be neither idled nor abandoned.
         refuse_abandon: bool,
-        /// `reset_state` and `recreate_request` fail, as `create_infer_request` does on a GPU OOM.
-        refuse_scrub: bool,
+        /// `reset_state` fails (pushes `reset_refused`).
+        refuse_reset: bool,
+        /// `recreate_request` fails (pushes `recreate_refused`), as `create_infer_request` does on
+        /// a GPU OOM.
+        refuse_recreate: bool,
     }
 
     impl Drop for MockStage {
@@ -7251,7 +7262,8 @@ mod tests {
                 residue: false,
                 refuse_set: false,
                 refuse_abandon: false,
-                refuse_scrub: false,
+                refuse_reset: false,
+                refuse_recreate: false,
             }
         }
         pub(super) fn input_names(&self) -> cascadia_ov_genai_shim::Result<Vec<String>> {
@@ -7270,8 +7282,13 @@ mod tests {
             };
             Err(cascadia_ov_genai_shim::Error::Native(why.into()))
         }
-        fn refuse_scrub(&self) -> cascadia_ov_genai_shim::Result<()> {
-            if self.refuse_scrub {
+        fn refuse_scrub(
+            &self,
+            refused: bool,
+            event: &'static str,
+        ) -> cascadia_ov_genai_shim::Result<()> {
+            if refused {
+                self.events.lock().unwrap().push(event);
                 return Err(cascadia_ov_genai_shim::Error::Native(
                     "create_infer_request failed".into(),
                 ));
@@ -7377,7 +7394,7 @@ mod tests {
         }
         pub(super) fn reset_state(&mut self) -> cascadia_ov_genai_shim::Result<()> {
             self.refuse()?;
-            self.refuse_scrub()?;
+            self.refuse_scrub(self.refuse_reset, "reset_refused")?;
             self.events.lock().unwrap().push("reset");
             if !self.residue {
                 self.folded = 0;
@@ -7388,7 +7405,7 @@ mod tests {
         /// The shim refuses to release a request that is not idle (it would block forever).
         pub(super) fn recreate_request(&mut self) -> cascadia_ov_genai_shim::Result<()> {
             self.refuse()?;
-            self.refuse_scrub()?;
+            self.refuse_scrub(self.refuse_recreate, "recreate_refused")?;
             self.events.lock().unwrap().push("reset");
             self.folded = 0;
             self.ran = false;
@@ -7885,7 +7902,8 @@ mod tests {
         busy_after_failed_infer(&mut e, 0, 1);
         e.submit(chat("c1")).unwrap();
         assert!(run_to_final(&mut e).error.is_some(), "the first task fails");
-        mock1(&mut e).refuse_scrub = true;
+        mock1(&mut e).refuse_reset = true;
+        mock1(&mut e).refuse_recreate = true;
 
         e.submit(chat("c2")).unwrap();
         assert!(
@@ -7902,6 +7920,76 @@ mod tests {
             why.contains("qwen36 engine failed"),
             "the engine-failed refusal: {why}"
         );
+    }
+
+    #[test]
+    fn a_cheap_reset_that_fails_after_a_recovery_falls_back_to_a_recreate_and_keeps_serving() {
+        // After a recovery the cold scrub's `reset_state` fails, but `recreate_request` works.
+        // The stage is recreated, so the engine does not fail and every later task is served.
+        let mut e = mock_box();
+        e.retry_disabled_for_test = true; // Task 57 off: the task fails, the next one recovers
+        let events = busy_after_failed_infer(&mut e, 0, 1);
+        e.submit(chat("c1")).unwrap();
+        assert!(run_to_final(&mut e).error.is_some(), "the first task fails");
+        mock1(&mut e).refuse_reset = true;
+        let before = events.lock().unwrap().len();
+
+        for id in ["c2", "c3", "c4"] {
+            e.submit(chat(id)).unwrap();
+            let c = run_to_final(&mut e);
+            assert!(c.error.is_none(), "{id} served: {c:?}");
+        }
+        assert!(e.engine_failed.is_none(), "the engine did not fail");
+        let after = events.lock().unwrap()[before..].to_vec();
+        let refused = after
+            .iter()
+            .position(|&a| a == "reset_refused")
+            .expect("the cheap reset was refused");
+        assert_eq!(
+            after.get(refused + 1),
+            Some(&"reset"),
+            "the recreate ran next: {after:?}"
+        );
+    }
+
+    #[test]
+    fn a_cheap_reset_and_a_recreate_that_fail_after_a_recovery_fail_the_engine() {
+        // After a recovery the cold scrub's `reset_state` fails and the recreate fallback fails
+        // too. The engine fails in that scrub: the next admission no longer sees the fault and
+        // would refuse every task on a dirty stage (`stage state reset failed`) for ever.
+        let mut e = mock_box();
+        e.retry_disabled_for_test = true; // Task 57 off: the task fails, the next one recovers
+        let events = busy_after_failed_infer(&mut e, 0, 1);
+        e.submit(chat("c1")).unwrap();
+        assert!(run_to_final(&mut e).error.is_some(), "the first task fails");
+        mock1(&mut e).refuse_reset = true;
+        mock1(&mut e).refuse_recreate = true;
+        let before = events.lock().unwrap().len();
+
+        e.submit(chat("c2")).unwrap();
+        assert!(run_to_final(&mut e).error.is_some(), "not served");
+        let after = events.lock().unwrap()[before..].to_vec();
+        let refused = after
+            .iter()
+            .position(|&a| a == "reset_refused")
+            .expect("the cheap reset was refused");
+        assert_eq!(
+            after.get(refused + 1),
+            Some(&"recreate_refused"),
+            "the recreate was tried: {after:?}"
+        );
+        assert!(e.engine_failed.is_some(), "the engine failed");
+        assert_eq!(e.failure().reason(), e.engine_failed, "the server exits");
+
+        for id in ["c3", "c4"] {
+            e.submit(chat(id)).unwrap();
+            let c = run_to_final(&mut e);
+            let why = c.error.as_deref().expect("refused");
+            assert!(
+                why.contains("qwen36 engine failed"),
+                "{id}: the engine-failed refusal, not a dirty-stage loop: {why}"
+            );
+        }
     }
 
     #[test]

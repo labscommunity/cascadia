@@ -928,6 +928,9 @@ so its supervisor restarts it (below):
   cap`, with `total`, `local_stages`, `largest_leak_bytes` and `cap`), and every `recompile`
   recovery line carries `recompiled` and `cap`.
 - The request could not be abandoned (the shim is out of memory), or its state cannot be read.
+- The scrub after a recovery cannot rebuild a stage request: its `recreate_request` fails. A
+  failed cheap `reset_state` first gets a recreate on the next scrub; only that recreate's
+  failure fails the engine.
 
 A failed engine fails the task that ran the recovery, and every later one at once, with
 `backend error: qwen36 engine failed: <reason>; restart the server`. For example: `stage6's
