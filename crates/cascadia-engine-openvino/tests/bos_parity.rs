@@ -145,6 +145,13 @@ fn a_templated_prompt_carries_one_bos_on_both_pipelines() {
         "raw string path changed"
     );
     drop(llm);
+    if device.eq_ignore_ascii_case("NPU") {
+        // The NPU compiler has no PagedAttention, so ContinuousBatchingPipeline
+        // does not compile there (OpenVINO 2026.4.1); Cascadia builds it only
+        // for --cb, and its NPU path is the LLMPipeline checked above.
+        eprintln!("cb: not built on the NPU (no PagedAttention there); LLMPipeline checked");
+        return;
+    }
 
     let cb = CbPipeline::new(
         &model,
