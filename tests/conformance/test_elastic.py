@@ -289,6 +289,9 @@ def cgroup_file(pid, name):
 
 
 SHIM_POOL_MB_DEFAULT = 8192
+# findmnt names whose statfs magic the shim treats as memory-backed:
+# devtmpfs is TMPFS_MAGIC and the initramfs "rootfs" is RAMFS/TMPFS_MAGIC.
+MEMORY_FS = ("tmpfs", "ramfs", "devtmpfs", "rootfs")
 
 
 def shim_pool_mb(env):
@@ -344,7 +347,7 @@ def escape_target(edir, pool_mb=SHIM_POOL_MB_DEFAULT):
             continue
         if not os.path.isdir(cand) or not dir_usable(cand):
             continue
-        if fstype(cand) in ("tmpfs", "ramfs"):
+        if fstype(cand) in MEMORY_FS:
             continue
         try:
             if shutil.disk_usage(cand).free < need:
@@ -534,7 +537,7 @@ def main():
     if not os.access(edir, os.W_OK):
         record("guard: backing dir usable", False, f"{edir} is not writable")
         finish(1)
-    if ft in ("tmpfs", "ramfs"):
+    if ft in MEMORY_FS:
         # The shim escapes a memory-backed dir; that is the supported config now.
         # It only stays fatal when no disk-backed alternative exists, because then
         # the posture really is a no-op under a cap.

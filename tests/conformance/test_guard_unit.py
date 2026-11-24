@@ -20,6 +20,15 @@ Usage = collections.namedtuple("Usage", "total used free")
 GIB = 1 << 30
 
 
+def _takes_o_tmpfile(path):
+    """Independent oracle: does this dir accept a raw O_TMPFILE open?"""
+    try:
+        os.close(os.open(str(path), os.O_TMPFILE | os.O_RDWR, 0o600))
+        return True
+    except OSError:
+        return False
+
+
 @pytest.fixture
 def two_disk_candidates(tmp_path, monkeypatch):
     """/var/tmp and ~/.cache both exist, are disk-typed and have 20 GiB free."""
@@ -39,10 +48,11 @@ def test_rejects_candidates_that_refuse_o_tmpfile(two_disk_candidates, monkeypat
     # so the guard must not report an escape.
     if not hasattr(os, "O_TMPFILE"):
         pytest.skip("needs O_TMPFILE")
+    real_open = os.open  # te.os is this os module: capture before patching
     def no_tmpfile(path, flags, mode=0o777):
         if flags & getattr(os, "O_TMPFILE", 0):
             raise OSError(95, "Operation not supported")
-        return os.open(path, flags, mode)
+        return real_open(path, flags, mode)
     monkeypatch.setattr(te.os, "open", no_tmpfile)
     assert te.escape_target("/dev/shm") is None
 
@@ -50,6 +60,11 @@ def test_rejects_candidates_that_refuse_o_tmpfile(two_disk_candidates, monkeypat
 def test_rejects_candidates_that_refuse_ftruncate(two_disk_candidates, monkeypatch):
     if not hasattr(os, "O_TMPFILE"):
         pytest.skip("needs O_TMPFILE")
+    # Without O_TMPFILE on a candidate the probe fails before ftruncate and the
+    # test would pass even with the ftruncate step removed.
+    for cand in ("/var/tmp", two_disk_candidates):
+        if not _takes_o_tmpfile(cand):
+            pytest.skip(f"{cand} does not support O_TMPFILE")
     # The real dir_usable() runs; only the 1 MiB ftruncate fails, as on a full disk.
     def no_room(fd, length):
         raise OSError(errno.ENOSPC, "No space left on device")
@@ -60,9 +75,7 @@ def test_rejects_candidates_that_refuse_ftruncate(two_disk_candidates, monkeypat
 def test_dir_usable_probe_on_a_real_dir(tmp_path, monkeypatch):
     if not hasattr(os, "O_TMPFILE"):
         pytest.skip("needs O_TMPFILE")
-    try:  # independent oracle: does this fs take an O_TMPFILE at all?
-        os.close(os.open(str(tmp_path), os.O_TMPFILE | os.O_RDWR, 0o600))
-    except OSError:
+    if not _takes_o_tmpfile(tmp_path):
         pytest.skip("tmp_path does not support O_TMPFILE")
     assert te.dir_usable(str(tmp_path)) is True
     assert te.dir_usable(str(tmp_path / "missing")) is False
@@ -82,6 +95,15 @@ def test_no_home_cache_candidate_without_home(two_disk_candidates, monkeypatch):
                         else True if p.endswith("/.cache") else isdir(p))
     assert te.escape_target("/dev/shm") == two_disk_candidates
     monkeypatch.delenv("HOME")
+    assert te.escape_target("/dev/shm") is None
+
+
+@pytest.mark.parametrize("fs", ["tmpfs", "ramfs", "devtmpfs", "rootfs"])
+def test_memory_backed_candidates_are_skipped(two_disk_candidates, monkeypatch, fs):
+    # findmnt says devtmpfs/rootfs where the shim's statfs sees tmpfs/ramfs
+    # magic; the shim skips those candidates, so the guard must too.
+    monkeypatch.setattr(te, "dir_usable", lambda p: True)
+    monkeypatch.setattr(te, "fstype", lambda p: fs)
     assert te.escape_target("/dev/shm") is None
 
 
