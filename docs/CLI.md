@@ -230,6 +230,27 @@ oneDNN's dirty repacked copies (D-004) — so `--elastic` still asserts
 the cut. The Windows hook is compiled in only when `cascadia-elastic` was built
 with `DETOURS_DIR` set; otherwise `--elastic` reports inactive there.
 
+On Linux the interposer serves big allocations from unlinked `O_TMPFILE` files
+in `ELASTIC_DIR` (default `$TMPDIR`, else `/tmp`). A tmpfs/ramfs directory is
+escaped to `/var/tmp` or `~/.cache` — those pages would be shmem, which cannot be
+written back, so the posture would give no OOM protection under a memory cap —
+and the escape is logged. This covers an explicit `ELASTIC_DIR` too: that
+variable chooses where the files live, not whether the posture is real, and
+`--elastic` claiming protection it cannot deliver is the worse surprise. Set
+`ELASTIC_ALLOW_TMPFS=1` to keep the configured directory anyway — correct only
+where swap actually leaves RAM, so a disk-backed swapfile or partition; with
+zram, "swapped" shmem still occupies RAM. When the shim moves the directory
+itself and the target is ext4 or xfs, it reserves space for each file up front
+and keeps 1 GiB free there, so a full disk makes that allocation fall back to
+ordinary memory instead of crashing the process. Each file is reserved at its
+full size, so an allocation larger than the free space minus 1 GiB stays in
+ordinary memory and is not protected under a memory cap; a workload with a
+large fixed-size reserve (for example `--cb-cache-size`) should set
+`ELASTIC_DIR` to a disk with room for it. The reserved space shows as used in
+`df` while the server runs; a `MAP_NORESERVE` mapping is not reserved.
+A directory you set with `ELASTIC_DIR` that is already disk-backed is used as
+is: its files are sparse, so keep its free space above the model's working set.
+
 **`--ov-cache-dir` is on by default and matters.** For `ov-genai`, `ov-runtime`,
 `gemma4` and `sparse-moe`, leaving it unset defaults to
 `<user-cache>/cascadia/ov-cache` (`~/.cache` on Linux, `~/Library/Caches` on

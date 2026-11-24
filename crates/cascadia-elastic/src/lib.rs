@@ -75,6 +75,8 @@ pub struct ElasticOpts {
     /// Cap on retained (freed-but-mapped) bytes, in MB. 0 disables the pool.
     pub pool_mb: u32,
     /// Backing directory for the temp files. `None` = `$TMPDIR` or `/tmp`.
+    /// A tmpfs/ramfs directory is escaped to `/var/tmp` or `~/.cache` (see
+    /// docs/CLI.md).
     pub dir: Option<OsString>,
 }
 

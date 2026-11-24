@@ -288,8 +288,9 @@ impl Drop for ChildJob {
 /// side of the posture, its staging buffer must stay plain anonymous memory
 /// (Level Zero cannot memcpy from file-mapped pages), and the interposer
 /// would build a second retention pool in the child.
-const HOST_ELASTIC_ENV: [&str; 5] = [
+const HOST_ELASTIC_ENV: [&str; 6] = [
     "CASCADIA_ELASTIC_ACTIVE",
+    "ELASTIC_ALLOW_TMPFS",
     "ELASTIC_DIR",
     "ELASTIC_MIN_MB",
     "ELASTIC_POOL_MB",

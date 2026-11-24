@@ -114,6 +114,17 @@ jobs:
           echo "OV_VERSION $OV_VERSION (release.yml agrees)"
           python3 -m unittest scripts/test_ov_sdk.py
 
+      - name: Elastic backing-dir guard tests
+        # The conformance suite needs a model and an OpenVINO build, so CI
+        # runs only its model-free parts: the guard's unit tests and the
+        # full-disk fallback check on the Linux interposer. pytest is
+        # version-pinned (the actions above are SHA-pinned); its dependencies
+        # resolve from PyPI at run time. The check exits 77 when a
+        # prerequisite is missing, which is reported as an error, not a pass.
+        run: |
+          pipx run --spec pytest==8.4.2 pytest -q tests/conformance/test_guard_unit.py
+          bash tests/conformance/test_enospc_fallback.sh || { rc=$?; [ "$rc" -eq 77 ] && echo "::error::full-disk fallback check could not run on this runner (missing prerequisite, see SKIP line)"; exit "$rc"; }
+
       - name: Build cascadia binary (needed by e2e tests)
         # tests-e2e exec the cascadia binary directly; without this they
         # panic with "cascadia binary not built". Stub mode is fine —
