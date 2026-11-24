@@ -13,10 +13,10 @@ Guards that keep a result meaningful:
 
   * gate line - the elastic leg's log must contain "elastic posture active".
     Without it the run is invalid (hook off), not a pass.
-  * backing dir - ELASTIC_DIR must be on a disk-backed filesystem. On tmpfs
-    the pages cannot be written back, so the posture gives no survival
-    benefit under a memory cap even though RssAnon still collapses
-    (measured 2026-09-22, B70: tmpfs backing dies at the same caps as stock).
+  * backing dir - the shim's backing dir must end up disk-backed. A tmpfs/ramfs
+    ELASTIC_DIR passes when the shim can escape it to /var/tmp or ~/.cache; the
+    run fails only when no disk-backed alternative exists, since tmpfs pages
+    cannot be written back (measured 2026-09-22, B70: dies at stock's caps).
   * cgroup limit - the pressure leg verifies memory.max actually equals the
     requested cap before trusting the result.
 
@@ -338,7 +338,8 @@ def escape_target(edir, pool_mb=SHIM_POOL_MB_DEFAULT):
     Pass the pool cap the shim will see (shim_pool_mb()), not the default.
     """
     need = (min(pool_mb, 1 << 20) << 20) + (1 << 30)
-    for cand in ("/var/tmp", os.path.expanduser("~/.cache")):
+    home = os.environ.get("HOME")                # the shim reads $HOME only
+    for cand in ("/var/tmp", os.path.join(home, ".cache") if home else ""):
         if not cand or os.path.abspath(cand) == os.path.abspath(edir):
             continue
         if not os.path.isdir(cand) or not dir_usable(cand):
@@ -441,7 +442,8 @@ def main():
     ap.add_argument("--bin", required=True, help="built cascadia binary")
     ap.add_argument("--model", required=True, help="model directory (int4-ov)")
     ap.add_argument("--elastic-dir", default=None,
-                    help="disk-backed backing dir (else $ELASTIC_DIR/$TMPDIR//tmp)")
+                    help="backing dir; tmpfs is escaped like the shim does "
+                         "(else $ELASTIC_DIR/$TMPDIR//tmp)")
     ap.add_argument("--pressure-mb", type=int, default=None,
                     help="run the C3 pressure leg under this cgroup cap (MB)")
     ap.add_argument("--scale-model", default=None,
@@ -553,6 +555,11 @@ def main():
         record("guard: backing dir disk-backed", True,
                f"{edir} is on {ft}; the shim escapes to {esc}")
     else:
+        if not dir_usable(edir):
+            record("guard: backing dir usable", False,
+                   f"{edir} ({ft}) cannot hold an O_TMPFILE, so the shim would "
+                   f"fall back to anonymous memory and the posture does nothing")
+            finish(1)
         record("guard: backing dir disk-backed", True, f"{edir} ({ft})")
 
     used = set()
