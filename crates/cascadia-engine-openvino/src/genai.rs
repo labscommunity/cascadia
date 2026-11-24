@@ -1344,6 +1344,45 @@ mod tests {
         assert_eq!(default_prompt_token_limit("CPU", model, &[]), 131072);
     }
 
+    /// Linear and dynamic scale like YaRN, also under `text_config`. A missing factor or a
+    /// factor below 1 keeps `max_position_embeddings`, and the top level wins over
+    /// `text_config`.
+    #[test]
+    fn default_prompt_limit_scales_linear_dynamic_and_nested_rope() {
+        let dir = tempfile::tempdir().unwrap();
+        let model = dir.path().to_str().unwrap();
+        let write = |json: &str| std::fs::write(dir.path().join("config.json"), json).unwrap();
+        write(
+            r#"{"max_position_embeddings":4096,"rope_scaling":{"type":"linear","factor":4.0,
+                "original_max_position_embeddings":4096}}"#,
+        );
+        assert_eq!(default_prompt_token_limit("CPU", model, &[]), 16384);
+        write(
+            r#"{"max_position_embeddings":4096,"rope_scaling":{"rope_type":"dynamic","factor":2.0,
+                "original_max_position_embeddings":4096}}"#,
+        );
+        assert_eq!(default_prompt_token_limit("CPU", model, &[]), 8192);
+        write(
+            r#"{"text_config":{"max_position_embeddings":8192,"rope_scaling":{"rope_type":"yarn",
+                "factor":2.0,"original_max_position_embeddings":8192}}}"#,
+        );
+        assert_eq!(default_prompt_token_limit("CPU", model, &[]), 16384);
+        write(
+            r#"{"max_position_embeddings":8192,"rope_scaling":{"rope_type":"yarn",
+                "original_max_position_embeddings":4096}}"#,
+        );
+        assert_eq!(default_prompt_token_limit("CPU", model, &[]), 8192);
+        write(
+            r#"{"max_position_embeddings":8192,"rope_scaling":{"rope_type":"linear","factor":0.5,
+                "original_max_position_embeddings":8192}}"#,
+        );
+        assert_eq!(default_prompt_token_limit("CPU", model, &[]), 8192);
+        write(
+            r#"{"max_position_embeddings":4096,"text_config":{"max_position_embeddings":131072}}"#,
+        );
+        assert_eq!(default_prompt_token_limit("CPU", model, &[]), 4096);
+    }
+
     /// Past the window ov-genai generates junk instead of failing, so the limit must be
     /// enforced before the request reaches the pipeline.
     #[test]
