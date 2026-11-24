@@ -21,7 +21,15 @@
 //! template lacks); it fails loudly on a tokenizer that adds none, so it
 //! cannot pass vacuously. Optional: CASCADIA_BOS_PARITY_DEVICE (default CPU)
 //! and CASCADIA_BOS_PARITY_VLM_MODEL=<vlm-ir-dir> to check the VLM path too.
-//! Skips when CASCADIA_BOS_PARITY_MODEL is unset.
+//! Skips when CASCADIA_BOS_PARITY_MODEL is unset (the VLM test: when
+//! CASCADIA_BOS_PARITY_VLM_MODEL is unset).
+//!
+//! CASCADIA_BOS_PARITY_NO_BOS=1 accepts a tokenizer that adds no special
+//! tokens (Qwen3, Qwen3.5/3.6): no
+//! second BOS can appear there, so the run then checks only that the
+//! templated prompt reaches the pipeline untouched and gives the pipeline's
+//! own reply, which is the claim for those models (on the NPU, or on a
+//! Qwen3.5/3.6 VLM-layout export). It says so on stderr.
 #![cfg(feature = "openvino")]
 
 use cascadia_ov_genai_shim::{
@@ -61,16 +69,25 @@ fn cb_generate(pipe: &CbPipeline, id: u64, prompt: &str, cfg: &GenConfig) -> Str
 
 /// The rendered prompt and its token counts without and with special tokens,
 /// after checking the tokenizer does add special tokens on top of it (else a
-/// doubled BOS cannot happen and the check proves nothing).
+/// doubled BOS cannot happen and the check proves nothing), unless
+/// CASCADIA_BOS_PARITY_NO_BOS=1 accepts one that adds none.
 fn rendered_prompt(pipe: &LlmPipeline, model: &str) -> (String, u32, u32) {
     let rendered = pipe.apply_chat_template(USER).expect("render template");
     let with = pipe.count_tokens(&rendered, true).expect("count with");
     let without = pipe.count_tokens(&rendered, false).expect("count without");
     eprintln!("{model}: rendered {rendered:?}, {without} tokens (+special: {with})");
+    if with == without && std::env::var("CASCADIA_BOS_PARITY_NO_BOS").as_deref() == Ok("1") {
+        eprintln!(
+            "{model}'s tokenizer adds no special tokens (CASCADIA_BOS_PARITY_NO_BOS=1): \
+             checking only that the templated prompt arrives untouched and matches the reference"
+        );
+        return (rendered, without, with);
+    }
     assert!(
         with > without,
         "{model}'s tokenizer adds no special tokens to its rendered template; \
-         pick a BOS-template model (Llama-3.x, gemma-2b-it) or the check proves nothing"
+         pick a BOS-template model (Llama-3.x, gemma-2b-it) or the check proves nothing \
+         (CASCADIA_BOS_PARITY_NO_BOS=1 checks only the untouched prompt)"
     );
     (rendered, without, with)
 }
