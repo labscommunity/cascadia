@@ -8576,16 +8576,27 @@ mod tests {
     /// A prompt over the runner's context budget is refused at submit, where the
     /// caller can still be told (PromptTooLong is a 4xx before any stream), instead
     /// of being truncated during prefill and answered from its head. A prompt that
-    /// exactly fills the budget (StubRunner: 32) is accepted.
+    /// exactly fills the budget (StubRunner: 32) is accepted. The tokenizer adds a
+    /// BOS on `encode(.., true)`, so submit must count it as admission does.
     #[test]
     fn pipeline_engine_refuses_over_budget_prompt_at_submit() {
         let rt = tokio::runtime::Builder::new_current_thread()
             .build()
             .unwrap();
         let tok = Tokenizer::from_bytes(
-            br#"{"version":"1.0","truncation":null,"padding":null,"added_tokens":[],
-                "normalizer":null,"pre_tokenizer":{"type":"Whitespace"},"post_processor":null,
-                "decoder":null,"model":{"type":"WordLevel","vocab":{"hi":0},"unk_token":"hi"}}"#,
+            br#"{"version":"1.0","truncation":null,"padding":null,
+                "added_tokens":[{"id":1,"content":"<s>","single_word":false,"lstrip":false,
+                    "rstrip":false,"normalized":false,"special":true}],
+                "normalizer":null,"pre_tokenizer":{"type":"Whitespace"},
+                "post_processor":{"type":"TemplateProcessing",
+                    "single":[{"SpecialToken":{"id":"<s>","type_id":0}},
+                              {"Sequence":{"id":"A","type_id":0}}],
+                    "pair":[{"SpecialToken":{"id":"<s>","type_id":0}},
+                            {"Sequence":{"id":"A","type_id":0}},
+                            {"Sequence":{"id":"B","type_id":1}}],
+                    "special_tokens":{"<s>":{"id":"<s>","ids":[1],"tokens":["<s>"]}}},
+                "decoder":null,
+                "model":{"type":"WordLevel","vocab":{"hi":0,"<s>":1},"unk_token":"hi"}}"#,
         )
         .expect("build tiny tokenizer");
         let mut eng = PipelineEngine::new(
@@ -8601,9 +8612,11 @@ mod tests {
             None,
         );
         let words = |n: usize| vec!["hi"; n].join(" ");
-        eng.submit(GenerationTask::new("fits", words(32)))
+        // 31 words + BOS = 32 ids: exactly fills max_seq.
+        eng.submit(GenerationTask::new("fits", words(31)))
             .expect("a prompt that exactly fills max_seq is accepted");
-        match eng.submit(GenerationTask::new("over", words(33))) {
+        // 32 words + BOS = 33 ids: over by the BOS alone.
+        match eng.submit(GenerationTask::new("over", words(32))) {
             Err(EngineError::PromptTooLong(msg)) => {
                 assert!(msg.contains("33") && msg.contains("32"), "{msg}")
             }
