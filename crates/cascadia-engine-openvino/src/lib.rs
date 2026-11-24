@@ -86,11 +86,13 @@ pub(crate) fn forwarded_prompt_window(
 
 /// Refuse a prompt over a pipeline stage's model window at submit, counted as admission encodes
 /// it. Nothing else bounds these stages' prompts, so an unrefused one prefills past what the
-/// model was built for. No window or no count admits it.
+/// model was built for. `resume_len` resume ids join the prompt in the same prefill, so they
+/// count too. No window or no count admits it.
 pub(crate) fn refuse_over_model_window(
     tokenizer: Option<&tokenizers::Tokenizer>,
     prompt: &str,
     window: Option<u32>,
+    resume_len: usize,
 ) -> cascadia_engine::EngineResult<()> {
     let (Some(tokenizer), Some(window)) = (tokenizer, window) else {
         return Ok(());
@@ -98,7 +100,8 @@ pub(crate) fn refuse_over_model_window(
     let Ok(encoding) = tokenizer.encode(prompt, false) else {
         return Ok(());
     };
-    let tokens = u32::try_from(encoding.get_ids().len()).unwrap_or(u32::MAX);
+    let tokens =
+        u32::try_from(encoding.get_ids().len().saturating_add(resume_len)).unwrap_or(u32::MAX);
     match genai::prompt_over_limit(tokens, window) {
         Some(msg) => Err(cascadia_engine::EngineError::PromptTooLong(msg)),
         None => Ok(()),
@@ -135,8 +138,8 @@ mod model_window_tests {
     #[test]
     fn refuses_only_a_counted_prompt_past_the_window() {
         let tok = word_tokenizer();
-        assert!(refuse_over_model_window(Some(&tok), "hi hi hi", Some(3)).is_ok());
-        let err = refuse_over_model_window(Some(&tok), "hi hi hi hi", Some(3)).unwrap_err();
+        assert!(refuse_over_model_window(Some(&tok), "hi hi hi", Some(3), 0).is_ok());
+        let err = refuse_over_model_window(Some(&tok), "hi hi hi hi", Some(3), 0).unwrap_err();
         match err {
             EngineError::PromptTooLong(msg) => {
                 assert!(
@@ -146,8 +149,25 @@ mod model_window_tests {
             }
             other => panic!("expected PromptTooLong, got {other:?}"),
         }
-        assert!(refuse_over_model_window(Some(&tok), "hi hi hi hi", None).is_ok());
-        assert!(refuse_over_model_window(None, "hi hi hi hi", Some(3)).is_ok());
+        assert!(refuse_over_model_window(Some(&tok), "hi hi hi hi", None, 0).is_ok());
+        assert!(refuse_over_model_window(None, "hi hi hi hi", Some(3), 0).is_ok());
+    }
+
+    #[test]
+    fn resume_ids_count_against_the_window() {
+        // A resume sends prompt + resume ids in one prefill frame, so both count.
+        let tok = word_tokenizer();
+        assert!(refuse_over_model_window(Some(&tok), "hi hi", Some(3), 1).is_ok());
+        let err = refuse_over_model_window(Some(&tok), "hi hi", Some(3), 2).unwrap_err();
+        match err {
+            EngineError::PromptTooLong(msg) => {
+                assert!(
+                    msg.contains("prompt is 4 tokens") && msg.contains("at most 3"),
+                    "{msg}"
+                )
+            }
+            other => panic!("expected PromptTooLong, got {other:?}"),
+        }
     }
 
     #[test]

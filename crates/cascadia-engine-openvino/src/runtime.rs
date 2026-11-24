@@ -3866,6 +3866,7 @@ impl Engine for OvRuntimeEngine {
                 self.tokenizer.as_deref(),
                 &task.prompt,
                 self.prompt_window,
+                task.resume_ids().map_or(0, <[i32]>::len),
             )?;
         }
         self.pending.push(task);

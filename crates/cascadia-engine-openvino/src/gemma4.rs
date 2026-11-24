@@ -1532,6 +1532,7 @@ impl Engine for Gemma4Engine {
             self.tokenizer.as_deref(),
             &task.prompt,
             self.prompt_window,
+            0,
         )?;
         self.pending.push(task);
         Ok(())

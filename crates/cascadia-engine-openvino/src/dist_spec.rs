@@ -1474,7 +1474,12 @@ impl Engine for OvDistSpecEngine {
                 cap: MAX_PENDING_TASKS,
             });
         }
-        crate::refuse_over_model_window(Some(&self.tokenizer), &task.prompt, self.prompt_window)?;
+        crate::refuse_over_model_window(
+            Some(&self.tokenizer),
+            &task.prompt,
+            self.prompt_window,
+            task.resume_ids().map_or(0, <[i32]>::len),
+        )?;
         self.pending.push(task);
         Ok(())
     }
