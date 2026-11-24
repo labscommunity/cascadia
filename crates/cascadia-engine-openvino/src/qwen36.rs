@@ -2633,6 +2633,13 @@ impl Qwen36Engine {
         // A failed scrub leaves whatever was in the requests live; no snapshot of it may enter the
         // prefix cache until a reset succeeds (a warm restore overwrites it and is still allowed).
         self.stages_dirty = !all_ok;
+        // A recovery whose scrub fails fails the engine, so the server exits for a restart. A
+        // later admission sees a dirty stage but no fault, and would refuse every task for ever.
+        if recovering && !all_ok {
+            let why = "stage state reset failed after a failed infer".to_string();
+            error!(reason = %why, "qwen36: engine failed; every later task is refused until a restart");
+            self.fail_engine(why);
+        }
     }
 
     /// Finish the active task: reset state, log, emit the final marker.
@@ -7211,6 +7218,8 @@ mod tests {
         refuse_set: bool,
         /// Task 56: `abandon_request` fails, so the request can be neither idled nor abandoned.
         refuse_abandon: bool,
+        /// `reset_state` and `recreate_request` fail, as `create_infer_request` does on a GPU OOM.
+        refuse_scrub: bool,
     }
 
     impl Drop for MockStage {
@@ -7242,6 +7251,7 @@ mod tests {
                 residue: false,
                 refuse_set: false,
                 refuse_abandon: false,
+                refuse_scrub: false,
             }
         }
         pub(super) fn input_names(&self) -> cascadia_ov_genai_shim::Result<Vec<String>> {
@@ -7259,6 +7269,14 @@ mod tests {
                 return Ok(());
             };
             Err(cascadia_ov_genai_shim::Error::Native(why.into()))
+        }
+        fn refuse_scrub(&self) -> cascadia_ov_genai_shim::Result<()> {
+            if self.refuse_scrub {
+                return Err(cascadia_ov_genai_shim::Error::Native(
+                    "create_infer_request failed".into(),
+                ));
+            }
+            Ok(())
         }
         pub(super) fn request_state(&self) -> cascadia_ov_genai_shim::Result<RequestState> {
             Ok(if self.abandoned {
@@ -7359,6 +7377,7 @@ mod tests {
         }
         pub(super) fn reset_state(&mut self) -> cascadia_ov_genai_shim::Result<()> {
             self.refuse()?;
+            self.refuse_scrub()?;
             self.events.lock().unwrap().push("reset");
             if !self.residue {
                 self.folded = 0;
@@ -7369,6 +7388,7 @@ mod tests {
         /// The shim refuses to release a request that is not idle (it would block forever).
         pub(super) fn recreate_request(&mut self) -> cascadia_ov_genai_shim::Result<()> {
             self.refuse()?;
+            self.refuse_scrub()?;
             self.events.lock().unwrap().push("reset");
             self.folded = 0;
             self.ran = false;
@@ -7853,6 +7873,35 @@ mod tests {
 
     fn dropped(d: &Arc<std::sync::atomic::AtomicUsize>) -> usize {
         d.load(std::sync::atomic::Ordering::SeqCst)
+    }
+
+    #[test]
+    fn a_scrub_that_fails_after_a_recovery_fails_the_engine() {
+        // The requests come back to idle after a failed infer, but the scrub after it fails
+        // (`create_infer_request` on a GPU OOM). The engine fails, so the server exits for a
+        // restart, and does not refuse every later task on a dirty stage for ever.
+        let mut e = mock_box();
+        e.retry_disabled_for_test = true; // Task 57 off: the task fails, the next one recovers
+        busy_after_failed_infer(&mut e, 0, 1);
+        e.submit(chat("c1")).unwrap();
+        assert!(run_to_final(&mut e).error.is_some(), "the first task fails");
+        mock1(&mut e).refuse_scrub = true;
+
+        e.submit(chat("c2")).unwrap();
+        assert!(
+            run_to_final(&mut e).error.is_some(),
+            "not served on a dirty stage"
+        );
+        assert!(e.engine_failed.is_some(), "the engine failed");
+        assert_eq!(e.failure().reason(), e.engine_failed, "the server exits");
+
+        e.submit(chat("c3")).unwrap();
+        let c = run_to_final(&mut e);
+        let why = c.error.as_deref().expect("refused");
+        assert!(
+            why.contains("qwen36 engine failed"),
+            "the engine-failed refusal: {why}"
+        );
     }
 
     #[test]
