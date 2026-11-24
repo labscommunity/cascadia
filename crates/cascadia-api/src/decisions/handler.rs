@@ -575,4 +575,13 @@ mod tests {
             e => panic!("{e:?}"),
         }
     }
+
+    #[test]
+    fn engine_decision_unsupported_is_501_not_503() {
+        let e = engine_failure(
+            "decision_unsupported: a pipeline rank cannot serve decision passes (an older build)",
+        );
+        assert!(matches!(e, DecisionError::NotServed), "{e:?}");
+        assert_eq!(e.status(), axum::http::StatusCode::NOT_IMPLEMENTED);
+    }
 }
