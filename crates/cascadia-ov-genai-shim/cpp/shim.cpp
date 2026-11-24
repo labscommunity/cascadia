@@ -10,6 +10,7 @@
 #include <algorithm>
 #include <cstdint>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <fstream>
 #include <memory>
@@ -32,6 +33,16 @@
 #include <openvino/genai/chat_history.hpp>
 #include <openvino/genai/version.hpp>
 #include <openvino/core/version.hpp>
+
+#ifdef _WIN32
+#ifndef WIN32_LEAN_AND_MEAN
+#define WIN32_LEAN_AND_MEAN
+#endif
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
+#include <windows.h>
+#endif
 
 namespace {
 
@@ -215,6 +226,10 @@ struct cascadia_runtime_t {
     // restore are exactly that. Deliberately survives recreate_request: the CompiledModel
     // (and thus the plugin's KV precision) is retained, so the types cannot change.
     std::unordered_map<std::string, ov::element::Type> state_dtypes;
+    // The request's states hold KV: set by an inference or a restore, cleared by reset_state and
+    // recreate_request. A new request starts without. set_state_blob reads it to prime an empty
+    // GPU request (see prime_empty_gpu_request).
+    bool state_live = false;
 };
 
 extern "C" {
@@ -963,6 +978,9 @@ int32_t cascadia_runtime_reset_state(cascadia_runtime_t* handle) {
     try {
         // OV C++ API: query each variable_state and reset it. Equivalent
         // to InferRequest::reset_state() (which is sugar over this loop).
+        // Cleared first: a throw partway leaves the request neither empty nor whole, and a
+        // needless prime is harmless where a skipped one is not.
+        handle->state_live = false;
         for (auto& state : handle->request->query_state()) {
             state.reset();
         }
@@ -1013,6 +1031,7 @@ int32_t cascadia_runtime_recreate_request(cascadia_runtime_t* handle) {
     }
     try {
         handle->request = std::make_shared<ov::InferRequest>(handle->compiled->create_infer_request());
+        handle->state_live = false;
         return 0;
     } catch (const std::exception& e) {
         set_last_error(e); return 1;
@@ -1217,10 +1236,104 @@ int32_t cascadia_runtime_get_state_blob(cascadia_runtime_t* handle, uint8_t* buf
     catch (...) { set_last_error("unknown C++ exception in get_state_blob"); return 1; }
 }
 
+// Test-only: true when the environment variable `name` is "1". The prime tests use these
+// to run the prime on CPU (CASCADIA_SHIM_FORCE_PRIME) and to make it fail
+// (CASCADIA_SHIM_FAIL_PRIME). Do not set them in production.
+// On Windows, std::getenv reads the CRT copy of the environment from process start.
+// That copy does not see Rust `std::env::set_var`, which calls SetEnvironmentVariableW.
+// Thus Windows reads the process environment directly with GetEnvironmentVariableA.
+static bool test_env_set(const char* name) {
+#ifdef _WIN32
+    char buf[8];
+    DWORD n = GetEnvironmentVariableA(name, buf, sizeof buf);
+    return n == 1 && buf[0] == '1';
+#else
+    const char* v = std::getenv(name);
+    return v && std::strcmp(v, "1") == 0;
+#endif
+}
+
+// True when the compiled model executes on a GPU (`GPU`, `GPU.0`, or under AUTO/HETERO).
+static bool runs_on_gpu(const ov::CompiledModel& compiled) {
+    if (test_env_set("CASCADIA_SHIM_FORCE_PRIME")) return true;
+    try {
+        for (const auto& d : compiled.get_property(ov::execution_devices))
+            if (d.find("GPU") != std::string::npos) return true;
+    } catch (...) {
+        // Fail safe: a needless prime is harmless, a skipped one is not.
+        std::fprintf(stderr,
+                     "[cascadia-shim] set_state_blob: cannot read execution devices; "
+                     "priming the empty request\n");
+        return true;
+    }
+    return false;
+}
+
+// The GPU plugin (seen on 2026.2 and 2026.4.1) mishandles set_state into a request whose states
+// are empty: the restore succeeds and a 1-token step after it runs, but the first step of two or
+// more tokens fails with "opset1::Add ... Argument shapes are inconsistent". set_state over live
+// state of any length works and gives exactly the logits of an unrestored run. So before a restore
+// into an empty GPU request, run one throwaway 1-token inference: every input zero-filled, every
+// dynamic dim 1. It leaves one token of junk in each state, which the restore below overwrites (it
+// fails unless every state is applied). The caller's input tensors are put back afterwards.
+// Returns false when the prime fails, which must fail the restore: without the prime a restore can
+// be silently discarded, so it would report success and the next step would serve wrong tokens.
+static bool prime_empty_gpu_request(cascadia_runtime_t* handle) {
+    if (handle->state_live || handle->request->query_state().empty() ||
+        !runs_on_gpu(*handle->compiled))
+        return true;
+    bool primed = false;
+    std::vector<std::pair<ov::Output<const ov::Node>, ov::Tensor>> saved;
+    try {
+        for (const auto& port : handle->compiled->inputs()) {
+            try {
+                saved.emplace_back(port, handle->request->get_tensor(port));
+            } catch (const std::exception&) {
+            }
+            ov::Shape shape;
+            for (const auto& d : port.get_partial_shape())
+                shape.push_back(d.is_static() ? static_cast<size_t>(d.get_length()) : 1);
+            ov::Tensor t(port.get_element_type(), shape);
+            std::memset(t.data(), 0, t.get_byte_size());
+            // One attended token: an all-zero mask would leave the softmax nothing to attend.
+            if (port.get_names().count("attention_mask")) {
+                if (t.get_element_type() == ov::element::i64) {
+                    std::fill_n(t.data<int64_t>(), t.get_size(), int64_t{1});
+                } else if (t.get_element_type() == ov::element::i32) {
+                    std::fill_n(t.data<int32_t>(), t.get_size(), int32_t{1});
+                }
+            }
+            handle->request->set_tensor(port, t);
+        }
+        if (test_env_set("CASCADIA_SHIM_FAIL_PRIME"))
+            throw std::runtime_error("forced by CASCADIA_SHIM_FAIL_PRIME");
+        handle->request->infer();
+        handle->state_live = true;
+        primed = true;
+    } catch (const std::exception& e) {
+        // stderr too: some callers keep only the restore's pass or fail, not its last error.
+        std::fprintf(stderr,
+                     "[cascadia-shim] set_state_blob: GPU prime of an empty request failed (%s); "
+                     "failing the restore\n",
+                     e.what());
+        std::ostringstream oss;
+        oss << "set_state_blob: GPU prime of an empty request failed: " << e.what();
+        set_last_error(oss.str().c_str());
+    }
+    for (auto& [port, t] : saved) {
+        try {
+            handle->request->set_tensor(port, t);
+        } catch (const std::exception&) {
+        }
+    }
+    return primed;
+}
+
 int32_t cascadia_runtime_set_state_blob(cascadia_runtime_t* handle, const uint8_t* buf, size_t len) {
     if (!handle || !handle->request) { set_last_error("null runtime handle"); return 1; }
     if (!buf || len < 4) { set_last_error("set_state_blob: short buffer"); return 1; }
     try {
+        if (!prime_empty_gpu_request(handle)) return 1;
         // Canonical restore keyed by KV IDENTITY (layer, key/value) parsed from each VariableState
         // name. get_state_blob emits states in this same canonical order, so blob slot i maps to the
         // model state that shares its identity — independent of OV's per-INSTANCE query_state() ORDER
@@ -1355,6 +1468,8 @@ int32_t cascadia_runtime_set_state_blob(cascadia_runtime_t* handle, const uint8_
         // A skipped state (byte-size mismatch) leaves that variable at its CURRENT value while its
         // siblings carry the donor's — a silent half-restore the caller then treats as a good warm
         // resume. Fail instead so the engine falls back to a cold reprefill.
+        // A partial apply is scrubbed by the caller (recreate_request clears the flag again).
+        if (applied > 0) handle->state_live = true;
         if (applied != count) {
             std::ostringstream oss;
             oss << "set_state_blob: applied " << applied << " of " << count << " states"
@@ -1466,7 +1581,11 @@ int32_t cascadia_runtime_set_input(
 
 int32_t cascadia_runtime_infer(cascadia_runtime_t* handle) {
     if (!handle || !handle->request) { set_last_error("null runtime"); return 1; }
-    try { handle->request->infer(); return 0; }
+    try {
+        handle->request->infer();
+        handle->state_live = true;
+        return 0;
+    }
     catch (const std::exception& e) { set_last_error(e); return 1; }
     catch (...) {
         set_last_error("unknown C++ exception in infer"); return 1;

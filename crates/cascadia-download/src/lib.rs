@@ -65,7 +65,11 @@ impl ModelEntry {
             id: id.into(),
             source: default_source(),
             local_path: None,
-            pulled_at: chrono::Utc::now().timestamp(),
+            // Seconds since the Unix epoch, as chrono's `timestamp()` gave. A clock
+            // set before 1970 records 0.
+            pulled_at: std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map_or(0, |d| d.as_secs() as i64),
             size_bytes: 0,
             revision: None,
             tags: Vec::new(),
