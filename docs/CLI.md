@@ -239,7 +239,12 @@ variable chooses where the files live, not whether the posture is real, and
 `--elastic` claiming protection it cannot deliver is the worse surprise. Set
 `ELASTIC_ALLOW_TMPFS=1` to keep the configured directory anyway — correct only
 where swap actually leaves RAM, so a disk-backed swapfile or partition; with
-zram, "swapped" shmem still occupies RAM.
+zram, "swapped" shmem still occupies RAM. On ext4 and xfs the space for each
+file is reserved when it is created, so a full disk makes that allocation fall
+back to ordinary memory instead of crashing the process; the reserved space
+counts as used in `df` while the server runs. On other filesystems (btrfs,
+overlayfs, NFS) the files stay sparse, so keep free space there above the
+model's working set.
 
 **`--ov-cache-dir` is on by default and matters.** For `ov-genai`, `ov-runtime`,
 `gemma4` and `sparse-moe`, leaving it unset defaults to

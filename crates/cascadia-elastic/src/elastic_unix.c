@@ -23,6 +23,11 @@
  * the pool, per-inference scratch pays an mmap round trip every step — the
  * eager-return anti-pattern exp 097 measured (v1 of this shim: -35% decode).
  *
+ * On ext4/xfs each tmpfile's blocks are reserved with fallocate when it is
+ * created, so a full disk makes that allocation fall back to anonymous memory
+ * instead of SIGBUSing on a later write fault. Other filesystems (btrfs,
+ * overlayfs, NFS...) keep a sparse file, which can still SIGBUS when full.
+ *
  * Env:  ELASTIC_MIN_MB   threshold in MB (default 1)
  *       ELASTIC_DIR      backing dir for the tmpfiles (default $TMPDIR or /tmp)
  *       ELASTIC_ALLOW_TMPFS=1  keep a tmpfs/ramfs backing dir (only correct
@@ -131,6 +136,17 @@ static int dir_usable(const char *dir) {
     return ok;
 }
 
+/* Filesystems that overwrite in place, where a preallocated block is good for
+ * every later write to it. Not copy-on-write ones (btrfs: rewriting a page
+ * that was written back needs new space, so a full disk can still SIGBUS) and
+ * not overlayfs (its upper layer may be tmpfs, where fallocate commits the
+ * pages up front). Those keep the sparse file. */
+static int dir_can_prealloc(const char *dir) {
+    struct statfs st;
+    if (!dir || statfs(dir, &st) != 0) return 0;
+    return st.f_type == EXT4_SUPER_MAGIC || st.f_type == XFS_SUPER_MAGIC;
+}
+
 static unsigned long long dir_free_bytes(const char *dir) {
     struct statfs st;
     if (!dir || statfs(dir, &st) != 0) return 0;
@@ -202,6 +218,22 @@ static void resolve_backing_dir(void) {
     warn_write(m, sizeof m);
 }
 
+/* Size a fresh tmpfile. With prealloc (ext4/xfs) the blocks are reserved now,
+ * so a full filesystem fails here and the caller falls back to anonymous
+ * memory; a sparse file (ftruncate) is accepted and then SIGBUSes on the first
+ * write the disk cannot hold. Every other filesystem (tmpfs/ramfs, btrfs,
+ * overlayfs, NFS...) keeps the sparse file, as does one without fallocate. */
+static int g_prealloc;                 /* set at init: g_dir is ext4/xfs */
+static int reserve_tmpfile(int fd, off_t len, int prealloc) {
+    if (prealloc) {
+        int r;
+        do r = fallocate(fd, 0, 0, len); while (r != 0 && errno == EINTR);
+        if (r == 0) return 0;
+        if (errno != EOPNOTSUPP && errno != ENOSYS) return -1;
+    }
+    return ftruncate(fd, len);
+}
+
 static void do_init(void) {
     g_in_init = 1;
     real_malloc         = dlsym(RTLD_NEXT, "malloc");
@@ -230,6 +262,7 @@ static void do_init(void) {
     g_mmap_on = !((v = getenv("ELASTIC_MMAP")) && *v == '0');
     /* A memory-backed dir makes the posture a no-op under a cap: escape it. */
     resolve_backing_dir();
+    g_prealloc = dir_can_prealloc(g_dir);
     /* Same warning, different failure mode: on a rotational device the
      * mechanism still works, but the page-ins are seek-bound, so "slow but
      * alive" degrades into "dead". Decode re-reads every weight on every
@@ -368,7 +401,7 @@ static void *big_alloc2(size_t size, int want_zero) {
     }
     int fd = open(g_dir, O_TMPFILE | O_RDWR | O_EXCL, 0600);
     if (fd < 0) { atomic_fetch_add(&n_fallback, 1); return NULL; }
-    if (ftruncate(fd, (off_t)total) != 0) { close(fd); return NULL; }
+    if (reserve_tmpfile(fd, (off_t)total, g_prealloc) != 0) { close(fd); atomic_fetch_add(&n_fallback, 1); return NULL; }
     base = mmap(NULL, total, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
     if (base == MAP_FAILED) { close(fd); atomic_fetch_add(&n_fallback, 1); return NULL; }
     close(fd);                           /* mapping holds the inode; no fd kept */
@@ -494,8 +527,8 @@ void *valloc(size_t size) { return memalign(PAGE, size); }
  * those mappings from the same O_TMPFILE pool: map the tmpfile MAP_SHARED
  * and close the fd immediately (the mapping holds the reference; the
  * unlinked inode dies with the mapping), so munmap/mremap/madvise need no
- * tracking. Fresh sparse file pages read as zeros — MAP_ANONYMOUS's
- * zero-on-first-touch semantics are preserved.
+ * tracking. Fresh file pages (sparse or preallocated) read as zeros —
+ * MAP_ANONYMOUS's zero-on-first-touch semantics are preserved.
  * Interposed only when: addr==NULL, writable, non-exec, anonymous+private,
  * no MAP_FIXED/MAP_STACK/HUGETLB, and len >= threshold (the fd argument is
  * ignored by the kernel for anonymous mappings, so any value passes).
@@ -512,7 +545,9 @@ void *mmap(void *addr, size_t len, int prot, int flags, int fd, off_t off) {
                       | MAP_HUGETLB | MAP_SYNC))) {
         int tf = open(g_dir, O_TMPFILE | O_RDWR | O_EXCL, 0600);
         if (tf >= 0) {
-            if (ftruncate(tf, (off_t)len) == 0) {
+            /* MAP_NORESERVE asked for fault-time allocation: keep it sparse. */
+            if (reserve_tmpfile(tf, (off_t)len,
+                                g_prealloc && !(flags & MAP_NORESERVE)) == 0) {
                 void *p = real_mmap(NULL, len, PROT_READ | PROT_WRITE,
                                     MAP_SHARED, tf, 0);
                 close(tf);              /* mapping holds the reference */
