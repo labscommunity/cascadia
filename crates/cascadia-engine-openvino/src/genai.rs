@@ -382,17 +382,17 @@ fn default_prompt_token_limit(device: &str, model_path: &str, props: &[(String, 
         .and_then(|s| serde_json::from_str::<serde_json::Value>(&s).ok());
     let window = |v: &serde_json::Value| -> Option<u64> {
         let positions = v.get("max_position_embeddings")?.as_u64()?;
-        // YaRN / linear / dynamic scaling extend the window past the stated positions;
-        // llama3 and longrope configs already state the scaled window.
+        // YaRN / linear / dynamic scaling extend the window to original * factor.
+        // Without the original length, the stated positions are already the scaled
+        // window (Gemma 3), and llama3 and longrope configs state it too. Tradeoff:
+        // Llama-2-era linear configs without the original length (vicuna-7b-v1.5-16k)
+        // get the base 4096 and refuse longer prompts with a 413, not junk.
         let scaled = v.get("rope_scaling").and_then(|r| {
             let kind = r.get("rope_type").or_else(|| r.get("type"))?.as_str()?;
             if !matches!(kind, "yarn" | "linear" | "dynamic") {
                 return None;
             }
-            let base = r
-                .get("original_max_position_embeddings")
-                .and_then(serde_json::Value::as_u64)
-                .unwrap_or(positions);
+            let base = r.get("original_max_position_embeddings")?.as_u64()?;
             Some((base as f64 * r.get("factor")?.as_f64()?) as u64)
         });
         Some(positions.max(scaled.unwrap_or(0)))
@@ -1313,8 +1313,9 @@ mod tests {
         assert_eq!(default_prompt_token_limit(" npu ", model, &cap), 2048);
     }
 
-    /// YaRN / linear / dynamic rope scaling extends the window past the config's
-    /// `max_position_embeddings`; llama3 and longrope configs already state the scaled one.
+    /// YaRN / linear / dynamic rope scaling extends the window to
+    /// `original_max_position_embeddings * factor`; without the original length, and for
+    /// llama3 and longrope, `max_position_embeddings` already states the scaled window.
     #[test]
     fn default_prompt_limit_follows_rope_scaling() {
         let dir = tempfile::tempdir().unwrap();
@@ -1325,10 +1326,17 @@ mod tests {
                 "original_max_position_embeddings":32768}}"#,
         );
         assert_eq!(default_prompt_token_limit("CPU", model, &[]), 131072);
+        // No original length: the stated positions are already the window.
         write(
             r#"{"max_position_embeddings":40960,"rope_scaling":{"rope_type":"yarn","factor":4.0}}"#,
         );
-        assert_eq!(default_prompt_token_limit("CPU", model, &[]), 163840);
+        assert_eq!(default_prompt_token_limit("CPU", model, &[]), 40960);
+        // Gemma 3 (google/gemma-3-4b-it): 131072 is the scaled window, not the base.
+        write(
+            r#"{"text_config":{"max_position_embeddings":131072,
+                "rope_scaling":{"factor":8.0,"rope_type":"linear"}}}"#,
+        );
+        assert_eq!(default_prompt_token_limit("CPU", model, &[]), 131072);
         write(
             r#"{"max_position_embeddings":131072,"rope_scaling":{"rope_type":"llama3","factor":8.0,
                 "original_max_position_embeddings":8192}}"#,
