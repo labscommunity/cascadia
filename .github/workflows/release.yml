@@ -517,7 +517,11 @@ jobs:
           ref: ${{ inputs.tag || github.ref }}
           persist-credentials: false
 
-      - name: Install oneAPI DPC++ + oneMKL, ninja
+      # Ninja is not installed here: the windows-2022 image already ships it
+      # (choco reported "ninja v1.13.2 already installed"), so nothing unpinned
+      # is downloaded. An image without it fails at CMake configure, never
+      # silently.
+      - name: Install oneAPI DPC++ + oneMKL
         shell: cmd
         run: |
           curl.exe --fail --output "%RUNNER_TEMP%\oneapi.exe" --url "%ONEAPI_INSTALLER%" --retry 5 --retry-delay 5 || exit /b 1
@@ -527,7 +531,6 @@ jobs:
           del "%RUNNER_TEMP%\oneapi.exe"
           "%RUNNER_TEMP%\oneapi\bootstrapper.exe" -s --action install --components=%ONEAPI_COMPONENTS% --eula=accept -p=NEED_VS2017_INTEGRATION=0 -p=NEED_VS2019_INTEGRATION=0 -p=NEED_VS2022_INTEGRATION=0 --log-dir="%RUNNER_TEMP%\oneapi-logs" || exit /b 1
           rd /s /q "%RUNNER_TEMP%\oneapi"
-          choco install ninja -y --no-progress || exit /b 1
 
       # Without headers + ze_loader.lib the SYCL backend silently builds with
       # GGML_SYCL_SUPPORT_LEVEL_ZERO_API off ("Level Zero loader or headers not
@@ -644,7 +647,7 @@ jobs:
           cd "$RUNNER_TEMP/cascadia-llama-sycl"
           # Host libraries are destination-provided and absent on the runner
           # (same list as is_host_library in the packager).
-          host='lib(OpenCL|ze_loader|ze_intel_gpu|igdrcl|igc|c|m|mvec|pthread|dl|rt|resolv|util|gcc_s|stdc\+\+|z|numa|ssl|crypto)\.so'
+          host='lib(OpenCL|ze_loader|ze_intel_gpu|igdrcl|c|m|mvec|pthread|dl|rt|resolv|util|gcc_s|stdc\+\+|z|numa|ssl|crypto)\.so'
           missing="$(env -u LD_LIBRARY_PATH ldd ./llama-server | grep 'not found' | grep -Ev "$host" || true)"
           if [ -n "$missing" ]; then
             echo "::error::bundle has unresolved libraries: $missing"; exit 1

@@ -97,11 +97,35 @@ int sycl_value(void) {
             f"-L{self.runtime}", "-lsycl", f"-Wl,-rpath,{self.runtime}",
         )
 
-    def package(self):
+    def package(self, *options):
         return subprocess.run(
-            ["bash", str(SCRIPT), str(self.build), str(self.archive)],
+            ["bash", str(SCRIPT), str(self.build), str(self.archive), *options],
             env=self.env, text=True, capture_output=True,
         )
+
+    def link_server_against_missing(self, soname):
+        """Rebuild the server with a DT_NEEDED on soname, then delete that library."""
+        stub = self.root / "stub"
+        stub.mkdir(exist_ok=True)
+        name = soname.split(".so")[0][len("lib"):]
+        self.compile(stub / soname, "int stub_value(void) { return 1; }",
+                     "-shared", "-fPIC", f"-Wl,-soname,{soname}")
+        (stub / f"lib{name}.so").symlink_to(soname)
+        self.compile(
+            self.bin / "llama-server",
+            "extern int sycl_value(void); extern int stub_value(void);\n"
+            "int main(void) { return sycl_value() + stub_value() == 43 ? 0 : 73; }\n",
+            f"-L{self.runtime}", "-lsycl", f"-Wl,-rpath,{self.runtime}",
+            f"-L{stub}", f"-l{name}",
+        )
+        (stub / soname).unlink()
+        ldd = subprocess.run(["ldd", str(self.bin / "llama-server")], env=self.env,
+                             text=True, capture_output=True).stdout
+        self.assertIn(f"{soname} => not found", ldd)
+
+    def archive_names(self):
+        with tarfile.open(self.archive) as archive:
+            return {Path(name).name for name in archive.getnames()}
 
     def unpack_and_remove_sources(self):
         destination = self.root / "relocated"
@@ -207,6 +231,37 @@ int sycl_value(void) {
         result = self.package()
         self.assertNotEqual(result.returncode, 0)
         self.assertIn("outside bundle", result.stderr)
+        self.assertFalse(self.archive.exists())
+
+    # A GPU-less release runner: the SYCL runtime aborts before --version, so
+    # the run is skipped while every relocation check still applies.
+    def test_no_run_check_packages_without_running_the_server(self):
+        self.compile(self.bin / "llama-server", "int main(void) { return 73; }")
+        self.assertNotEqual(self.package().returncode, 0)
+        result = self.package("--no-run-check")
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertIn("run check skipped", result.stdout)
+        self.assertNotIn("VERSION.txt", self.archive_names())
+
+    def test_missing_host_library_is_tolerated_and_not_bundled(self):
+        # The runner has no GPU driver; the destination provides the loader.
+        self.link_server_against_missing("libze_loader.so.1")
+        result = self.package("--no-run-check")
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertNotIn("libze_loader.so.1", self.archive_names())
+
+    def test_missing_non_host_library_still_aborts_packaging(self):
+        self.link_server_against_missing("libnothost.so.1")
+        result = self.package("--no-run-check")
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("unresolved dependency", result.stderr)
+        self.assertIn("libnothost.so.1", result.stderr)
+        self.assertFalse(self.archive.exists())
+
+    def test_unknown_option_is_rejected(self):
+        result = self.package("--bogus")
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("unknown option: --bogus", result.stderr)
         self.assertFalse(self.archive.exists())
 
 

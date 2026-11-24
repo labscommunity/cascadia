@@ -2,7 +2,7 @@
 #
 # Usage: scripts\package-llama-stream-windows.ps1 BUILD_DIR OUT_ZIP [-NoRunCheck]
 #   BUILD_DIR    the DEST passed to build-llama-stream-windows.bat (contains build\bin)
-#   OUT_ZIP      e.g. cascadia-llama-sycl-windows-x86_64-v0.3.0.zip
+#   OUT_ZIP      e.g. cascadia-llama-sycl-0.3.0-windows-x86_64.zip (the release asset name)
 #   -NoRunCheck  skip running the staged server. Use it only on a builder with
 #                no Intel GPU (hosted CI): the SYCL runtime aborts at startup
 #                when it finds no device, even for --version. The import walk
@@ -61,8 +61,10 @@ $urLoader = Find-OneApiFile "ur_loader.dll"
 if (-not $urLoader) {
     # Say what the install actually contains instead of failing blind: a
     # toolkit without the DPC++ runtime DLLs looks identical to a PATH problem.
-    $bin = Join-Path $env:ONEAPI_ROOT "compiler\latest\bin"
-    if (Test-Path -LiteralPath $bin) {
+    $bin = if ($env:ONEAPI_ROOT) { Join-Path $env:ONEAPI_ROOT "compiler\latest\bin" } else { $null }
+    if (-not $bin) {
+        Write-Output "ONEAPI_ROOT is not set"
+    } elseif (Test-Path -LiteralPath $bin) {
         Write-Output ("compiler\latest\bin DLLs: " + ((Get-ChildItem -LiteralPath $bin -Filter *.dll -ErrorAction SilentlyContinue | Select-Object -First 25 -ExpandProperty Name) -join ", "))
     } else {
         Write-Output "compiler\latest\bin does not exist under $env:ONEAPI_ROOT"

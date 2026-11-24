@@ -41,7 +41,28 @@ Python is not needed for inference. It is needed only for `cascadia shard` — w
 ## GGUF inference with sycl-llama
 
 This engine works in the default Rust build; it does not require OpenVINO.
-Install Intel oneAPI and the Intel GPU driver first, then build both executables:
+
+**Prebuilt patched `llama-server`.** Each release ships it next to the
+OpenVINO bundles, with its SYCL, oneMKL and Unified Runtime libraries beside
+the executable, so no oneAPI install is needed:
+
+- `cascadia-llama-sycl-<ver>-linux-x86_64.tar.gz` — needs the Intel GPU driver
+  with its Level Zero loader (`libze_loader.so.1`) and OpenCL ICD.
+- `cascadia-llama-sycl-<ver>-windows-x86_64.zip` — needs the Intel GPU driver
+  and the Microsoft VC++ redistributable. A release can be missing this zip;
+  the release log names it when it is.
+
+```bash
+tar -xzf cascadia-llama-sycl-<ver>-linux-x86_64.tar.gz
+export CASCADIA_LLAMA_BIN="$PWD/cascadia-llama-sycl/llama-server"
+cascadia run /path/to/model.gguf --engine sycl-llama --elastic --api 127.0.0.1:8080
+```
+
+On Windows, unzip it and `set CASCADIA_LLAMA_BIN=%CD%\cascadia-llama-sycl\llama-server.exe`.
+`HOST-DEPENDENCIES.txt` in the zip lists the DLLs it expects from the system.
+
+**Building it yourself.** Install Intel oneAPI and the Intel GPU driver first,
+then build both executables:
 
 ```bash
 cargo install --path crates/cascadia --locked
@@ -52,8 +73,9 @@ cascadia doctor
 cascadia run /path/to/model.gguf --engine sycl-llama --elastic --api 127.0.0.1:8080
 ```
 
-The existing OpenVINO release bundles do not include this child executable.
-On Windows, use `scripts\build-llama-stream-windows.bat` from a VS 2022 Developer
+The OpenVINO release bundles do not include this child executable; it ships
+as the separate `cascadia-llama-sycl-*` assets above.
+To build on Windows, use `scripts\build-llama-stream-windows.bat` from a VS 2022 Developer
 Command Prompt with Intel oneAPI installed. See [the engine guide](docs/engines/sycl-llama.md)
 for GPU selection, weight budgets, limitations and runtime setup.
 
