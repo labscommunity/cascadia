@@ -84,7 +84,7 @@ def _check_against_reference(ov, m, head, hs, rtol=0.0):
 
 def test_export_joint_head_from_real_dir(tmp_path):
     """Real Clef weights: only when CLEF_HEAD_DIR points at joint_head.safetensors + config. Beyond the
-    input names, the exported IR must reproduce the real head's logits (H35)."""
+    input names, the exported IR must reproduce the real head's logits."""
     ov = pytest.importorskip("openvino")
     pytest.importorskip("safetensors")
     head_dir = os.environ.get("CLEF_HEAD_DIR")

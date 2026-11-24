@@ -554,7 +554,7 @@ mod tests {
 
     #[test]
     fn frame_bodies_are_capped_on_encode() {
-        // H20: the sender refuses what the receiver would refuse.
+        // The sender refuses what the receiver would refuse.
         assert!(framed(vec![b'1'; MAX_DECISION_BODY_BYTES]).is_ok());
         let e = framed(vec![b'1'; MAX_DECISION_BODY_BYTES + 1]).unwrap_err();
         assert!(e.contains("exceeds"), "{e}");
@@ -592,7 +592,7 @@ mod tests {
 
     #[test]
     fn head_assets_load_verbalizer_and_pointer() {
-        // H22: hidden 3, dp 2.
+        // Hidden 3, dp 2.
         let d = head_dir(r#"{"kind":"verbalizer"}"#, &[]);
         let a = HeadAssets::load(&d, 3).unwrap();
         assert_eq!(a.kind(), "verbalizer");
@@ -624,7 +624,7 @@ mod tests {
 
     #[test]
     fn head_assets_load_refuses_bad_files() {
-        // H22: a .f32 of the wrong size, a pointer without dp, an unknown kind, no head.json.
+        // A .f32 of the wrong size, a pointer without dp, an unknown kind, no head.json.
         let short = [
             ("pointer_q_w.f32", 6),
             ("pointer_q_b.f32", 2),
@@ -657,14 +657,14 @@ mod tests {
 
     #[test]
     fn lm_head_mean_averages_rows_and_refuses_ids_past_vocab() {
-        // H22: vocab 3, hidden 2, f16 rows [1,2], [3,4], [5,6].
+        // Vocab 3, hidden 2, f16 rows [1,2], [3,4], [5,6].
         let table: Vec<u8> = [1.0f32, 2.0, 3.0, 4.0, 5.0, 6.0]
             .iter()
             .flat_map(|&x| half::f16::from_f32(x).to_le_bytes())
             .collect();
         let mut f = std::io::Cursor::new(table);
         assert_eq!(lm_head_mean(&mut f, 2, 3, &[0, 2]).unwrap(), vec![3.0, 4.0]);
-        // The same handle serves the next option (the pass opens the file once, H19).
+        // The same handle serves the next option (the pass opens the file once).
         assert_eq!(lm_head_mean(&mut f, 2, 3, &[1]).unwrap(), vec![3.0, 4.0]);
         assert_eq!(
             lm_head_mean(&mut f, 2, 3, &[1, 3]).unwrap_err(),

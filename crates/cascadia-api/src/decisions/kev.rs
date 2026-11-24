@@ -91,7 +91,7 @@ struct Renderer {
 }
 
 /// Python's `str.isspace`: Unicode White_Space plus the separators \x1c-\x1f, so the list-item
-/// strip matches kev.py's `lstrip()` (H10).
+/// strip matches kev.py's `lstrip()`.
 fn py_space(c: char) -> bool {
     c.is_whitespace() || ('\x1c'..='\x1f').contains(&c)
 }
@@ -252,7 +252,7 @@ impl Codec for KevCodec {
             tokens: self.max_total_tokens,
         };
         // A token is at most ~8 bytes of honest rendered text: a state rendering past
-        // max_state x 8 bytes is refused before the tokenizer pays for it (P2-SEC-3).
+        // max_state x 8 bytes is refused before the tokenizer pays for it.
         let text = b.render(&req.state)?;
         let cap = self.max_state.saturating_mul(8);
         if text.len() > cap {
@@ -312,7 +312,7 @@ impl Codec for KevCodec {
             };
             // Like the state: the row has `max_tokens - state` tokens left, so a question
             // (instructions plus option texts) rendering past 8 bytes per token of that is refused
-            // before the tokenizer pays for it (P3-SEC residual of P2-SEC-3).
+            // before the tokenizer pays for it.
             let left = self.max_tokens - state.len();
             let row_cap = left.saturating_mul(8);
             let text = instructions.len() + opts.iter().map(String::len).sum::<usize>();
@@ -447,7 +447,7 @@ mod tests {
 
     #[test]
     fn list_items_strip_leading_space_like_python_lstrip() {
-        // H10: Python's `str.lstrip()` also strips the separators \x1c-\x1f, which Rust's
+        // Python's `str.lstrip()` also strips the separators \x1c-\x1f, which Rust's
         // `char::is_whitespace` does not count; both strip the Unicode spaces (here U+00A0).
         assert_eq!(
             render(&ov(r#"["\u001cfoo", "\u001f bar"]"#), 0),
@@ -460,7 +460,7 @@ mod tests {
 
     #[test]
     fn option_text_with_empty_descriptions() {
-        // H9: kev.api.option_text drops the separator only for an absent, null or "" description;
+        // kev.api.option_text drops the separator only for an absent, null or "" description;
         // an empty list or object renders to "" after it (`name: `), as kev.py does.
         let mut b = Budget {
             left: 1000,
@@ -558,7 +558,7 @@ mod tests {
 
     #[test]
     fn new_rechecks_the_temperature_bound() {
-        // Task 24 M1: a profile built without `DecisionProfile::load` gets the same refusal.
+        // A profile built without `DecisionProfile::load` gets the same refusal.
         for t in [0.0, f64::NAN, 1e-309] {
             let e = KevCodec::new(tok(), KevProfile { temperature: t }, 100, 400)
                 .err()
@@ -631,7 +631,7 @@ mod tests {
 
     #[test]
     fn state_over_serve_max_state_is_413() {
-        // FID-2: kev.model.admit refuses a state over SERVE_MAX_STATE tokens, <state> included,
+        // kev.model.admit refuses a state over SERVE_MAX_STATE tokens, <state> included,
         // even when the row would fit max_tokens.
         let mut c = KevCodec::new(tok(), KevProfile { temperature: 1.0 }, 1000, 4000).unwrap();
         assert_eq!(c.max_state, SERVE_MAX_STATE);
@@ -653,7 +653,7 @@ mod tests {
 
     #[test]
     fn a_rendered_state_over_eight_bytes_per_allowed_token_is_413_before_tokenizing() {
-        // P2-SEC-3: the rendered state is bounded at max_state x 8 bytes before the tokenizer
+        // The rendered state is bounded at max_state x 8 bytes before the tokenizer
         // runs, so a guaranteed-413 state never costs a full tokenization.
         let mut c = KevCodec::new(tok(), KevProfile { temperature: 1.0 }, 1000, 4000).unwrap();
         c.max_state = 3;
@@ -706,7 +706,7 @@ mod tests {
 
     #[test]
     fn limits_match_kev_api() {
-        // FID-1: 1..=255 choice criteria and score levels (kev/api.py MAX_OPTIONS, min_length=1).
+        // 1..=255 choice criteria and score levels (kev/api.py MAX_OPTIONS, min_length=1).
         let c = KevCodec::new(tok(), KevProfile { temperature: 1.0 }, 1000, 4000).unwrap();
         let l = c.limits();
         assert_eq!((l.max_options, l.min_levels, l.max_levels), (255, 1, 255));
@@ -729,7 +729,7 @@ mod tests {
 
     #[test]
     fn legend_is_the_rendered_level_text() {
-        // EDGE-5(c): kev/api.py legend = dict(zip(keys, [render(x) for x in criteria])).
+        // kev/api.py legend = dict(zip(keys, [render(x) for x in criteria])).
         let c = KevCodec::new(tok(), KevProfile { temperature: 1.0 }, 1000, 4000).unwrap();
         let r: DecisionRequest = serde_json::from_str(
             r#"{"model": "m", "state": "a", "questions": {"s": {"type": "score", "criteria": [{"name": "x"}, "lo", 2, true]}}}"#,
@@ -745,7 +745,7 @@ mod tests {
 
     #[test]
     fn list_state_with_image_fields_is_plain_data() {
-        // EDGE-1: kev.api.render turns a catalogue record with an `image` key into text.
+        // kev.api.render turns a catalogue record with an `image` key into text.
         let c = KevCodec::new(tok(), KevProfile { temperature: 1.0 }, 1000, 4000).unwrap();
         let r: DecisionRequest = serde_json::from_str(
             r#"{"model": "m", "state": [{"sku": 1, "image": "a"}, {"type": "image_url", "image_url": "b"}], "questions": {"u": {"type": "noul"}}}"#,

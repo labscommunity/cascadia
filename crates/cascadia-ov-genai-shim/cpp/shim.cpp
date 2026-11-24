@@ -240,7 +240,7 @@ struct cascadia_runtime_t {
     bool state_live = false;
 };
 
-// ───── Task 46: a request a failed infer left busy ─────
+// ───── A request a failed infer left busy ─────
 //
 // OpenVINO's `ov::IAsyncInferRequest` (src/inference/src/dev/iasync_infer_request.cpp, 2026.0)
 // keeps an IDLE/BUSY/CANCELLED/STOP state under its own mutex, and every request method checks it
@@ -249,7 +249,7 @@ struct cascadia_runtime_t {
 // on every outstanding future with no timeout. So a request whose state stayed BUSY, with a
 // promise nobody will ever set, blocks forever in its destructor: releasing it in
 // `recreate_request` (or `destroy`) hangs the caller. On the GPU after `unknown C++ exception in
-// infer` (Task 46, pawan-03) `reset_state` reported busy and the next `recreate_request` never
+// infer` (on an Arc 140V box) `reset_state` reported busy and the next `recreate_request` never
 // returned. The calls below let the engine find out without blocking, try OpenVINO's own way back
 // to idle (`cancel()`, bounded `wait_for`), and abandon a request that never gets there instead of
 // destroying it.
@@ -283,7 +283,7 @@ static int32_t request_state_of(const std::shared_ptr<ov::InferRequest>& req) {
 // does not run its destructor either.
 // False only when the holder cannot be allocated: the request is then left in place, untouched.
 // Never throws, so no exception crosses the extern "C" boundary.
-// Every request leaked this way in this process (Task 54): `cascadia_runtime_leaked_requests`.
+// Every request leaked this way in this process: `cascadia_runtime_leaked_requests`.
 static std::atomic<uint64_t> g_leaked_requests{0};
 
 static bool abandon_request(std::shared_ptr<ov::InferRequest>& req) noexcept {
@@ -913,7 +913,7 @@ int32_t cascadia_runtime_compile(
 
 void cascadia_runtime_destroy(cascadia_runtime_t* handle) {
     if (!handle) return;
-    // A busy request would block this delete forever (Task 46): leak it instead. The Rust
+    // A busy request would block this delete forever: leak it instead. The Rust
     // `Drop` logs the leak. Out of memory for the holder: leak the whole handle, never block.
     if (request_state_of(handle->request) != CASCADIA_REQ_IDLE &&
         !abandon_request(handle->request)) {
@@ -1103,7 +1103,7 @@ int32_t cascadia_runtime_recreate_request(cascadia_runtime_t* handle) {
         set_last_error("null runtime handle"); return 1;
     }
     try {
-        // Task 46: releasing a request that is not idle can block forever in its destructor.
+        // Releasing a request that is not idle can block forever in its destructor.
         // Refuse instead; the engine makes it idle first (`cascadia_runtime_cancel` + `wait_for`).
         const int32_t st = request_state_of(handle->request);
         if (st == CASCADIA_REQ_BUSY || st == CASCADIA_REQ_CANCELLED) {

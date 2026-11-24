@@ -1,4 +1,4 @@
-"""Parity tooling for wide JEV choices (Task 38): WIDE_RECORDS, multi-pass dump alignment, the
+"""Parity tooling for wide JEV choices: WIDE_RECORDS, multi-pass dump alignment, the
 serve_decide plan/combine ports, and the wide paths of codec_golden, reference_stream and parity_check.
 
     python -m pytest tools/tests/test_wide_parity.py -v

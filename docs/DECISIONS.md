@@ -501,10 +501,10 @@ took 17 s as before.
 
 JEV's reference server can also answer with System 2: the base model reasons over the question in
 its chat template, its answer distribution `p2` is read back after the thought and blended with
-System 1's `p1`. Cascadia built it (Tasks 41 to 45, with a switchable-LoRA export that ran the
-base model from the same tree) and removed it in Task 53, after an A/B on hardware:
+System 1's `p1`. Cascadia built it (with a switchable-LoRA export that ran the
+base model from the same tree) and removed it after an A/B on hardware:
 
-- **Setup.** typed-decisions on pawan-03's GPU (Intel Arc 140V), 8 cases, the 16 questions that
+- **Setup.** typed-decisions on the GPU of an Intel Arc 140V box, 8 cases, the 16 questions that
   thought.
 - **Accuracy.** The blend never changed an argmax: 7/16 correct with and without it. The read-back
   `p2` put 0.975 mean mass on System 1's own argmax.
@@ -527,9 +527,9 @@ What remains of it:
   the flag; `trees/jev9b-int8-sw` on the test boxes is such a tree. The `jev.answer_labels`,
   `jev.answer_label_ids` and `jev.end_think_id` that trees exported in between carry are ignored,
   and the exporter no longer writes them.
-- **Pipeline wire.** As before Task 41: HELLO_ACK capability bits 0 (capture_v2) and 1 (decision
+- **Pipeline wire.** As before System 2: HELLO_ACK capability bits 0 (capture_v2) and 1 (decision
   frames) only, no `lora_scale` key in the HELLO payload, and `pos = 0` in RESET and RESTORE. A
-  rank built between Tasks 42 and 53 still interoperates on a baked tree: its extra bit 2 is
+  rank built while System 2 shipped still interoperates on a baked tree: its extra bit 2 is
   dropped by the AND along the chain, and its extra HELLO key is ignored.
 
 ## Confidence
@@ -651,7 +651,7 @@ python tools/decision_export.py clef --base-ir STOCK_INT8_IR \
   holds the whole model, which serves faster (see [One stage or eight](#one-stage-or-eight)).
   A pipeline passes one per rank (`--stages 2` for two machines), as before. `--stages 8` cuts a
   single-box tree for a machine with too little RAM for the 1-stage export: the export then holds
-  one stage at a time. Exporter peak RAM (process tree working set) measured on pawan-01, 1 stage
+  one stage at a time. Exporter peak RAM (process tree working set) measured on an Arc 140V box, 1 stage
   against 8: JEV 8.25 against 3.1 GiB, Kev 20.3 against 5.1 GiB, Clef-flash 20.6 against 5.3 GiB.
 - A 1-stage export checks its memory before it writes anything. It estimates its peak RAM from
   the base IR's int8 weight files (`openvino_language_model.bin` plus
@@ -731,7 +731,7 @@ wait stopped:
   (see [Engine failures](#engine-failures)); until it exits, every task, chat and decisions
   alike, fails at once with `qwen36 engine failed: <the desync message>; restart the server`.
   With the relays under restart-on-exit supervisors too, the pipeline reconnects on its own.
-  Measured on pawan-03 (two ranks on one host, kev9b-int8-2st, warm model cache, a test
+  Measured on an Arc 140V box (two ranks on one host, kev9b-int8-2st, warm model cache, a test
   supervisor that restarts a rank 2 s after it exits; the systemd unit's `RestartSec=5` adds
   about 3 s to each restart):
   - Rank 0 killed: the pipeline served again about 4 s after the kill.
@@ -801,7 +801,7 @@ chunk of the failed attempt. A decision pass re-runs from the start, so
 its answer is the one an uninterrupted pass gives. A chat keeps every byte already sent, but its
 continuation is not always byte-identical to an uninterrupted run: re-prefilling the generated
 tokens takes a different numeric path than decoding them one at a time, so a later near-tie can
-go the other way. On pawan-01 and pawan-03 (Arc 140V, OpenVINO 2026.4.0 as a fault source, 3
+go the other way. On two Arc 140V boxes ( OpenVINO 2026.4.0 as a fault source, 3
 real faults in 240 rounds of 1600 tokens) every retried chat returned 200 with all 1600 tokens
 and differed from the clean runs of the same prompt. A plain-OpenVINO replay of the same resume
 on the 8-stage IRs continued token-identically across the seam and first diverged 93 and 152
@@ -851,7 +851,7 @@ Pipeline mode does not retry: a failed task on the pipeline head fails as before
 
 ### After a failed infer
 
-On the GPU (pawan-03, Arc 140V), a decode infer threw `unknown C++ exception in infer`. 25 ms
+On the GPU of an Arc 140V box, a decode infer threw `unknown C++ exception in infer`. 25 ms
 later the next admission's scrub logged `stage reset failed ... Infer Request is busy`, and the
 server then sat idle for 18 minutes, every request waiting. The failed infer had left the
 OpenVINO request marked busy. OpenVINO refuses `reset_state` on a busy request. Its destructor
@@ -872,12 +872,12 @@ What happens now:
    copy in place of the old one, and the task continues on it. The task that ran the recovery is
    served after the wait and the compile, and later tasks are served as usual.
 
-**Why recompile, not a fresh request.** On pawan-01 (Arc 140V, build 435c874e) stage6 read
+**Why recompile, not a fresh request.** On a second Arc 140V box (build 435c874e) stage6 read
 `Cancelled` for the whole 30 s after the fault. A fresh request from the same compiled model was
 created in 1 ms, but its first infer failed with a shape-inference error, so the engine failed.
 On the same GPU, a fresh request from a healthy compiled model served in every case tested, so
 the fault corrupts state the GPU plugin keeps per compiled model. Only a new compile escapes it.
-With the recompile (build 0c61635a) the same soak on pawan-01 recovered from the fault twice,
+With the recompile (build 0c61635a) the same soak on that box recovered from the fault twice,
 on stage3 and on stage6, and served the next request each time.
 
 **The old stage is never dropped.** Its destructor could wait forever on the stuck request, so
@@ -924,7 +924,7 @@ so its supervisor restarts it (below):
   that shares the host's RAM. There the first fault recovers and the request is retried (above);
   the second fails the engine, and the server exits for a supervisor restart (below), about 22 s
   warm for a 1-stage 9B tree. If a stage's weight file size cannot be read at load, the cap
-  stays 2, the pre-Task 58 behaviour. The engine logs its cap at load (`qwen36: stage recompile
+  stays 2, the earlier behaviour. The engine logs its cap at load (`qwen36: stage recompile
   cap`, with `total`, `local_stages`, `largest_leak_bytes` and `cap`), and every `recompile`
   recovery line carries `recompiled` and `cap`.
 - The request could not be abandoned (the shim is out of memory), or its state cannot be read.
@@ -948,8 +948,8 @@ already in flight 3 s to reach their clients (the failing request's 5xx and any 
 refused), runs the same bounded close as a SIGTERM (up to 10 s), and exits non-zero. Both
 production units restart on a non-zero exit: systemd's `Restart=on-failure` and NSSM's `AppExit
 Default Restart` (see [docs/deploy/README.md](deploy/README.md)). A warm restart (model cache
-warm) measured about 5 s to `API serving` on pawan-03 for an 8-stage tree, and 21-24 s (about
-22 s) on pawan-01 for a 1-stage tree, after the supervisor's own delay (systemd `RestartSec=5`).
+warm) measured about 5 s to `API serving` on one Arc 140V box for an 8-stage tree, and 21-24 s (about
+22 s) on another for a 1-stage tree, after the supervisor's own delay (systemd `RestartSec=5`).
 If the close overruns its 10 s, the process exits non-zero at once instead of waiting on it.
 Requests that arrive while the server is down get a connection refused, so clients should
 retry. A SIGTERM or SIGINT still exits 0; if its close overruns the same 10 s, the process logs
@@ -957,10 +957,10 @@ retry. A SIGTERM or SIGINT still exits 0; if its close overruns the same 10 s, t
 once too. Only qwen35 reports a failed engine; the other engines never do.
 
 To debug a failed engine in place, pass `--keep-serving-on-engine-failure` (worker and `run`).
-The server then stays up as before Task 56: it refuses every request with a 5xx, and `/health`
+The server then stays up as before: it refuses every request with a 5xx, and `/health`
 keeps answering and reports `degraded` after a failed completion.
 
-**After a second recovery the engine is slower.** On pawan-01 (Arc 140V), an engine that holds two
+**After a second recovery the engine is slower.** On an Arc 140V box, an engine that holds two
 leaked stage copies (about 3.2 GB) decodes 12-20% slower per stage, the embeddings about 2x, and a
 chat took +16% (126 to 146 ms/token); this matches the +15% seen in the soak after the second
 recovery. One leaked copy, or any number of recompiles whose old copies are freed, showed no
@@ -1032,12 +1032,12 @@ downstream rank's log. No frame changed, so a peer without this change handles i
 link.
 
 During the recovery the engine is held, so other requests wait for it. Every wait is bounded;
-before Task 46 none was.
+before this change none was.
 
 ### BUG-1 (OpenVINO 2026.4.0 GPU fault)
 
 BUG-1 is a fault in OpenVINO 2026.4.0's GPU plugin, not in Cascadia. Run on 2026.4.1, the
-supported runtime: on pawan-03, 100 rounds of 1600-token chat each on an 8-stage jev9b tree and
+supported runtime: on an Arc 140V box, 100 rounds of 1600-token chat each on an 8-stage jev9b tree and
 an 8-stage kev9b tree ran 0 faults, where 2026.4.0 faults in about 3% of rounds. The recovery
 above stays as hardening against a fault like it.
 
@@ -1047,13 +1047,13 @@ chat generations of that length hit it too. A diagnostic build's exception logge
 structured exception: an access violation (`0xc0000005`, a read at `0x108`) at
 `openvino.dll+0x82d20`, called from `openvino_intel_gpu_plugin.dll`. OpenVINO's `InferRequest`
 wrapper turns C++ exceptions into `ov::Exception`, so a structured exception passes it as
-"unknown". That also explains why the request stayed busy: OpenVINO's own cleanup never ran. On pawan-01
+"unknown". That also explains why the request stayed busy: OpenVINO's own cleanup never ran. On a second Arc 140V box
 such a request never came back to idle: it stayed `Cancelled` for the full 30 s, and a fresh
 request on the same compiled model then failed its first infer. The engine now recompiles the
-stage (above). On pawan-01 (build 0c61635a, chat soak) the fault hit stage3 and later stage6 in
+stage (above). On that box (build 0c61635a, chat soak) the fault hit stage3 and later stage6 in
 one run; both times the recompile took under 0.4 s, the recompiled stage's first infer
 succeeded, and the next request was served. If a recompiled stage's first infer ever fails, the
-engine fails. On OpenVINO 2026.4.0 a 1-stage tree ran 0 faults in 100 rounds on pawan-01, where
+engine fails. On OpenVINO 2026.4.0 a 1-stage tree ran 0 faults in 100 rounds on that box, where
 the 8-stage tree faults in about 3% of rounds.
 
 ## Devices
@@ -1087,7 +1087,7 @@ linear-attention and KV state. That is a separate project, not a flag.
 ### One stage or eight
 
 A single box serves a 1-stage tree (the exporter's default) faster than the same weights cut into
-8 stages. Measured on pawan-01 (Arc 140V, `--device GPU`, OpenVINO 2026.4.1, build bd02a0f5), same
+8 stages. Measured on an Arc 140V box (`--device GPU`, OpenVINO 2026.4.1, build bd02a0f5), same
 weights exported both ways:
 
 | Model | td40 decision p50, 8 → 1 stage | 1600-token chat, 8 → 1 stage | GPU parity (both) |
@@ -1137,7 +1137,7 @@ the cheap reset), so nothing prefills on the finished pass's state. Pipelines ar
 reset after every pass. The cost of that scrub moves rather than disappearing: a chat that follows
 a decision pass pays that scrub (a recreate after a warm pass, else the cheap reset) at its own
 admission (before its first token), where before the decision request paid it at its finish.
-Measured on pawan-03 (Arc 140V, 40 td40 cases, build 8f6d8f1a vs 0c61635a): a Kev restore fell
+Measured on an Arc 140V box (40 td40 cases, build 8f6d8f1a vs 0c61635a): a Kev restore fell
 from about 300 ms to about 91-100 ms with `prime_ms` 0 and no recreate, and Kev p50 fell from
 3.56 s to 2.41 s (-32%, p90 4.13 s to 2.85 s). Answers were identical (max |dp| 0, no flips) for
 Kev, JEV and Clef; JEV (3.50 to 3.41 s) and Clef (1.41 to 1.38 s) stay within noise, since their

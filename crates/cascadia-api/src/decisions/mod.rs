@@ -71,7 +71,7 @@ pub trait Codec: Send + Sync {
     fn limits(&self) -> Limits;
     /// Encode the request into engine passes. `cancel` is set when the client is gone (the
     /// request future was dropped): codecs check it between questions and stop early, so an
-    /// orphaned encode does not keep tokenizing (SEC-2). The error is never seen by anyone.
+    /// orphaned encode does not keep tokenizing. The error is never seen by anyone.
     fn encode_until(
         &self,
         req: &DecisionRequest,
@@ -130,7 +130,7 @@ pub struct DecisionService {
     pub prefix_reuse: bool,
     /// Concurrent decision encodes (tokenizations), separate from the decision permits: each
     /// holds up to a few hundred MB of tokenizer transients, so 16 permits must not mean 16 of
-    /// them at once (P2-SEC-3). Held by the blocking encode itself, like the request permit.
+    /// them at once. Held by the blocking encode itself, like the request permit.
     pub encode_slots: Arc<tokio::sync::Semaphore>,
 }
 
@@ -156,7 +156,7 @@ impl std::fmt::Debug for DecisionService {
 
 /// Whether `model_dir` has a `decision.json` entry at all. `Path::exists` follows symlinks and
 /// reads a dangling one as absent, so a broken `decision.json` would silently mean "chat model"
-/// (H5); any entry, or a lookup that fails for another reason than "not found", counts as present.
+/// any entry, or a lookup that fails for another reason than "not found", counts as present.
 /// A `model_dir` that is a regular file (NotADirectory) has no entry either.
 pub fn decision_json_present(model_dir: &Path) -> bool {
     use std::io::ErrorKind;
@@ -182,7 +182,7 @@ impl DecisionService {
             .map_err(|e| format!("{}: {e}", path.display()))
     }
 
-    /// Range-check the profile and clamp it to the limits the engine enforces (EDGE-6, COR-1):
+    /// Range-check the profile and clamp it to the limits the engine enforces:
     /// a limit the engine would refuse at admission turns a too-large request into a 503 instead
     /// of the API's own 400/413.
     fn from_profile(
@@ -317,7 +317,7 @@ pub(crate) const TOKENIZE_FAILED: &str = "request could not be tokenized";
 /// without this, state or option text could forge `<|im_end|>`, `<|fim_suffix|>` etc. and steer
 /// the decision. Template pieces are tokenized separately and keep their real special tokens.
 pub(crate) fn sanitize_user_text(text: &str) -> String {
-    // One linear scan (SEC-1). At each "<|", the name is the maximal [A-Za-z0-9_] run after it,
+    // One linear scan. At each "<|", the name is the maximal [A-Za-z0-9_] run after it,
     // rewritten only when "|>" follows the run immediately. This equals "find the first `|>` and
     // check the text before it is a non-empty name": a name holds no '|', so the first "|>" can
     // only sit at the run's end. Re-searching the remainder for "|>" at every "<|" was O(n^2).
@@ -345,7 +345,7 @@ pub(crate) fn sanitize_user_text(text: &str) -> String {
 }
 
 /// The prefix a pass shares with the request's other passes, when the engine's prefix cache could
-/// store it: a `cache_prefix` under `MIN_PREFIX_TOKENS` is never snapshotted (P2-CE-2), so it earns
+/// store it: a `cache_prefix` under `MIN_PREFIX_TOKENS` is never snapshotted, so it earns
 /// no discount and is never resumed.
 fn shared_prefix(p: &Pass) -> Option<usize> {
     p.readout
@@ -376,7 +376,7 @@ pub fn prefill_work(passes: &[Pass], prefix_reuse: bool) -> usize {
     (shared + tails).min(full)
 }
 
-/// Flag the passes of a request admitted on the shared-prefix discount (SEC-3, P2-SEC-1/2), so the
+/// Flag the passes of a request admitted on the shared-prefix discount, so the
 /// tokens it actually prefills never exceed `max_total`, whatever the cache evicts.
 ///
 /// A request that fits without the discount (every pass in full within `max_total`) is left
@@ -482,7 +482,7 @@ mod tests {
         std::fs::remove_dir_all(&d).unwrap();
     }
 
-    /// H5: a `decision.json` entry that exists but cannot be read (a dangling symlink, a
+    /// A `decision.json` entry that exists but cannot be read (a dangling symlink, a
     /// directory) is "present but unusable", never "no decision model".
     #[cfg(unix)]
     #[test]
@@ -531,7 +531,7 @@ mod tests {
         }
     }
 
-    /// The pre-SEC-1 implementation (quadratic on `<|<|<|…`), kept as the equivalence oracle.
+    /// The earlier implementation (quadratic on `<|<|<|…`), kept as the equivalence oracle.
     fn sanitize_oracle(text: &str) -> String {
         let mut safe = String::with_capacity(text.len());
         let mut rest = text;
@@ -609,7 +609,7 @@ mod tests {
 
     #[test]
     fn sanitize_is_linear_on_adversarial_input() {
-        // SEC-1: 1 MiB of "<|" (with and without a trailing "|>") took minutes when every "<|"
+        // 1 MiB of "<|" (with and without a trailing "|>") took minutes when every "<|"
         // rescanned the remainder for "|>".
         for tail in ["", "|>", "a|>"] {
             let s = format!("{}{tail}", "<|".repeat(512 * 1024));
@@ -722,7 +722,7 @@ mod tests {
         );
         // On the discount: the first pass must be able to snapshot (checked before its prefill),
         // and EVERY later pass resumes, so a lost snapshot fails at the first pass that misses
-        // it (P2-SEC-2) rather than after the cold passes a greedy plan would allow.
+        // it rather than after the cold passes a greedy plan would allow.
         for budget in [45, 60, 66, 86] {
             let mut p = kev();
             mark_required_reuse(&mut p, budget, true);
@@ -746,7 +746,7 @@ mod tests {
 
     #[test]
     fn a_prefix_too_short_to_cache_earns_no_discount() {
-        // P2-CE-2: the engine never stores a snapshot under MIN_PREFIX_TOKENS, so such a prefix
+        // The engine never stores a snapshot under MIN_PREFIX_TOKENS, so such a prefix
         // is budgeted in full (a clean 413 or a clean run), never resumed.
         let c = (cascadia_types::MIN_PREFIX_TOKENS - 1) as u32;
         let tiny: Vec<Pass> = (0..4).map(|_| pass(c as usize + 100, Some(c))).collect();

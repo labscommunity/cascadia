@@ -18,7 +18,7 @@ pub struct JevCodec {
     /// state, so the first pass over it ends the encode instead of tokenizing every question.
     pass_cap: usize,
     /// The request's prefill budget (`max_total_tokens`): JEV prefills every pass in full, so
-    /// the encode stops once the passes so far exceed it (P2-SEC-4).
+    /// the encode stops once the passes so far exceed it.
     total_cap: usize,
 }
 
@@ -48,7 +48,7 @@ fn render_state(v: &OrderedValue) -> String {
             .iter()
             .map(|p| match p {
                 OrderedValue::String(s) => s.clone(),
-                // `validate` refuses a text part without a string `text` (H8).
+                // `validate` refuses a text part without a string `text`.
                 p if p.get("type").and_then(|t| t.as_str()) == Some("text") => {
                     p.get("text").map(render).unwrap_or_default()
                 }
@@ -211,7 +211,7 @@ impl JevCodec {
                 ));
             }
             // A zero-width choice range would refuse every choice question with a confusing
-            // "1..=0 options" 400 (EDGE-6).
+            // "1..=0 options" 400.
             if width.is_none() && hi == lo {
                 return Err(format!(
                     "decision.json jev: slot range {k} [{lo}, {hi}) must be at least 1 wide"
@@ -339,7 +339,7 @@ impl JevCodec {
     }
 
     /// Each choice option's line after its label, sanitized: `name`, or `name: description`
-    /// (an empty or null description drops the `: `, H7).
+    /// (an empty or null description drops the `: `).
     fn option_texts(&self, q: &Question) -> Vec<String> {
         q.choice_criteria()
             .iter()
@@ -369,7 +369,7 @@ impl JevCodec {
     /// One pass's prompt ids, refused over the per-pass cap. No BOS (`add_special_tokens =
     /// false`, none in the text): serve_decide does the same for the Qwen-based JEV models, whose
     /// tokenizers add none. A JEV on a base that expects `<bos>` (Gemma) would need it prepended
-    /// here; none ships (H6).
+    /// here; none ships.
     fn tokenize_pass(&self, text: &str) -> Result<Vec<u32>, DecisionError> {
         let enc = self
             .tok
@@ -487,7 +487,7 @@ impl JevCodec {
     }
 
     /// Count `len` more prefill tokens, with `reserve` still owed to second rounds: past the
-    /// request's budget the request is a 413 whatever follows, so the encode stops (P2-SEC-4).
+    /// request's budget the request is a 413 whatever follows, so the encode stops.
     fn charge(&self, running: &mut usize, reserve: usize, len: usize) -> Result<(), DecisionError> {
         *running += len;
         let need = *running + reserve;
@@ -521,7 +521,7 @@ fn question_raw(q: &Question, qid: &str) -> String {
 impl Codec for JevCodec {
     fn limits(&self) -> Limits {
         // Choices: as many as the profile has labels for (serve_decide's MAX_OPTIONS, 256), the
-        // ones past the trained slots answered by `plan_choice`; a profile from before Task 35
+        // ones past the trained slots answered by `plan_choice`; a profile from before the extended labels
         // has none and stays at the trained count. Score levels: any L, mapped from JEV's 0-5
         // scale (rescale_score). max_questions is overridden by DecisionService::limits.
         let max_options = match self.p.choice_labels.len() {
@@ -756,7 +756,7 @@ mod tests {
 
     #[test]
     fn empty_descriptions_and_missing_instructions_render_like_serve_decide() {
-        // H7: an empty (or null) description drops the `: ` (`A) name`), and a question without
+        // An empty (or null) description drops the `: ` (`A) name`), and a question without
         // instructions asks its own id.
         let c = JevCodec::new(tiny_tokenizer(), profile()).unwrap();
         let r: DecisionRequest = serde_json::from_str(
@@ -824,7 +824,7 @@ mod tests {
 
     #[test]
     fn encode_stops_once_the_running_total_passes_the_request_budget() {
-        // P2-SEC-4: JEV prefills every pass in full, so once the passes tokenized so far exceed
+        // JEV prefills every pass in full, so once the passes tokenized so far exceed
         // max_total_tokens the request is a 413 whatever follows: stop tokenizing there.
         let full = JevCodec::new(tiny_tokenizer(), profile())
             .unwrap()
@@ -875,7 +875,7 @@ mod tests {
             c.prompt_text(&r, "u")
         );
         // serve_decide `_parts` reads an `image` element as an image part: JEV's limits refuse it
-        // (Kev and Clef read the same element as data; EDGE-1).
+        // (Kev and Clef read the same element as data).
         assert!(c.limits().image_parts);
         let img: DecisionRequest = serde_json::from_str(r#"{"model": "m", "state": [{"image": "data:x"}], "questions": {"u": {"type": "noul"}}}"#).unwrap();
         match img.validate(&c.limits()) {
@@ -891,7 +891,7 @@ mod tests {
 
     #[test]
     fn new_rechecks_the_calibration_bounds() {
-        // Task 24 M1: a profile built without `DecisionProfile::load` gets the same refusal.
+        // A profile built without `DecisionProfile::load` gets the same refusal.
         let mut p = profile();
         p.temperature.insert("score".into(), 0.0);
         let e = JevCodec::new(tiny_tokenizer(), p).err().unwrap();
@@ -969,7 +969,7 @@ mod tests {
     }
 
     /// A JEV with `trained` choice slots after noul and score, and `labels` choice labels (0 for
-    /// a decision.json from before Task 35). Choice slot i has bias 0.1·(i+1).
+    /// a decision.json from before the extended labels). Choice slot i has bias 0.1·(i+1).
     fn wide_profile(trained: usize, labels: usize) -> JevProfile {
         let mut p = profile();
         let n = 8 + trained;
@@ -1189,7 +1189,7 @@ mod tests {
         assert_eq!(c.dump_strategy(&r, "q"), Some("permute"));
     }
 
-    /// Task 36's hand-computed n = 20 tournament: group passes, final pass and the combination.
+    /// The hand-computed n = 20 tournament: group passes, final pass and the combination.
     fn tournament_by_hand() -> (Vec<Vec<f64>>, Vec<f64>, Vec<f64>) {
         let mut g0 = vec![0.05; 10];
         g0[2] = 0.3;

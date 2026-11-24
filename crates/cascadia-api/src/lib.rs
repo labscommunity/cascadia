@@ -178,9 +178,9 @@ impl DumpSink for std::fs::File {
 
 /// The open `--decision-dump` file and its optional size cap (`--decision-dump-max-bytes`).
 /// Closes for good (a latch) once a request would pass the cap or a write fails, so the file is
-/// always a prefix of the run's requests, whole lines only (P3-DRIFT-2, P3-SEC-2).
+/// always a prefix of the run's requests, whole lines only.
 pub struct DecisionDump {
-    /// Set once: checked before a request's lines are cloned or serialized (P3-SEC-1).
+    /// Set once: checked before a request's lines are cloned or serialized.
     closed: std::sync::atomic::AtomicBool,
     pub(crate) file: std::sync::Mutex<DumpFile>,
 }
@@ -610,7 +610,7 @@ pub fn load_chat_template_config_at(tok_dir: &std::path::Path) -> ChatTemplateCo
 /// Open the `--decision-dump` file for appending, mode 0600. Refuses a symlink at the path
 /// (`O_NOFOLLOW`), and, checked on the opened descriptor, anything but a regular file this user
 /// owns with one link: a FIFO (with `O_NONBLOCK` the open cannot block startup), a device, or a
-/// hardlink to another file the server account owns (SEC-4).
+/// hardlink to another file the server account owns.
 fn open_decision_dump(p: &std::path::Path) -> std::io::Result<std::fs::File> {
     let mut o = std::fs::OpenOptions::new();
     o.create(true).append(true);
@@ -4822,7 +4822,7 @@ mod tests {
         assert_eq!(v["error"]["type"], "invalid_request_error");
     }
 
-    /// H16/L9: a 30-digit integer and a 17-digit float survive both routes digit for digit
+    /// A 30-digit integer and a 17-digit float survive both routes digit for digit
     /// (checked on the RAW body: `serde_json::Value` would round both through f64).
     #[tokio::test]
     async fn exact_numbers_on_both_routes() {
@@ -4861,7 +4861,7 @@ mod tests {
         );
     }
 
-    /// Task 25 review (a): a repeated top-level key is a 400 in OpenAI's envelope.
+    /// A repeated top-level key is a 400 in OpenAI's envelope.
     #[tokio::test]
     async fn openai_duplicate_keys_are_400() {
         let (status, v) = post_openai(
@@ -4957,7 +4957,7 @@ mod tests {
         assert_eq!(status, StatusCode::PAYLOAD_TOO_LARGE, "{v}");
         // 32 passes of 11 tokens (<fim_prefix> a b + an 8-token branch) = 352: the prefill budget,
         // not the per-pass cap, is what rejects it. A 3-token prefix is under MIN_PREFIX_TOKENS,
-        // which the engine never caches, so it is counted in every pass (P2-CE-2).
+        // which the engine never caches, so it is counted in every pass.
         assert_eq!(
             v["error"],
             "this request needs 352 prefill tokens; the per-request limit is 40"
@@ -5045,7 +5045,7 @@ mod tests {
 
     #[tokio::test]
     async fn decisions_dump_stops_appending_at_its_byte_cap() {
-        // P2-SEC-5: --decision-dump-max-bytes. A request's lines are written whole or not at
+        // --decision-dump-max-bytes. A request's lines are written whole or not at
         // all, and the request itself is unaffected.
         let dir = std::env::temp_dir().join(format!("decision-dump-cap-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
@@ -5077,7 +5077,7 @@ mod tests {
 
     #[tokio::test]
     async fn decisions_dump_cap_latches_so_no_later_request_is_written() {
-        // P3-DRIFT-2 / P3-SEC-2: once one request would pass the cap, no later request is
+        // Once one request would pass the cap, no later request is
         // written, even one that would still fit: the file stays a prefix of the run.
         let dir = std::env::temp_dir().join(format!("decision-dump-latch-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
@@ -5129,7 +5129,7 @@ mod tests {
 
     #[test]
     fn a_failed_dump_write_drops_its_torn_line_and_closes_the_dump() {
-        // P3-SEC-2: ENOSPC mid-request must not leave a torn line (parity_check parses every
+        // ENOSPC mid-request must not leave a torn line (parity_check parses every
         // line) nor a byte count short of the file. The dump stops at the first failure.
         let data = Arc::new(std::sync::Mutex::new(b"0123".to_vec()));
         let dump = DecisionDump::new(
@@ -5191,7 +5191,7 @@ mod tests {
     // Holding the dump's lock across the awaits is the stalled disk this test simulates.
     #[allow(clippy::await_holding_lock)]
     async fn decisions_disconnect_keeps_the_permit_until_the_dump_write_ends() {
-        // P3-SEC-1: a client that leaves while its request waits on the dump must not free its
+        // A client that leaves while its request waits on the dump must not free its
         // permit while the detached write still holds a request-sized clone.
         use std::sync::atomic::Ordering::SeqCst;
         let runner = Runner::new(Box::new(MockBuilder::new()));
@@ -5372,7 +5372,7 @@ mod tests {
 
     #[tokio::test]
     async fn decisions_engine_error_text_is_not_returned() {
-        // the mock fails a task whose prompt_ids contain DECISION_FAIL_ID (Task 2)
+        // the mock fails a task whose prompt_ids contain DECISION_FAIL_ID
         let (status, v, body) = post_decisions(
             make_decision_app().await,
             r#"{"model": "m", "state": "__engine_error__", "questions": {"u": {"type": "noul"}}}"#,
@@ -5422,7 +5422,7 @@ mod tests {
         assert_eq!(v["error"]["type"], "server_error");
     }
 
-    /// The Kev test codec with one probability replaced by `bad` (H17: finite logits whose
+    /// The Kev test codec with one probability replaced by `bad` (finite logits whose
     /// calibration overflowed, so the codec's softmax returned NaN or inf).
     struct NonFiniteProbCodec {
         inner: decisions::kev::KevCodec,
@@ -5472,7 +5472,7 @@ mod tests {
 
     #[tokio::test]
     async fn decisions_non_finite_probabilities_are_an_engine_error_not_a_200() {
-        // H17: the logits are finite, but the codec's probabilities are not (a calibration that
+        // The logits are finite, but the codec's probabilities are not (a calibration that
         // overflowed `(l + b) / t`). Without a check they serialise as `null` in a 200.
         for bad in [f64::NAN, f64::INFINITY, f64::NEG_INFINITY] {
             let (status, v, body) = post_decisions(
@@ -5600,7 +5600,7 @@ mod tests {
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn decision_encodes_are_bounded_by_their_own_slots_not_the_request_permits() {
-        // P2-SEC-3: 16 decision permits must not mean 16 concurrent tokenizer transients. Six
+        // 16 decision permits must not mean 16 concurrent tokenizer transients. Six
         // requests within the permits all answer, but at most `encode_slots` (2) encode at once.
         let runner = Runner::new(Box::new(MockBuilder::new()));
         runner
@@ -5773,7 +5773,7 @@ mod tests {
 
     #[tokio::test]
     async fn decisions_disconnect_keeps_the_permit_until_the_encode_ends() {
-        // SEC-2: a client disconnect drops the request future but not its spawn_blocking encode.
+        // A client disconnect drops the request future but not its spawn_blocking encode.
         // The permit must stay held by the encode, or orphaned encodes pile up unbounded.
         use std::sync::atomic::Ordering::SeqCst;
         let runner = Runner::new(Box::new(MockBuilder::new()));
@@ -5843,7 +5843,7 @@ mod tests {
     }
 
     /// One noul pass with a probability vector one short: a codec bug must be a 503, not a panic
-    /// or a silently truncated answer (QUA-6).
+    /// or a silently truncated answer.
     struct ShortCodec(GateCodec);
 
     impl decisions::Codec for ShortCodec {
@@ -5888,7 +5888,7 @@ mod tests {
 
     #[tokio::test]
     async fn kev_pass_whose_snapshot_was_evicted_is_a_503_not_a_cold_reprefill() {
-        // SEC-3: state of 21 tokens (<state> + 20), 3 noul passes of 29 (tail 8). Reuse work 45,
+        // State of 21 tokens (<state> + 20), 3 noul passes of 29 (tail 8). Reuse work 45,
         // full work 87. Under a 60-token budget passes 2 and 3 must resume warm; the mock
         // reports their snapshot evicted, so the request is refused rather than re-prefilled.
         let state = format!("__evicted__{}", " a".repeat(19));
@@ -5901,7 +5901,7 @@ mod tests {
             v["error"],
             "engine at capacity; retry after current requests complete"
         );
-        // On the discount at all, every later pass resumes (P2-SEC-2): 66 used to let pass 2 run
+        // On the discount at all, every later pass resumes: 66 used to let pass 2 run
         // cold; now the request fails at the first pass that misses its snapshot.
         let (status, v, _) = post_decisions(make_decision_app_with(1000, 66).await, &body).await;
         assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE, "{v}");
@@ -5913,7 +5913,7 @@ mod tests {
 
     #[tokio::test]
     async fn kev_prefix_the_cache_can_never_hold_is_a_413_not_a_retry() {
-        // P2-SEC-1/2: the engine refuses the FIRST pass (no prefill) when its cache can never hold
+        // The engine refuses the FIRST pass (no prefill) when its cache can never hold
         // the shared prefix; the client is told the full need, not to retry.
         let state = format!("__uncacheable__{}", " a".repeat(19));
         let body = format!(
@@ -5933,7 +5933,7 @@ mod tests {
 
     #[tokio::test]
     async fn kev_state_too_short_to_cache_is_budgeted_in_full() {
-        // P2-CE-2: a 6-token prefix (<state> + 5) is under MIN_PREFIX_TOKENS, which the engine
+        // A 6-token prefix (<state> + 5) is under MIN_PREFIX_TOKENS, which the engine
         // never snapshots, so it earns no discount: 3 passes of 14 need 42, not 6 + 3 x 8 = 30.
         let body = r#"{"model": "m", "state": "x a a a a", "questions": {"a": {"type": "noul"}, "b": {"type": "noul"}, "c": {"type": "noul"}}}"#;
         let (status, v, _) = post_decisions(make_decision_app_with(1000, 30).await, body).await;
@@ -6023,7 +6023,7 @@ mod tests {
 
     #[tokio::test]
     async fn clef_one_joint_pass_is_sliced_per_question_on_both_routes() {
-        // CMP-2 / P2-CE-3: one joint pass carries every option; the mock returns joint logits
+        // One joint pass carries every option; the mock returns joint logits
         // -(i^2)/4 over all of them, so the choice gets [0, -0.25, -1] (sorted keys a, m, z) and
         // the noul [-2.25, -4] (Clef order true, false). The logits are not evenly spaced, so a
         // wrong per-question offset (every part read from 0, or the parts swapped) changes the
@@ -6064,7 +6064,7 @@ mod tests {
 
     #[tokio::test]
     async fn jev_passes_answer_every_kind_on_both_routes() {
-        // CMP-2: one verbalizer pass per question; mock logits -(i) over each pass's slots.
+        // One verbalizer pass per question; mock logits -(i) over each pass's slots.
         let (status, v, _) = post_decisions(
             jev_app().await,
             r#"{"model": "m", "state": "S", "questions": {
@@ -6112,7 +6112,7 @@ mod tests {
 
     #[tokio::test]
     async fn removed_system2_fields_are_ignored_like_any_unknown_field_on_both_routes() {
-        // Task 53: System 2 is gone. Its request fields are handled as the server before Task 43
+        // System 2 is gone. Its request fields are handled as the server before System 2
         // handled every unknown field (neither request schema denies unknown fields): ignored,
         // whatever their value. The answer is System 1's, with no `thinking` object.
         let questions = r#""questions": {
@@ -6156,7 +6156,7 @@ mod tests {
 
     #[tokio::test]
     async fn jev_list_state_image_part_is_400_but_kev_reads_it_as_data() {
-        // EDGE-1: only JEV reads list elements as message parts.
+        // Only JEV reads list elements as message parts.
         let body = r#"{"model": "m", "state": [{"sku": 1, "image": "https://x/1.jpg"}], "questions": {"u": {"type": "noul"}}}"#;
         let (status, v, _) = post_decisions(jev_app().await, body).await;
         assert_eq!(status, StatusCode::BAD_REQUEST, "{v}");
@@ -6406,7 +6406,7 @@ mod tests {
 
     #[tokio::test]
     async fn jev_twenty_option_tournament_runs_two_groups_then_a_final() {
-        // Task 36's hand-computed tournament: group 0 ties options 2 and 5, group 1's winner is
+        // The hand-computed tournament: group 0 ties options 2 and 5, group 1's winner is
         // 13, the final over 0..16 gives 2 → 0.5, 13 → 0.25, 5 and 0 → 0.125. With unit
         // temperature and no bias, logits ln(p) give exactly those passes.
         use decisions::profile::JevStrategy;

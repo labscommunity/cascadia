@@ -230,7 +230,7 @@ mod sys {
             out_len: *mut usize,
         ) -> c_int;
         pub fn cascadia_runtime_recreate_request(handle: *mut cascadia_runtime_t) -> c_int;
-        // Task 46: make a request a failed infer left busy idle, or abandon it, never blocking.
+        // Make a request a failed infer left busy idle, or abandon it, never blocking.
         pub fn cascadia_runtime_request_state(
             handle: *mut cascadia_runtime_t,
             out_state: *mut i32,
@@ -242,7 +242,7 @@ mod sys {
             out_ready: *mut i32,
         ) -> c_int;
         pub fn cascadia_runtime_abandon_request(handle: *mut cascadia_runtime_t) -> c_int;
-        // Task 54: the process's count of leaked requests.
+        // The process's count of leaked requests.
         pub fn cascadia_runtime_leaked_requests() -> u64;
         // Issue-34: serialize/restore all KV variable-states as one opaque blob (warm-pull).
         pub fn cascadia_runtime_get_state_blob(
@@ -1735,7 +1735,7 @@ impl Runtime {
 }
 
 /// How many infer requests this process has leaked rather than destroyed (abandoned, or left
-/// non-idle at a runtime's drop), Task 54. 0 in a stub build.
+/// non-idle at a runtime's drop). 0 in a stub build.
 pub fn leaked_request_count() -> u64 {
     #[cfg(not(feature = "openvino"))]
     return 0;

@@ -833,7 +833,7 @@ mod tests {
 
     #[test]
     fn image_parts_in_state_are_data_when_the_codec_does_not_read_parts() {
-        // EDGE-1: Kev and Clef render list elements as data; a catalogue record with an `image`
+        // Kev and Clef render list elements as data; a catalogue record with an `image`
         // field is a valid state for both references.
         let text_only = Limits {
             image_parts: false,
@@ -991,7 +991,7 @@ mod tests {
 
     #[test]
     fn integers_of_any_size_keep_every_digit() {
-        // L9/H16: Python ints are unbounded; json.dumps and str() print every digit.
+        // Python ints are unbounded; json.dumps and str() print every digit.
         let big = "123456789012345678901234567890";
         let v: OrderedValue = serde_json::from_str(&format!(
             r#"{{"id": {big}, "neg": -{big}, "f": 0.18466034385487662}}"#
@@ -1020,7 +1020,7 @@ mod tests {
 
     #[test]
     fn text_parts_need_a_string_text_when_the_codec_reads_parts() {
-        // H8: serve_decide `_parts` reads `p["text"]`; a part without one is a KeyError there.
+        // serve_decide `_parts` reads `p["text"]`; a part without one is a KeyError there.
         for state in [
             r#"[{"type": "text"}]"#,
             r#"["a", {"type": "text", "text": 5}]"#,

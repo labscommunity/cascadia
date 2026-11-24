@@ -312,7 +312,7 @@ pub trait KvWarmHandoff: Send + Sync {
     fn clear(&self, epoch: u64) -> bool;
 }
 
-/// Task 56: an engine that has failed for good, with the reason, readable WITHOUT the engine lock
+/// An engine that has failed for good, with the reason, readable WITHOUT the engine lock
 /// (a long step holds it). The engine hands out a clone via [`Engine::failure`], grabbed once at
 /// engine load like [`Engine::kv_holder`]; the server watches it and exits so the supervisor
 /// restarts the process. Set once: the first reason wins, and nothing clears it.
@@ -399,14 +399,14 @@ pub trait Engine: Send {
         None
     }
 
-    /// Task 56: the handle this engine marks when it fails for good and can only refuse tasks
+    /// The handle this engine marks when it fails for good and can only refuse tasks
     /// until a restart. Grabbed once at engine load, like [`Self::kv_holder`]. Default: a fresh
     /// handle nothing ever sets (the engine never reports failure).
     fn failure(&self) -> EngineFailure {
         EngineFailure::default()
     }
 
-    /// Task 61: the last `step()` returned no chunks but did real work, so the runner counts it
+    /// The last `step()` returned no chunks but did real work, so the runner counts it
     /// as progress, not toward a stream's empty-step limit. qwen36 reports the step that fails a
     /// task and admits its retry. Default: `false` (an empty step is an empty step).
     fn progressed_without_chunks(&self) -> bool {
@@ -444,7 +444,7 @@ pub trait Builder: Send {
 mod tests {
     use super::*;
 
-    /// Task 56: an engine that does not override `failure` never reports one, and a handle, once
+    /// An engine that does not override `failure` never reports one, and a handle, once
     /// set, is seen by every clone with the first reason.
     #[test]
     fn engine_failure_defaults_to_not_failed_and_keeps_the_first_reason() {

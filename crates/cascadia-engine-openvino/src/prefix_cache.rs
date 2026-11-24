@@ -107,7 +107,7 @@ pub(crate) fn kv_seq_from_framed_blob(blob: &[u8]) -> Option<usize> {
 /// `fixed + per_token × len` bytes. Each attention KV state (rank ≥ 3, not `conv`/`ssm`) holds
 /// `nb / shape[2]` bytes per token at its own precision; everything else (recurrent state,
 /// names, shapes, counts) is fixed. One blob at any depth is enough, so the engine's warmup
-/// state gives the slope before the first request (P4-CE-1). `None` when a part does not parse
+/// state gives the slope before the first request. `None` when a part does not parse
 /// exactly, a KV state's bytes are not a whole multiple of its depth, or no KV state is found.
 pub(crate) fn state_size_model(parts: &[Vec<u8>]) -> Option<(usize, usize)> {
     fn u32_at(b: &[u8], p: usize) -> Option<u32> {
@@ -279,7 +279,7 @@ impl PrefixCache {
     }
 
     /// Seed a lower bound on snapshot bytes, `fixed + per_token × len`, known before any snapshot
-    /// is taken (the engine derives it from the tree's config.json at load, P3-CE-1). With it,
+    /// is taken (the engine derives it from the tree's config.json at load). With it,
     /// [`Self::estimated_bytes`] is never unknown, so a snapshot that can never fit is refused
     /// before the first request's prefill. A lower bound never refuses a snapshot that fits.
     pub fn seed_floor(&mut self, fixed: usize, per_token: usize) {
@@ -300,7 +300,7 @@ impl PrefixCache {
     }
 
     /// Record a measured snapshot's per-stage parts as the size model, without caching anything
-    /// (the engine's warmup state, P4-CE-1). When the parts parse ([`state_size_model`]) the
+    /// (the engine's warmup state). When the parts parse ([`state_size_model`]) the
     /// model's line is recorded exactly, as the points `(0, fixed)` and `(1, fixed + per_token)`,
     /// and returned; otherwise the total is recorded at the parts' KV depth (else one token), a
     /// single point that only bounds longer keys from below.
@@ -390,7 +390,7 @@ impl PrefixCache {
     /// at least [`MIN_PREFIX_TOKENS`], under the measured over-budget
     /// threshold ([`Self::worth_copying`]) and an estimated size within the
     /// budget ([`Self::estimated_bytes`]; unknown counts as fitting, which the
-    /// engine's load-time floor rules out, P3-CE-1). Says
+    /// engine's load-time floor rules out). Says
     /// nothing about eviction: a snapshot that fits can still be evicted later.
     pub fn can_hold(&self, len: usize) -> bool {
         self.worth_copying(len) && self.accepts(len, self.estimated_bytes(len).unwrap_or(0))
@@ -830,7 +830,7 @@ mod tests {
 
     #[test]
     fn a_decision_prefix_is_snapshotted_whatever_the_refresh_rule() {
-        // P2-CE-1: request A cached its Kev state (key 40); request B's state extends it (its
+        // Request A cached its Kev state (key 40); request B's state extends it (its
         // cache_prefix is 60). B's first pass restores A's entry, so the chat refresh rule sees a
         // 20-token tail against a 1.2 GB copy and skips the boundary. A decision boundary is
         // taken anyway: B's later passes must find it.
@@ -887,7 +887,7 @@ mod tests {
 
     #[test]
     fn a_seeded_size_floor_refuses_before_any_snapshot_was_measured() {
-        // P3-CE-1: on a fresh server nothing has been measured. The floor seeded at load (the
+        // On a fresh server nothing has been measured. The floor seeded at load (the
         // config lower bound, or the warmup's measured blob) must make a snapshot that can never
         // fit refuse up front, not count as fitting.
         let mut c = PrefixCache::new(1 << 20);
@@ -956,7 +956,7 @@ mod tests {
 
     #[test]
     fn the_state_size_model_read_from_one_blob_predicts_every_length() {
-        // P4-CE-1: the warmup blob alone gives the exact per-token slope (each KV state's bytes
+        // The warmup blob alone gives the exact per-token slope (each KV state's bytes
         // over its sequence depth) and the fixed part (recurrent state plus framing), so the size
         // estimate is exact from the first request, not a lower bound.
         let warm = vec![hybrid_stage(1), hybrid_stage(1)];
@@ -986,7 +986,7 @@ mod tests {
 
     #[test]
     fn the_warmup_blob_makes_the_estimate_exact_from_the_first_request() {
-        // P4-CE-1 trace, scaled down: the config floor (half a byte per element) admits a key
+        // A measured trace, scaled down: the config floor (half a byte per element) admits a key
         // whose real snapshot is over the budget; the warmup blob's size model refuses it before
         // any prefill, and still admits one that fits.
         let warm = vec![hybrid_stage(1)];

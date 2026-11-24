@@ -188,8 +188,8 @@ impl Codec for ClefCodec {
             )));
         }
         let mut state = self.ids(&self.san.apply(&render_sorted(&req.state)))?;
-        // Truncating to fit is ruled (Task 8b), but truncating a non-empty state to nothing would
-        // answer every question without the caller's input as a normal 200 (EDGE-2).
+        // Truncating to fit is allowed, but truncating a non-empty state to nothing would
+        // answer every question without the caller's input as a normal 200.
         if fixed == limit && !state.is_empty() {
             return Err(DecisionError::TooLong(format!(
                 "schema needs {fixed} tokens, leaving no room for the state; the limit is {limit}"
@@ -322,7 +322,7 @@ mod tests {
 
     #[test]
     fn more_options_than_one_readout_holds_is_400() {
-        // H11: 17 questions x 256 options = 4352 > MAX_DECISION_OUTPUTS, within the per-question caps.
+        // 17 questions x 256 options = 4352 > MAX_DECISION_OUTPUTS, within the per-question caps.
         let crit: Vec<String> = (0..256).map(|k| format!(r#""o{k:03}": "d""#)).collect();
         let qs: Vec<String> = (0..17)
             .map(|i| {
@@ -349,7 +349,7 @@ mod tests {
 
     #[test]
     fn empty_instructions_fall_back_to_the_qid_and_null_noul_criteria_drop_the_description() {
-        // H11: encode_record asks the field id when the instruction is missing or empty, and
+        // encode_record asks the field id when the instruction is missing or empty, and
         // leaves `description` out of an option whose description is null.
         let r: DecisionRequest = serde_json::from_str(
             r#"{"model": "m", "state": "S", "questions": {
@@ -482,7 +482,7 @@ mod tests {
 
     #[test]
     fn list_state_with_image_fields_is_plain_data() {
-        // EDGE-1: encode_record json.dumps the state; Clef takes images only from `images`.
+        // encode_record json.dumps the state; Clef takes images only from `images`.
         let c = ClefCodec::new(tok(), 16384, None).unwrap();
         let r: DecisionRequest = serde_json::from_str(
             r#"{"model": "m", "state": [{"sku": 1, "image": "a"}], "questions": {"u": {"type": "noul"}}}"#,
@@ -513,7 +513,7 @@ mod tests {
 
     #[test]
     fn a_one_level_score_is_served_like_the_reference() {
-        // P2-FID-1: joint_schema_model refuses only empty criteria; one level answers score 0.0
+        // joint_schema_model refuses only empty criteria; one level answers score 0.0
         // with probability and confidence 1, NaN-free.
         let r: DecisionRequest = serde_json::from_str(
             r#"{"model": "m", "state": "S", "questions": {"s": {"type": "score", "criteria": ["only"]}}}"#,

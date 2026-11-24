@@ -212,7 +212,7 @@ def softmax(z):
 
 @lru_cache(maxsize=2)
 def clef_tensor_head(clef_dir):
-    """Task 14's joint head over flat tensors, loaded once per clef dir."""
+    """The joint head over flat tensors, loaded once per clef dir."""
     from decision.clef_head import TensorHead, load_joint_head
     return TensorHead(load_joint_head(clef_dir)).eval()
 

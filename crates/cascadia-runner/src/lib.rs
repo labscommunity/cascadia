@@ -360,7 +360,7 @@ pub struct Runner {
     /// between a stream's next poll and its `Drop`, and every restart books
     /// a nondeterministic number of client cancellations.
     closing: Arc<AtomicBool>,
-    /// Task 56: the engine's [`Engine::failure`] handle, grabbed once at `start()` so the server
+    /// The engine's [`Engine::failure`] handle, grabbed once at `start()` so the server
     /// can watch it without the engine lock. A handle nothing sets until then.
     failure: Mutex<EngineFailure>,
 }
@@ -376,7 +376,7 @@ impl Runner {
         }
     }
 
-    /// Task 56: the engine's failure handle (see [`Engine::failure`]). Never takes the engine
+    /// The engine's failure handle (see [`Engine::failure`]). Never takes the engine
     /// lock. Before `start()` it is a handle nothing sets.
     pub fn engine_failure(&self) -> EngineFailure {
         self.failure.lock().clone()
@@ -1076,8 +1076,8 @@ impl Stream for ChunkStream {
                     None => None,
                     Some(engine) => Some(match engine.step() {
                         Ok(produced) => {
-                            // A step that did real work without a chunk (qwen36's retry,
-                            // Task 61) is progress for every stream, not an empty step.
+                            // A step that did real work without a chunk (qwen36's retry)
+                            // is progress for every stream, not an empty step.
                             let empty = produced.is_empty() && !engine.progressed_without_chunks();
                             let mut bufs = this.slot.buffers.lock();
                             for (tid, chunk) in produced {
@@ -1387,7 +1387,7 @@ mod tests {
         }
     }
 
-    /// Task 56: an engine that hands out a failure handle the test controls.
+    /// An engine that hands out a failure handle the test controls.
     struct ReportingEngine(EngineFailure);
 
     impl Engine for ReportingEngine {
@@ -1421,7 +1421,7 @@ mod tests {
         }
     }
 
-    /// Task 56: the runner carries the engine's own failure handle from `start()`, and reading it
+    /// The runner carries the engine's own failure handle from `start()`, and reading it
     /// never takes the engine lock (a long step holds it). An engine that never reports one
     /// (the mock) reads as not failed.
     #[tokio::test]
@@ -2486,7 +2486,7 @@ mod tests {
         assert!(saw_progress && saw_final);
     }
 
-    /// Task 61: the steps a stream queued behind a retried task drives, as qwen36 runs them. The
+    /// The steps a stream queued behind a retried task drives, as qwen36 runs them. The
     /// steps that produce chunks for the other tasks are driven by those tasks' own streams and
     /// left out. Step 2 fails task "a" and admits its retry, all in one step that returns nothing;
     /// that step does real work, and the engine says so.
@@ -2531,7 +2531,7 @@ mod tests {
         }
     }
 
-    /// Task 61: a stream queued behind a retried task must not count the retry step as empty.
+    /// A stream queued behind a retried task must not count the retry step as empty.
     /// Counted, steps 1-3 are three empty steps in a row and "b" closes with "no progress"
     /// before its own answer; the engine's progress report keeps it alive.
     #[tokio::test]

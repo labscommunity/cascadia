@@ -41,7 +41,7 @@ impl FromStr for JevStrategy {
     }
 }
 
-/// The load error of a tree exported with the removed `--switchable-lora` (Task 53).
+/// The load error of a tree exported with the removed `--switchable-lora`.
 pub const SWITCHABLE_REFUSAL: &str =
     "switchable trees are no longer supported; re-export without --switchable-lora";
 
@@ -63,8 +63,8 @@ pub struct JevProfile {
     /// kind → calibration temperature.
     pub temperature: HashMap<String, f64>,
     /// Single-token choice labels (A..Z, AA..) and their ids, at most MAX_CHOICE_LABELS, the
-    /// first `hi - lo` being the trained choice slots (Task 35's export). A pass over m options
-    /// labels them `[..m]`. Empty in a decision.json from before Task 35: max 16 options then.
+    /// first `hi - lo` being the trained choice slots. A pass over m options
+    /// labels them `[..m]`. Empty in a decision.json from before the extended labels: max 16 options then.
     #[serde(default)]
     pub choice_labels: Vec<String>,
     #[serde(default)]
@@ -108,7 +108,7 @@ impl DecisionProfile {
             serde_json::from_str(&raw).map_err(|e| format!("{}: {e}", path.display()))?;
         // A tree exported with the removed `--switchable-lora` records its trained scale here;
         // its stages take a `lora_scale` input nothing feeds any more (the engine refuses the
-        // tree too). Every other field Task 43 added (answer labels, end_think_id) is ignored.
+        // tree too). Every other field System 2 added (answer labels, end_think_id) is ignored.
         let raw_v: serde_json::Value = serde_json::from_str(&raw).unwrap_or_default();
         if !raw_v["jev"]["lora_scale"].is_null() {
             return Err(format!("{}: {SWITCHABLE_REFUSAL}", path.display()));
@@ -138,7 +138,7 @@ impl DecisionProfile {
 
 /// A zero, negative or non-finite temperature turns every probability into NaN, and so does
 /// one small enough (or a bias large enough) for `(logit + bias) / temperature` to overflow
-/// (H17). Within these bounds it stays finite for every finite f32 logit.
+/// Within these bounds it stays finite for every finite f32 logit.
 fn check_calibration<'a>(
     temps: impl IntoIterator<Item = &'a f64>,
     biases: impl IntoIterator<Item = &'a f64>,
@@ -266,7 +266,7 @@ mod tests {
 
     #[test]
     fn calibration_that_can_overflow_is_refused() {
-        // H17: `(logit + bias) / temperature` must stay finite for every finite f32 logit, or
+        // `(logit + bias) / temperature` must stay finite for every finite f32 logit, or
         // softmax turns it into NaN probabilities.
         let d = std::env::temp_dir().join(format!("dprof-h17-{}", uuid::Uuid::new_v4().simple()));
         std::fs::create_dir_all(&d).unwrap();
@@ -314,7 +314,7 @@ mod tests {
 
     #[test]
     fn choice_labels_and_strategy_are_optional() {
-        // Task 36: a decision.json from before Task 35 has neither field and keeps loading.
+        // A decision.json from before the extended labels has neither field and keeps loading.
         let d = std::env::temp_dir().join(format!("dprof-t36-{}", uuid::Uuid::new_v4().simple()));
         std::fs::create_dir_all(&d).unwrap();
         let p = d.join("decision.json");
@@ -338,7 +338,7 @@ mod tests {
 
     #[test]
     fn a_switchable_tree_is_refused_and_system2_fields_are_ignored() {
-        // Task 53: trees exported between Tasks 43 and 53 carry System 2's answer labels and
+        // Trees exported while System 2 shipped carry System 2's answer labels and
         // end_think_id; they load, the fields ignored. A switchable tree (jev.lora_scale) does not.
         let d = std::env::temp_dir().join(format!("dprof-t53-{}", uuid::Uuid::new_v4().simple()));
         std::fs::create_dir_all(&d).unwrap();

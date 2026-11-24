@@ -2087,7 +2087,7 @@ fn build_builder(args: &WorkerArgs, prefix_cache_bytes: usize) -> Result<Box<dyn
 /// every ~1 s — the original demo's bursty token feel was driven
 /// almost entirely by this default.
 ///
-/// Task 61: once `stop` reads `true`, every open connection shuts down
+/// Once `stop` reads `true`, every open connection shuts down
 /// gracefully (hyper's `graceful_shutdown`): an idle keep-alive connection
 /// closes at once, and one with a response in flight closes after that
 /// response, so no new request is admitted while in-flight ones finish.
@@ -2213,11 +2213,11 @@ fn install_shutdown_signal_handler(
     })
 }
 
-/// Task 56: how long in-flight responses get to reach their clients once the engine has failed
+/// How long in-flight responses get to reach their clients once the engine has failed
 /// (the failing request's 5xx, and any requests it already refused) before the process exits.
 const ENGINE_FAILED_GRACE: std::time::Duration = std::time::Duration::from_secs(3);
 
-/// Task 56: how often the API serve loop reads the engine's failure handle.
+/// How often the API serve loop reads the engine's failure handle.
 const ENGINE_FAILURE_POLL: std::time::Duration = std::time::Duration::from_millis(200);
 
 /// Resolve with the reason once the engine reports a permanent failure. `None` (the
@@ -2244,8 +2244,8 @@ fn watched_failure(args: &WorkerArgs, runner: &Runner) -> Option<cascadia_engine
     (!args.keep_serving_on_engine_failure).then(|| runner.engine_failure())
 }
 
-/// Task 56 fix round 1: end the process at once with a non-zero code. Used only when the close
-/// overruns its bound, after an engine failure or a signal alike (Task 61): returning would let
+/// End the process at once with a non-zero code. Used only when the close
+/// overruns its bound, after an engine failure or a signal alike: returning would let
 /// `main` drop the tokio runtime, and that drop waits on the still-blocked close task (after a
 /// native fault a request's destructor can block forever), so the process would never exit and,
 /// after an engine failure, never be restarted.
@@ -2992,7 +2992,7 @@ async fn cmd_worker(args: WorkerArgs) -> Result<()> {
         // orphaned processes under systemd / k8s.
         let shutdown_signal =
             install_shutdown_signal_handler().context("install_shutdown_signal_handler")?;
-        // Task 56: watch the engine's failure handle unless the operator asked to keep a failed
+        // Watch the engine's failure handle unless the operator asked to keep a failed
         // engine up.
         let failure = watched_failure(&args, &runner);
         let (stop_connections, stop) = tokio::sync::watch::channel(false);
@@ -4308,7 +4308,7 @@ mod engine_failure_tests {
         assert!(r.is_err());
     }
 
-    /// Task 61: the signal path forces the exit on an overrun too, instead of returning into a
+    /// The signal path forces the exit on an overrun too, instead of returning into a
     /// runtime drop that would wait on the stuck close. A close in time is never forced (the
     /// tests above).
     #[tokio::test]
@@ -4361,7 +4361,7 @@ mod engine_failure_tests {
         }
     }
 
-    /// Task 61: once the connections are told to stop, an idle keep-alive connection is closed
+    /// Once the connections are told to stop, an idle keep-alive connection is closed
     /// at once, so it cannot send a new request into the grace, while a response in flight on
     /// another connection still streams to its end.
     #[tokio::test]

@@ -59,33 +59,33 @@ const LEGACY_HIDDEN: usize = 2048;
 const PREFILL_CHUNK: usize = 256;
 
 /// How long a stage request a failed infer left busy gets to return to idle (OpenVINO `cancel()`,
-/// then `wait_for`) before the engine abandons it (Task 46) and recompiles the stage (Task 54).
+/// then `wait_for`) before the engine abandons it and recompiles the stage.
 const STAGE_IDLE_TIMEOUT: Duration = Duration::from_secs(30);
-/// Stages the engine may recompile after an abandon before it fails instead (Task 54 fix round 2).
+/// Stages the engine may recompile after an abandon before it fails instead.
 /// Each recompile leaks the old stage's whole `Runtime` (compiled model and weights: about 1.5 GB
 /// for stage6 and 2.5 GB for stage7 of the 9B int8 tree, on a GPU that shares system RAM), so a
 /// fault that recurs cannot exhaust memory: the abandon past this marks the engine failed.
 const MAX_RECOMPILES: usize = 2;
 /// [`MAX_RECOMPILES`] for an engine whose recompile would leak more than [`LARGE_LEAK_BYTES`]
-/// (Task 58): two such leaks are not safe on a box that shares system RAM with the GPU. The first
-/// fault recovers (and the request is retried, Task 57); the second fails the engine, and the
-/// server exits for a supervisor restart (Task 56).
+/// two such leaks are not safe on a box that shares system RAM with the GPU. The first
+/// fault recovers (and the request is retried); the second fails the engine, and the
+/// server exits for a supervisor restart.
 const LARGE_LEAK_MAX_RECOMPILES: usize = 1;
 /// The weight bytes of a local stage (the copy one recompile leaks) above which the engine
-/// recompiles at most [`LARGE_LEAK_MAX_RECOMPILES`] times (Task 58). Measured stage weight files:
+/// recompiles at most [`LARGE_LEAK_MAX_RECOMPILES`] times. Measured stage weight files:
 /// the 8-stage 9B int8 tree's largest are 1.49 GB (stage6) and 2.47 GB (stage7), which keep
 /// [`MAX_RECOMPILES`]; a 1-stage 9B tree's one stage is the whole model (about 8.4 GiB), and a
 /// 27B 2-stage pipeline rank's stage is 12-15 GB, which both get the cap of 1 (two leaks of
 /// either can exhaust a 32 GB box).
 const LARGE_LEAK_BYTES: u64 = 4 << 30;
-/// Successful recompiles at which the engine is flagged degraded (Task 54 fix round 3): each one
+/// Successful recompiles at which the engine is flagged degraded: each one
 /// leaves one leaked stage copy, and two leaked copies cost decode about 16%. A recompile that
 /// fails also leaks a copy, but it fails the engine, so no later recompile can warn. Under
 /// [`LARGE_LEAK_MAX_RECOMPILES`] only one recompile can succeed, so there the warning keys on
 /// leaked bytes instead (at least [`LARGE_LEAK_BYTES`] after a successful recompile).
 const DEGRADED_AT_RECOMPILES: usize = 2;
-/// Bound on one stage recompile, run on a helper thread (Task 54 fix round 2). A cold compile
-/// without the model cache can take tens of seconds; a cache-warm one measured 1.2-1.7 s on p01.
+/// Bound on one stage recompile, run on a helper thread. A cold compile without
+/// the model cache can take tens of seconds; a cache-warm one measured 1.2-1.7 s on an Arc 140V.
 const RECOMPILE_TIMEOUT: Duration = Duration::from_secs(180);
 /// Stage `Runtime`s this process has leaked on purpose ([`leak_stage`]: never dropped, a destructor
 /// could wait forever on the stuck request). A copy left with a timed-out or dead helper thread is
@@ -522,7 +522,7 @@ pub struct Qwen36Builder {
     emb: Option<Runtime>,
     stages: Option<Vec<Runtime>>,
     /// How `load` compiled the embeddings and each local stage, kept so a faulted stage can be
-    /// recompiled the same way (Task 54 fix round 2).
+    /// recompiled the same way.
     emb_recipe: Option<StageRecipe>,
     stage_recipes: Vec<StageRecipe>,
     tokenizer: Option<Tokenizer>,
@@ -1041,7 +1041,7 @@ impl OvStage {
     }
 }
 
-/// Bring one stage request back to idle after a failed infer, without ever blocking on it (Task 46).
+/// Bring one stage request back to idle after a failed infer, without ever blocking on it.
 ///
 /// OpenVINO's request destructor waits, unbounded, on any run still outstanding, and its
 /// `query_state`/`set_tensor` refuse a busy request. On the GPU a request stayed busy after
@@ -1172,7 +1172,7 @@ impl<T> Drop for Forget<T> {
     }
 }
 
-/// Run `f` on a helper thread named `qwen36-<what>`, and wait at most `timeout` for it (Task 54).
+/// Run `f` on a helper thread named `qwen36-<what>`, and wait at most `timeout` for it.
 /// Its result is wrapped in [`Forget`] before it is sent, so a late result (or one left in the
 /// channel) is leaked, not dropped.
 fn run_bounded<T: Send + 'static>(
@@ -1210,7 +1210,7 @@ fn run_bounded<T: Send + 'static>(
     }
 }
 
-/// Run one native call on `st` on a helper thread, bounded by `timeout` (Task 54, fix round 1).
+/// Run one native call on `st` on a helper thread, bounded by `timeout`.
 ///
 /// After a recompile the engine's first infer runs on a stage nothing has proven yet; if the
 /// device queue is wedged it could block forever while holding the engine. The stage moves to the
@@ -1247,8 +1247,8 @@ fn bounded_call<T: Send + 'static>(
     }
 }
 
-/// How `load` compiled one IR, so a faulted stage can be compiled again the same way (Task 54 fix
-/// round 2): the same xml path, device and plugin config. qwen36 has one compile variant
+/// How `load` compiled one IR, so a faulted stage can be compiled again the same way:
+/// the same xml path, device and plugin config. qwen36 has one compile variant
 /// ([`Runtime::compile`]), so there is nothing else to record.
 #[derive(Clone, Debug)]
 struct StageRecipe {
@@ -1303,7 +1303,7 @@ fn compile_runtime(r: &StageRecipe) -> cascadia_ov_genai_shim::Result<Runtime> {
 type StageFactory =
     Arc<dyn Fn(&StageRecipe) -> cascadia_ov_genai_shim::Result<OvStage> + Send + Sync>;
 
-/// What the engine needs to recompile a faulted stage (Task 54 fix round 2).
+/// What the engine needs to recompile a faulted stage.
 struct Rebuild {
     emb: Option<StageRecipe>,
     stages: Vec<StageRecipe>,
@@ -1438,7 +1438,7 @@ enum Stuck {
     Failed(String),
 }
 
-/// A slot the engine may recompile (Task 54): the embeddings, or a local stage.
+/// A slot the engine may recompile: the embeddings, or a local stage.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Slot {
     Emb,
@@ -1454,7 +1454,7 @@ impl Slot {
     }
 }
 
-/// A recompiled stage's first infer, bounded ([`bounded_call`], [`STAGE_IDLE_TIMEOUT`]), Task 54.
+/// A recompiled stage's first infer, bounded ([`bounded_call`], [`STAGE_IDLE_TIMEOUT`]).
 /// Ok on success; otherwise the infer's error and the reason the engine fails: the fresh copy
 /// failed its first infer (the device itself is then suspect, so the engine fails rather than
 /// recompile again), did not return within `timeout`, or its helper thread died or could not be
@@ -1596,7 +1596,7 @@ fn read_state_floor(dir: &Path) -> Option<(usize, usize)> {
 }
 
 /// The engine's prefix cache, seeded with the load-time snapshot size floor when one is known, so
-/// a decision snapshot that can never fit is refused before the first request prefills (P3-CE-1).
+/// a decision snapshot that can never fit is refused before the first request prefills.
 fn new_prefix_cache(
     budget_bytes: usize,
     floor: Option<(usize, usize)>,
@@ -1610,11 +1610,11 @@ fn new_prefix_cache(
 
 /// This pass's snapshot plan. Only a `needs_snapshot` decision pass (the first pass of a request
 /// admitted on the shared-prefix discount) bypasses the chat refresh rule: its later passes must
-/// find that exact key (P2-CE-1). Every other pass, decision or chat, plans as a chat turn does,
-/// so an unflagged decision pass does not pay a multi-GB copy for a few tokens (P3-REG-1). A
+/// find that exact key. Every other pass, decision or chat, plans as a chat turn does,
+/// so an unflagged decision pass does not pay a multi-GB copy for a few tokens. A
 /// decision pass, flagged or not, also never copies a snapshot the cache can never hold
 /// ([`crate::prefix_cache::PrefixCache::can_hold`]: the key's length and the size estimate),
-/// which `insert` would only drop after the copy (P4-CE-2). Chat keeps its own rule unchanged.
+/// which `insert` would only drop after the copy. Chat keeps its own rule unchanged.
 fn plan_pass_snapshots(
     decision: Option<&cascadia_types::DecisionReadout>,
     prompt: &[u32],
@@ -1650,7 +1650,7 @@ fn decision_admission(task: &GenerationTask) -> Option<Vec<u32>> {
 /// A decision pass snapshots only where its request's passes share a prefix (Kev: the state);
 /// chat-style `<|im_start|>` boundaries would only evict chat entries. A prefix under
 /// [`crate::prefix_cache::MIN_PREFIX_TOKENS`] is never a boundary: `insert` would drop it after
-/// the copy (P4-CE-2), as [`crate::prefix_cache::chat_boundaries`] already filters for chat.
+/// the copy, as [`crate::prefix_cache::chat_boundaries`] already filters for chat.
 fn decision_snapshot_boundaries(d: &cascadia_types::DecisionReadout, cache_on: bool) -> Vec<usize> {
     match d.cache_prefix {
         Some(c) if cache_on && c as usize >= crate::prefix_cache::MIN_PREFIX_TOKENS => {
@@ -1719,7 +1719,7 @@ fn decision_warm_probe<'a>(d: &cascadia_types::DecisionReadout, ids: &'a [u32]) 
 }
 
 /// Prefix-cache refusals of a decision pass, checked after the restore and before any prefill
-/// (SEC-3, P2-CE-1/2, P2-SEC-1/2). `need` is the request's shared prefix (`cache_prefix`).
+/// `need` is the request's shared prefix (`cache_prefix`).
 /// - `decision_uncacheable` (the API's 413): the cache can never hold a snapshot at `need`
 ///   (disabled, under `MIN_PREFIX_TOKENS`, or measured/estimated over the budget), on the first
 ///   pass (`needs_snapshot`) of a request whose later passes must resume there, or on such a
@@ -1864,10 +1864,10 @@ pub struct Qwen36Engine {
     stages_dirty: bool,
     /// A task failed and the stage requests still hold its state: `finalize_error` leaves the
     /// scrub (`reset_all`) to the next admission, so the failed task's error chunk is returned
-    /// first. On the GPU after a failed infer the scrub did block (Task 46: it released a request
+    /// first. On the GPU after a failed infer the scrub did block (it released a request
     /// still marked busy); it now makes the requests idle first, bounded, or fails the engine.
     scrub_pending: bool,
-    /// Task 55 (H-lite), single box only: a decision pass finished and its state is still in the
+    /// Single box only: a decision pass finished and its state is still in the
     /// stage requests, which stay primed. `finish_decision` sets it instead of running `reset_all`.
     /// The next admission either restores a prefix-cache entry over the live requests (a decision
     /// warm hit: `set_state_blob` overwrites every VariableState or fails, so no recreate and no
@@ -1879,41 +1879,41 @@ pub struct Qwen36Engine {
     decision_scrub_deferred: bool,
     /// An infer on a stage (or the embeddings) returned an error since the last recovery: its
     /// request may still be marked busy, and OpenVINO blocks forever releasing a busy request.
-    /// The next `reset_all` makes every request idle first ([`make_idle`]), Task 46.
+    /// The next `reset_all` makes every request idle first ([`make_idle`]).
     infer_failed: bool,
     /// A recovery's cheap scrub (`reset_state`) failed. The next `reset_all` recreates the dirty
     /// stage, and if that fails too it fails the engine: `infer_failed` is clear by then.
     recovery_scrub_failed: bool,
-    /// Task 57, single box: the task [`Self::fail_local`] just re-queued at the front of `pending`
+    /// Single box: the task [`Self::fail_local`] just re-queued at the front of `pending`
     /// after a native infer failure. Taken by the next admission, which is the retry and runs in
     /// the same `step`.
     retry: Option<Retry>,
-    /// Task 61: this `step` failed a task and admitted its retry. That step returns no chunk, but
+    /// This `step` failed a task and admitted its retry. That step returns no chunk, but
     /// it is progress, not a stall: [`Engine::progressed_without_chunks`] tells the runner so,
     /// and no stream counts it toward its empty-step limit. Cleared at the start of each `step`.
     retried_in_step: bool,
-    /// Tests of the failed-task path (Task 45/46/54): a native infer failure fails the task, as
-    /// before Task 57, so the NEXT task runs the recovery.
+    /// Tests of the failed-task path: a native infer failure fails the task, as
+    /// without the retry, so the NEXT task runs the recovery.
     #[cfg(test)]
     retry_disabled_for_test: bool,
-    /// Set when the engine cannot keep serving after a failed infer (Task 46, narrowed by Task
-    /// 54): a request that could not be made idle could not be recovered either (the stage's
+    /// Set when the engine cannot keep serving after a failed infer:
+    /// a request that could not be made idle could not be recovered either (the stage's
     /// recompile failed or timed out, or [`Rebuild::cap`] recompiles were already used), or a
-    /// recompiled stage failed its first infer; or the downstream link desynced (Task 59,
+    /// recompiled stage failed its first infer; or the downstream link desynced (
     /// [`Self::desync`]). Every later task fails at once with this reason (a
     /// `backend error`, a 5xx at the API), and nothing touches the stage requests again. Only a
     /// restart clears it.
     engine_failed: Option<String>,
-    /// Task 56: rank 0 / single box marks this with the `engine_failed` reason
+    /// Rank 0 / single box marks this with the `engine_failed` reason
     /// ([`Self::fail_engine`]) so the server exits for a supervisor restart. Handed out by
     /// `failure()`, read without the engine lock. A relay rank exits through
     /// [`Self::relay_engine_failed`] instead and never marks it.
     failure: cascadia_engine::EngineFailure,
     /// [`STAGE_IDLE_TIMEOUT`]; shorter in tests.
     stage_idle_timeout: Duration,
-    /// How to recompile a faulted stage, and how many times this engine has (Task 54 fix round 2).
+    /// How to recompile a faulted stage, and how many times this engine has.
     rebuild: Rebuild,
-    /// Recompiled stages that have not yet completed an infer (Task 54). A failed first infer on
+    /// Recompiled stages that have not yet completed an infer. A failed first infer on
     /// one of them fails the engine.
     fresh_requests: Vec<Slot>,
     /// `max_position_embeddings` of the model (from the tree's config.json); prompts at or past it
@@ -2003,18 +2003,18 @@ struct ActiveTask {
     decision: Option<cascadia_types::DecisionReadout>,
     /// Hidden rows the decision head reads, gathered per prefill span (head-owning process).
     collector: Option<crate::decision::Collector>,
-    /// Task 57, single box: the task as admitted, kept so a native infer failure can re-queue it
+    /// Single box: the task as admitted, kept so a native infer failure can re-queue it
     /// once ([`Qwen36Engine::fail_local`]). `None` on pipeline rank 0, which never retries.
     retry_source: Option<GenerationTask>,
-    /// Task 57: this admission is that retry, so its failure fails the task.
+    /// This admission is that retry, so its failure fails the task.
     retried: bool,
-    /// Task 57: the tokens a retried chat's failed attempt generated, which the retry prefills as
+    /// The tokens a retried chat's failed attempt generated, which the retry prefills as
     /// part of `prompt_ids`. Not prompt tokens to the client: the final chunk's `prompt_tokens`
     /// leaves them out, so usage matches an uninterrupted run.
     retry_resumed: usize,
 }
 
-/// Task 57: what a retried task's admission needs from its failed attempt.
+/// What a retried task's admission needs from its failed attempt.
 struct Retry {
     task_id: TaskId,
     /// The bytes the failed attempt had already handed to the client; `None` for a decision pass,
@@ -2077,7 +2077,7 @@ enum DownLink {
     /// sending a second HELLO, whose reply would be left behind for the first task.
     HelloOwed,
     /// Alignment lost: every later exchange fails fast with this message until restart, and the
-    /// engine is failed with it so the rank exits for that restart (Task 59).
+    /// engine is failed with it so the rank exits for that restart.
     Desynced(String),
 }
 
@@ -2237,7 +2237,7 @@ impl Qwen36Engine {
         emb.set_input(&name, DType::I64, &[1, toks.len()], &le_bytes_i64(&ids))
             .map_err(map_ov)?;
         if self.fresh_requests.contains(&Slot::Emb) {
-            // A recompiled stage's first infer: bounded, and any failure fails the engine (Task 54).
+            // A recompiled stage's first infer: bounded, and any failure fails the engine.
             self.fresh_requests.retain(|s| *s != Slot::Emb);
             if let Err((e, why)) = first_infer_bounded(Slot::Emb, emb, self.stage_idle_timeout) {
                 self.rebuild.note_leaked(Slot::Emb);
@@ -2332,7 +2332,7 @@ impl Qwen36Engine {
             let fresh =
                 !self.fresh_requests.is_empty() && self.fresh_requests.contains(&Slot::Stage(j));
             let r = if fresh {
-                // A recompiled stage's first infer: bounded, and any failure fails the engine (Task 54).
+                // A recompiled stage's first infer: bounded, and any failure fails the engine.
                 self.fresh_requests.retain(|s| *s != Slot::Stage(j));
                 first_infer_bounded(Slot::Stage(j), st, self.stage_idle_timeout)
                     .map_err(|(e, why)| (e, Some(why)))
@@ -2393,8 +2393,8 @@ impl Qwen36Engine {
     }
 
     /// Make every request idle after a failed infer ([`make_idle`]), embeddings first. A request
-    /// that never gets there is abandoned and its stage recompiled from the same IR ([`Rebuild`],
-    /// Task 54 fix round 2), up to [`Rebuild::cap`] recompiles per engine. False when the engine
+    /// that never gets there is abandoned and its stage recompiled from the same IR ([`Rebuild`]),
+    /// up to [`Rebuild::cap`] recompiles per engine. False when the engine
     /// is failed instead (`engine_failed`): a request that could not be abandoned, an abandon past
     /// the cap, or a recompile that failed, timed out or lost its helper thread. A stage that did
     /// not come back to idle is never dropped, not even with the engine: it is leaked, and counted
@@ -2530,7 +2530,7 @@ impl Qwen36Engine {
     }
 
     /// Fail the engine (`engine_failed`) with `why`. Rank 0 / single box also marks `failure`, so
-    /// the server exits and the supervisor restarts it (Task 56); a relay rank already exits
+    /// the server exits and the supervisor restarts it; a relay rank already exits
     /// through [`Self::relay_engine_failed`].
     fn fail_engine(&mut self, why: String) {
         if self.rank == 0 {
@@ -2572,7 +2572,7 @@ impl Qwen36Engine {
         // single-box decision pass deferred (`scrub_deferred_decision`).
         self.scrub_pending = false;
         self.decision_scrub_deferred = false;
-        // Task 46: an abandoned request is never touched again (a call on it fails anyway, but
+        // An abandoned request is never touched again (a call on it fails anyway, but
         // nothing here may release it), and its state is unknown.
         if self.engine_failed.is_some() {
             self.stages_dirty = true;
@@ -2594,7 +2594,7 @@ impl Qwen36Engine {
         let reset_started = Instant::now();
         for (i, st) in self.stages.iter_mut().enumerate() {
             // A stage this recovery just recompiled is fresh (default state, never run): nothing
-            // to scrub. Its next device call is the bounded first infer (Task 54); only host-side
+            // to scrub. Its next device call is the bounded first infer; only host-side
             // input_names/set_input run on it before that.
             if self.fresh_requests.contains(&Slot::Stage(i)) {
                 error!(
@@ -2750,7 +2750,7 @@ impl Qwen36Engine {
 
     /// The rank can take part in a decision pass. Rank 0 and the head-owning (last) rank validate
     /// readouts against their vocab, and the head owner also needs head assets; a middle rank
-    /// only relays FRAME_DECIDE, so it needs neither (P2-REG-1). Advertised in the HELLO
+    /// only relays FRAME_DECIDE, so it needs neither. Advertised in the HELLO
     /// capability bits.
     fn serves_decisions(&self) -> bool {
         let reads_readouts = self.rank == 0 || self.owns_head();
@@ -2805,7 +2805,7 @@ impl Qwen36Engine {
                 let id = t.task_id.clone();
                 self.active = None;
                 if self.total <= 1 {
-                    // Task 55 (H-lite): keep the primed requests for the next pass. A warm hit
+                    // Keep the primed requests for the next pass. A warm hit
                     // restores over them; every other admission runs this scrub first.
                     self.decision_scrub_deferred = true;
                 } else {
@@ -2830,9 +2830,9 @@ impl Qwen36Engine {
                 self.last_timing = Some(self.timing.clone());
                 vec![decision_final_chunk(id, n, logits)]
             }
-            // Not retried (Task 61): no head path runs a native infer that sets `infer_failed`
+            // Not retried: no head path runs a native infer that sets `infer_failed`
             // (the verbalizer and pointer heads are host math, and the joint head's runtime is
-            // not one the Task 54 recovery covers), so a head failure fails the pass. A head that
+            // not one the stage recovery covers), so a head failure fails the pass. A head that
             // could be retried would first need its own runtime recovered before the re-run.
             Err(e) => self.finalize_error(head_failure_reason(e)),
         }
@@ -2884,7 +2884,7 @@ impl Qwen36Engine {
     /// is admitted ([`Self::scrub_failed_task`]), not here: the chunk only reaches its stream
     /// once `step` returns, so a scrub that blocks after a failed native call (a GPU infer that
     /// threw) would keep the error from a request that is still waiting for it. That scrub makes
-    /// every request idle first and is bounded by `stage_idle_timeout` (Task 46, `reset_all`).
+    /// every request idle first and is bounded by `stage_idle_timeout` (`reset_all`).
     fn finalize_error(&mut self, reason: String) -> Vec<(TaskId, Chunk)> {
         self.want_final_hidden = false;
         self.last_final_hidden = None;
@@ -2905,10 +2905,10 @@ impl Qwen36Engine {
         vec![(t.task_id, chunk)]
     }
 
-    /// Task 57: fail the active single-box task, or retry it once. A native infer failure
+    /// Fail the active single-box task, or retry it once. A native infer failure
     /// (`infer_failed` set, the engine not failed) of a task that has not been retried yet
     /// re-queues it at the front of `pending` and admits it again in this same `step`: the
-    /// admission runs the failed task's scrub first (`scrub_failed_task`: the Task 46/54 recovery,
+    /// admission runs the failed task's scrub first (`scrub_failed_task`: the stage recovery,
     /// bounded) and then the prefill, exactly as a new admission would. A chat resumes over the
     /// tokens it already generated (Option B, so `max_tokens` still bounds prefix + new) and
     /// carries the bytes already emitted; a decision pass re-runs unchanged. Greedy decode is
@@ -2982,7 +2982,7 @@ impl Qwen36Engine {
         }
     }
 
-    /// The scrub a finished single-box decision pass deferred (Task 55, see
+    /// The scrub a finished single-box decision pass deferred (see
     /// `decision_scrub_deferred`). Every admission and restore runs it before it prefills or
     /// writes state, except a decision pass's prefix-cache hit in the default restore mode,
     /// which overwrites every state of the live, primed requests instead (`local_warm_or_cold`).
@@ -3064,8 +3064,8 @@ impl Qwen36Engine {
     }
 
     /// Mark the downstream link desynced (logged once) so no later exchange reads it, and fail
-    /// the engine with the same reason (Task 59): nothing in-process can realign the stream, so
-    /// rank 0 exits for its supervisor (Task 56) and a relay rank exits through
+    /// the engine with the same reason: nothing in-process can realign the stream, so
+    /// rank 0 exits for its supervisor and a relay rank exits through
     /// [`Self::relay_engine_failed`]. With the other ranks restarting too, the pipeline reconnects.
     fn desync(&mut self, cause: String) {
         if matches!(self.down_link, DownLink::Desynced(_)) {
@@ -4032,7 +4032,7 @@ impl Qwen36Engine {
                 // failed downstream reset = no ack = task fails loud at
                 // rank 0 (reset protocol).
                 self.reset_all();
-                // Task 46: a stage abandoned by this reset's recovery. No RESET_ACK: the stage
+                // A stage abandoned by this reset's recovery. No RESET_ACK: the stage
                 // exits (connection-fatal) and its closed socket fails the head's exchange now.
                 if let Some(e) = self.relay_engine_failed() {
                     return Err(e);
@@ -4358,10 +4358,10 @@ impl Qwen36Engine {
             }
             self.scrub_failed_task();
             let task = self.pending.remove(0);
-            // Task 57: the retry `fail_local` re-queued in this same step, if this is it. Taken
+            // The retry `fail_local` re-queued in this same step, if this is it. Taken
             // by every admission, so a stale one can never reach a later task.
             let retry = self.retry.take().filter(|r| r.task_id == task.task_id);
-            // Task 55: only a decision pass may restore over the previous pass's live requests
+            // Only a decision pass may restore over the previous pass's live requests
             // (`local_warm_or_cold`); chat, completion and the kv_coord restore start scrubbed.
             if task.decision.is_none() {
                 self.scrub_deferred_decision();
@@ -4405,7 +4405,7 @@ impl Qwen36Engine {
             let resume = task.resume_ids().map(<[i32]>::to_vec);
             if let Some(r) = resume.as_deref() {
                 let mut vocab = crate::resume_vocab_bound(tokenizer);
-                // Task 61: a retry resumes over ids this model's own argmax picked, which may be
+                // A retry resumes over ids this model's own argmax picked, which may be
                 // a padded logit id past the tokenizer's vocab; the model's vocab bounds them.
                 if let (Some(_), Some(model)) = (&retry, self.vocab) {
                     vocab = vocab.max(model as u32);
@@ -4439,7 +4439,7 @@ impl Qwen36Engine {
                 .map(|t| t as u32)
                 .collect();
             let resume_seed_len = resume_gen_ids.len();
-            // Task 57: a retried chat carries the bytes its failed attempt already handed to the
+            // A retried chat carries the bytes its failed attempt already handed to the
             // client. Re-decoding the seed could differ from them: the U+FFFD holdback keeps an
             // incomplete UTF-8 char out of `emitted`, and that char would then be lost.
             let retried = retry.is_some();
@@ -4566,8 +4566,8 @@ impl Qwen36Engine {
                     .unwrap_or_default(),
             };
             // A needs_snapshot decision pass always snapshots its request's shared prefix when the
-            // cache can hold it (its later passes resume there, P2-CE-1); every other pass keeps
-            // the chat refresh rule (P3-REG-1).
+            // cache can hold it (its later passes resume there); every other pass keeps
+            // the chat refresh rule.
             let snapshot_at = plan_pass_snapshots(
                 task.decision.as_ref(),
                 &prompt_ids,
@@ -4871,7 +4871,7 @@ impl Engine for Qwen36Engine {
         // zombie that never rebuilds. The runner throttles non-fatal errors via
         // RELAY_ERR_BACKOFF, so no in-engine backoff is needed.
         //
-        // Task 46: a relay whose engine failed (a stage request abandoned busy) must not keep
+        // A relay whose engine failed (a stage request abandoned busy) must not keep
         // the link open, acking RESETs and dropping FORWARDs: the head would wait out its reply
         // bound on every task. It returns a connection-fatal error instead, before and after
         // any frame, so `run_relay_loop` exits for a supervisor rebuild and the head sees the
@@ -4879,7 +4879,7 @@ impl Engine for Qwen36Engine {
         if let Some(e) = self.relay_engine_failed() {
             return Err(e);
         }
-        // Task 59: a frame that failed the engine (a desynced downstream link) may also fail the
+        // A frame that failed the engine (a desynced downstream link) may also fail the
         // step with its own, non-fatal error; the connection-fatal one wins so the stage exits now.
         let result = self.step_pipe_relay().map(|_| Vec::new());
         let result = match self.relay_engine_failed() {
@@ -4973,19 +4973,19 @@ impl Qwen36Engine {
     /// not compiled in, it held nothing, or the blob it held FAILED to restore (that arm scrubs
     /// the half-applied state first, then falls through here). Restores the longest cached prefix
     /// of `prompt_ids` over the live requests and returns the resume depth, else cold-resets and
-    /// returns 0. The live requests are either already scrubbed or, since Task 55, the previous
+    /// returns 0. The live requests are either already scrubbed or the previous
     /// decision pass's primed ones (its finish deferred the scrub). A caller that is not a
     /// decision warm hit must run the deferred scrub (`scrub_deferred_decision`) first.
     fn local_warm_or_cold(&mut self, prompt_ids: &[u32]) -> usize {
         if self.prefix_cache.enabled() {
             if let Some((parts, len)) = self.prefix_cache.longest_prefix(prompt_ids) {
                 let started = Instant::now();
-                // Task 55 (H-lite): a finished decision pass left its primed requests live. The
+                // A finished decision pass left its primed requests live. The
                 // default restore writes over them with no recreate and no priming fold: the
                 // shim's `set_state_blob` requires the blob's state count to equal the request's
                 // and every state to apply, else it fails and the cold path below recreates. A
                 // pre-restore clear (the A/B knob) would `reset_state` a restored request, which
-                // leaves residue: scrub first then, as before Task 55.
+                // leaves residue: scrub first then.
                 if self.decision_scrub_deferred && restore_clear_mode() != "none" {
                     self.reset_all();
                 }
@@ -5079,7 +5079,7 @@ impl Qwen36Engine {
     /// recurrent state plus one token of KV, one copy of tens of MB) and read the snapshot size
     /// model from it, without caching it: each KV state's bytes per token and the fixed rest
     /// ([`crate::prefix_cache::PrefixCache::observe_state`]), so the size estimate is exact from
-    /// the first request (P3-CE-1, P4-CE-1). Chat-only trees skip the copy.
+    /// the first request. Chat-only trees skip the copy.
     fn observe_warmup_state(&mut self) {
         if !self.prefix_cache.enabled() || self.decision_assets.is_none() || self.stages_dirty {
             return;
@@ -5129,7 +5129,7 @@ impl Qwen36Engine {
             return false;
         };
         // The kv_coord restores (take_warm, the plane apply and hand-off) never write over a
-        // finished decision pass's live requests (Task 55): its admission scrubbed already, and
+        // finished decision pass's live requests: its admission scrubbed already, and
         // this is the backstop for a path that did not.
         self.scrub_deferred_decision();
         self.restore_local_parts(&parts)
@@ -6149,7 +6149,7 @@ mod tests {
         let mut d = t.decision.clone().unwrap();
         assert!(
             decision_snapshot_boundaries(&d, true).is_empty(),
-            "under MIN_PREFIX_TOKENS: never cached, never copied (P4-CE-2)"
+            "under MIN_PREFIX_TOKENS: never cached, never copied"
         );
         let min = crate::prefix_cache::MIN_PREFIX_TOKENS;
         d.cache_prefix = Some(min as u32);
@@ -6311,7 +6311,7 @@ mod tests {
 
     #[test]
     fn rank0_refuses_a_chain_that_cannot_serve_decisions_up_front() {
-        // QUA-3 / Task 15 ruling: an old rank (or one without vocab or head assets) clears
+        // An old rank (or one without vocab or head assets) clears
         // CAP_DECISION, and rank 0 refuses with 501 before any frame goes out.
         use cascadia_types::{DecisionReadout, ReadoutHead};
         let mut e = bare_engine(2, "{}");
@@ -6358,7 +6358,7 @@ mod tests {
 
     #[test]
     fn a_require_warm_pass_that_missed_its_snapshot_is_refused() {
-        // SEC-3: a later Kev pass admitted on the shared-prefix discount must not re-prefill the
+        // A later Kev pass admitted on the shared-prefix discount must not re-prefill the
         // state when the snapshot is gone. Evicted (the cache could hold it): the retryable 503.
         use crate::prefix_cache::PrefixCache;
         let cache = PrefixCache::new(1 << 20);
@@ -6399,7 +6399,7 @@ mod tests {
 
     #[test]
     fn a_first_pass_whose_snapshot_can_never_fit_is_refused_before_prefill() {
-        // P2-CE-2 / P2-SEC-1/2: the first pass of a request whose later passes must resume is
+        // The first pass of a request whose later passes must resume is
         // refused at admission (no prefill) when the cache can never hold its shared prefix, and
         // the API answers 413, not a retryable 503.
         use crate::prefix_cache::{PrefixCache, MIN_PREFIX_TOKENS};
@@ -6444,7 +6444,7 @@ mod tests {
 
     #[test]
     fn a_fresh_engine_refuses_an_uncacheable_first_pass_before_any_prefill() {
-        // P3-CE-1: nothing measured yet on a fresh server. The size floor seeded at load (here
+        // Nothing measured yet on a fresh server. The size floor seeded at load (here
         // a 25 MB fixed state against a 1 MiB budget) refuses the first pass with
         // decision_uncacheable at warm 0, before its prefill and copy.
         let cache = new_prefix_cache(1 << 20, Some((25 << 20, 4096)));
@@ -6462,7 +6462,7 @@ mod tests {
 
     #[test]
     fn only_a_needs_snapshot_pass_bypasses_the_chat_refresh_rule() {
-        // P3-REG-1: a decision pass that restored a shorter entry (its state extends a cached one)
+        // A decision pass that restored a shorter entry (its state extends a cached one)
         // snapshots its own prefix regardless of cost only when its later passes depend on it.
         // Other decision passes keep the chat refresh rule: no multi-GB copy for a few tokens.
         use crate::prefix_cache::{PrefixCache, RefreshCosts};
@@ -6515,7 +6515,7 @@ mod tests {
 
     #[test]
     fn an_unflagged_decision_pass_never_copies_a_snapshot_the_cache_cannot_hold() {
-        // P4-CE-2: an unflagged decision pass plans through the chat rule, but a snapshot the
+        // An unflagged decision pass plans through the chat rule, but a snapshot the
         // cache can never keep (a key under MIN_PREFIX_TOKENS, or one the size estimate already
         // puts over the budget) is not copied: insert would only drop it.
         use crate::prefix_cache::{PrefixCache, RefreshCosts, MIN_PREFIX_TOKENS};
@@ -6555,7 +6555,7 @@ mod tests {
 
     #[test]
     fn a_state_that_extends_a_cached_state_resumes_its_own_snapshot() {
-        // P2-CE-1 / P2-SEC-1: request A cached its state (key 30). Request B's state extends it
+        // Request A cached its state (key 30). Request B's state extends it
         // (cache_prefix 40). B's first pass restores A's entry, plans B's own boundary (no chat
         // refresh rule), and B's require_warm passes then resume at 40: no refusal (a 200).
         use crate::prefix_cache::{plan_decision_snapshots, PrefixCache};
@@ -6587,7 +6587,7 @@ mod tests {
 
     #[test]
     fn a_rank_without_vocab_or_head_assets_does_not_advertise_decisions() {
-        // REG-2: a chat-only last rank (no config.json, no decision/) clears CAP_DECISION, so rank
+        // A chat-only last rank (no config.json, no decision/) clears CAP_DECISION, so rank
         // 0 refuses up front instead of the last rank refusing after a full chain prefill.
         let mut e = bare_engine(2, "{}");
         e.rank = 0;
@@ -6601,7 +6601,7 @@ mod tests {
         );
         e.decision_assets = Some(crate::decision::HeadAssets::Verbalizer);
         assert!(e.serves_decisions());
-        // P2-REG-1: a middle rank only relays FRAME_DECIDE; it never reads a vocab or a head, so
+        // A middle rank only relays FRAME_DECIDE; it never reads a vocab or a head, so
         // a manifest + stage-only middle rank still serves decisions.
         let mut mid = bare_engine(3, "{}");
         mid.rank = 1;
@@ -6814,11 +6814,11 @@ mod tests {
         let late = Duration::from_millis(1600);
         let fake = rt.spawn(async move {
             let s = &mut server;
-            // Task 1 (chat): the TOKEN comes back late.
+            // task 1 (chat): the TOKEN comes back late.
             fake_expect(s, FRAME_FORWARD, 1).await;
             tokio::time::sleep(late).await;
             fake_token(s, 1, 7).await;
-            // Task 2 (decision): RESET and DECIDE on time, the DECISION late.
+            // task 2 (decision): RESET and DECIDE on time, the DECISION late.
             fake_expect(s, FRAME_RESET, 2).await;
             fake_ack(s, FRAME_RESET_ACK, 2).await;
             fake_expect(s, FRAME_DECIDE, 2).await;
@@ -6829,13 +6829,13 @@ mod tests {
             s.send_raw(&crate::decision::encode_result(&Ok(vec![0.25, 0.75])))
                 .await
                 .unwrap();
-            // Task 3 (decision): the DECIDE_ACK comes back late.
+            // task 3 (decision): the DECIDE_ACK comes back late.
             fake_expect(s, FRAME_RESET, 3).await;
             fake_ack(s, FRAME_RESET_ACK, 3).await;
             fake_expect(s, FRAME_DECIDE, 3).await;
             tokio::time::sleep(late).await;
             fake_ack(s, FRAME_DECIDE_ACK, 3).await;
-            // Task 4 (chat): everything on time.
+            // task 4 (chat): everything on time.
             fake_expect(s, FRAME_RESET, 4).await;
             fake_ack(s, FRAME_RESET_ACK, 4).await;
             fake_expect(s, FRAME_FORWARD, 4).await;
@@ -6852,7 +6852,7 @@ mod tests {
             err.contains("reply timed out after") && !err.contains("socket closed"),
             "a timeout is named a timeout, not a closed socket: {err}"
         );
-        // Task 59: a reply late before its first byte leaves the link owed, not desynced, and
+        // A reply late before its first byte leaves the link owed, not desynced, and
         // the engine keeps serving.
         assert_eq!(e.down_link, DownLink::Owed);
         assert!(e.engine_failed.is_none() && e.failure().reason().is_none());
@@ -6911,7 +6911,7 @@ mod tests {
 
         e.epoch = 1;
         assert!(e.send_forward_recv_token(one_row(&e), 1, 0).is_err());
-        // Task 59: the desync fails the engine, and rank 0 marks the Task 56 handle with the
+        // The desync fails the engine, and rank 0 marks the failure handle with the
         // desync reason so the server exits for its supervisor.
         let reason = e.engine_failed.clone().expect("a desync fails the engine");
         assert!(
@@ -6963,7 +6963,7 @@ mod tests {
             fake_ack(s, FRAME_RESET_ACK, 1).await;
         });
         assert!(e.handshake_a().is_err(), "HELLO past the bound");
-        // Task 59: an owed HELLO reply is retried, never an engine failure.
+        // An owed HELLO reply is retried, never an engine failure.
         assert_eq!(e.down_link, DownLink::HelloOwed);
         assert!(e.engine_failed.is_none() && e.failure().reason().is_none());
         e.handshake_a().expect("the retry reads the late HELLO_ACK");
@@ -7043,7 +7043,7 @@ mod tests {
 
     #[test]
     fn a_coded_head_refusal_keeps_its_code() {
-        // H23: the API maps `decision_*` reasons by prefix; a "decision head failed: " prefix
+        // The API maps `decision_*` reasons by prefix; a "decision head failed: " prefix
         // turned a 501 (`decision_unsupported`) into a 503.
         assert_eq!(
             head_failure_reason("decision_unsupported: no head assets".into()),
@@ -7100,7 +7100,7 @@ mod tests {
 
     #[test]
     fn chunked_body_reads_drain_an_over_ceiling_body_to_stay_framed() {
-        // H25: an accepted body is read in <= MAX_RAW_BYTES chunks; an over-ceiling one is read
+        // An accepted body is read in <= MAX_RAW_BYTES chunks; an over-ceiling one is read
         // to its end and discarded, so the next frame starts where it should.
         let rt = pipe_rt();
         let max = cascadia_transport::MAX_RAW_BYTES;
@@ -7131,7 +7131,7 @@ mod tests {
 
     #[test]
     fn decision_bodies_keep_their_length_prefix() {
-        // H25: recv_decision_body returns the body still framed (relays forward it verbatim).
+        // recv_decision_body returns the body still framed (relays forward it verbatim).
         let rt = pipe_rt();
         let framed = crate::decision::encode_result(&Ok(vec![0.5]));
         let mut wire = framed.clone();
@@ -7159,7 +7159,7 @@ mod tests {
         ));
     }
 
-    /// Task 27 M2: on a link whose HELLO reply is still owed, only the handshake retry may run;
+    /// On a link whose HELLO reply is still owed, only the handshake retry may run;
     /// a tagged exchange is refused before it writes anything.
     #[test]
     fn a_hello_owed_link_admits_only_the_handshake_retry() {
@@ -7196,24 +7196,24 @@ mod tests {
         state: Vec<u8>,
         /// The infer (counted from 0) that fails, as the GPU plugin's did on hardware.
         fail_infer_at: Option<usize>,
-        /// Task 57: a second infer that fails the same way (the retry's).
+        /// A second infer that fails the same way (the retry's).
         fail_infer_again: Option<usize>,
         infers: usize,
-        /// Every infer and reset, in order; and the recovery's cancel, wait and abandon (Task 46).
+        /// Every infer and reset, in order; and the recovery's cancel, wait and abandon.
         events: Arc<std::sync::Mutex<Vec<&'static str>>>,
-        /// Task 46: after the failing infer the request stays busy for this many `wait_for`
+        /// After the failing infer the request stays busy for this many `wait_for`
         /// calls (`u32::MAX`: forever), as the GPU plugin's did. Busy refuses what OpenVINO
         /// refuses.
         busy_after_fail: u32,
         busy: u32,
         cancelled: bool,
         abandoned: bool,
-        /// Task 54 fix round 1: the infer (counted from 0) that never returns.
+        /// The infer (counted from 0) that never returns.
         hang_infer_at: Option<usize>,
-        /// Task 54 fix round 2: counts drops of this stage (a recompile must never drop the old
+        /// Counts drops of this stage (a recompile must never drop the old
         /// one: its native destructor could wait forever on the stuck request).
         drops: Arc<std::sync::atomic::AtomicUsize>,
-        /// Task 55: a model of the request's state, so a stale or dropped state changes the
+        /// A model of the request's state, so a stale or dropped state changes the
         /// answer. `folded` is the tokens the state holds; the peak logit reads it.
         folded: usize,
         /// The request has run an infer since it was created or reset. A `set_state_blob` onto
@@ -7222,9 +7222,9 @@ mod tests {
         /// A `set_state_blob` landed: `reset_state` then leaves the state in place, as it leaves
         /// residue on the GPU (see `state_restored`). Only `recreate_request` clears it.
         residue: bool,
-        /// Task 55: `set_state_blob` refuses, as the shim does on a state-count mismatch.
+        /// `set_state_blob` refuses, as the shim does on a state-count mismatch.
         refuse_set: bool,
-        /// Task 56: `abandon_request` fails, so the request can be neither idled nor abandoned.
+        /// `abandon_request` fails, so the request can be neither idled nor abandoned.
         refuse_abandon: bool,
         /// `reset_state` fails (pushes `reset_refused`).
         refuse_reset: bool,
@@ -7386,7 +7386,7 @@ mod tests {
         ) -> cascadia_ov_genai_shim::Result<(DType, Vec<usize>, Vec<u8>)> {
             let mut row = vec![0f32; self.width];
             if let Some(p) = self.peak {
-                // Still the argmax; its value says how many tokens the state holds (Task 55).
+                // Still the argmax; its value says how many tokens the state holds.
                 row[p] = 1.0 + 0.01 * self.folded as f32;
             }
             let data: Vec<f32> = (0..self.n).flat_map(|_| row.clone()).collect();
@@ -7481,7 +7481,7 @@ mod tests {
         e
     }
 
-    /// Task 54 fix round 2: what the mock recompile does next.
+    /// What the mock recompile does next.
     #[derive(Default)]
     struct RecompileCtl {
         /// The compile fails.
@@ -7498,14 +7498,14 @@ mod tests {
         fresh_drops: Vec<Arc<std::sync::atomic::AtomicUsize>>,
     }
 
-    /// Task 54 fix round 2: give every mock slot of `e` a recipe, and a factory that "compiles" a
+    /// Give every mock slot of `e` a recipe, and a factory that "compiles" a
     /// fresh mock of the same shape that logs into the same event list (with a `recompile` event)
     /// and has its own drop counter. Returns the control for the next compiles.
     fn arm_recompile(e: &mut Qwen36Engine) -> Arc<std::sync::Mutex<RecompileCtl>> {
         arm_recompile_sized(e, 1000)
     }
 
-    /// [`arm_recompile`] with every slot's weight file `weight_bytes` long (Task 58: the cap
+    /// [`arm_recompile`] with every slot's weight file `weight_bytes` long (the cap
     /// follows the largest).
     fn arm_recompile_sized(
         e: &mut Qwen36Engine,
@@ -7616,7 +7616,7 @@ mod tests {
         }
     }
 
-    // ---- Task 53: switchable-LoRA trees are refused ----
+    // ---- Switchable-LoRA trees are refused ----
 
     #[test]
     fn the_manifest_says_which_trees_were_exported_switchable() {
@@ -7682,17 +7682,17 @@ mod tests {
         }
     }
 
-    // ---- Task 53: the pipeline wire is the pre-Task-41 layout ----
+    // ---- The pipeline wire is the layout from before System 2 ----
 
     #[test]
-    fn own_caps_are_the_pre_task_41_bits() {
-        // Bits 0 (capture_v2) and 1 (decision frames) only. A Task 42 build also set bit 2; the
+    fn own_caps_are_the_pre_system2_bits() {
+        // Bits 0 (capture_v2) and 1 (decision frames) only. A System 2 build also set bit 2; the
         // AND in combine_caps drops it, so a chain with one reads as this layout.
         assert_eq!(own_caps(true) & !(CAP_CAPTURE_V2 | CAP_DECISION), 0);
         assert_eq!(own_caps(false) & !CAP_CAPTURE_V2, 0);
         assert!(chain_decision(own_caps(true)));
-        let task42_peer = CAP_CAPTURE_V2 | CAP_DECISION | 4;
-        assert_eq!(combine_caps(own_caps(true), task42_peer), own_caps(true));
+        let system2_peer = CAP_CAPTURE_V2 | CAP_DECISION | 4;
+        assert_eq!(combine_caps(own_caps(true), system2_peer), own_caps(true));
         for old in [0, 1, CAP_CAPTURE_V2 | CAP_DECISION] {
             assert_eq!(combine_caps(own_caps(true), old), own_caps(true) & old);
         }
@@ -7703,10 +7703,10 @@ mod tests {
         let e = bare_engine(2, "{}");
         let ours: serde_json::Value = serde_json::from_slice(&e.hello_payload()).unwrap();
         assert!(ours.get("lora_scale").is_none(), "{ours}");
-        // A Task 42 build sends `"lora_scale": 1`; on a baked tree that is all that differs.
-        let mut task42 = ours.clone();
-        task42["lora_scale"] = serde_json::json!(1);
-        assert_eq!(e.validate_hello(task42.to_string().as_bytes()), None);
+        // A System 2 build sends `"lora_scale": 1`; on a baked tree that is all that differs.
+        let mut system2 = ours.clone();
+        system2["lora_scale"] = serde_json::json!(1);
+        assert_eq!(e.validate_hello(system2.to_string().as_bytes()), None);
         assert_eq!(e.validate_hello(&e.hello_payload()), None);
     }
 
@@ -7724,7 +7724,7 @@ mod tests {
     }
 
     #[test]
-    fn rank0_accepts_old_and_task_42_downstream_ranks_at_hello() {
+    fn rank0_accepts_old_and_system2_downstream_ranks_at_hello() {
         let rt = pipe_rt();
         for cap in [
             CAP_CAPTURE_V2 | CAP_DECISION,
@@ -7735,14 +7735,14 @@ mod tests {
             let fake = rt.spawn(async move { fake_hello(&mut server, cap).await });
             e.handshake_a().expect("accepted");
             assert!(e.handshake_done);
-            assert_eq!(e.chain_caps & 4, 0, "no bit beyond the pre-41 ones: {cap}");
+            assert_eq!(e.chain_caps & 4, 0, "only bits 0 and 1: {cap}");
             rt.block_on(fake).unwrap();
         }
     }
 
     #[test]
     fn rank0_sends_reset_with_pos_zero() {
-        // RESET's `pos` is 0, as before Task 41 (Task 42 put the LoRA scale's bits there).
+        // RESET's `pos` is 0, as before System 2 (a System 2 build put the LoRA scale there).
         let rt = pipe_rt();
         let (mut e, mut server) = pipe_rank0(&rt);
         e.hidden = MOCK_HIDDEN;
@@ -7775,11 +7775,11 @@ mod tests {
 
     #[test]
     fn a_failed_decode_returns_its_error_before_the_scrub() {
-        // Task 45: on the GPU, a decode infer threw and the request never heard of it; the warn
+        // On the GPU, a decode infer threw and the request never heard of it; the warn
         // was logged, and the scrub that ran before the error chunk was returned did not return.
         // The error chunk now comes first; the next admission scrubs before it touches a stage.
         let mut e = mock_box();
-        e.retry_disabled_for_test = true; // Task 57 off: the task fails, the next one recovers
+        e.retry_disabled_for_test = true; // retry off: the task fails, the next one recovers
         let events = match &mut e.stages[1] {
             OvStage::Mock(m) => {
                 m.fail_infer_at = Some(1); // the prefill is infer 0, the first decode infer 1
@@ -7800,7 +7800,7 @@ mod tests {
         assert_eq!(
             c.error.as_deref(),
             Some("decode failed: backend error: unknown C++ exception in infer"),
-            "the error Task 44 saw"
+            "the error seen on hardware"
         );
         assert_eq!(c.warm_prefix, Some(0), "a cold prefill: a cache miss");
         assert!(e.active.is_none(), "the failed task is gone");
@@ -7820,7 +7820,7 @@ mod tests {
         assert!(!e.scrub_pending);
     }
 
-    /// Task 46: stage 1 of a mock box fails infer `at` and then reads busy for `busy` state reads.
+    /// Stage 1 of a mock box fails infer `at` and then reads busy for `busy` state reads.
     fn busy_after_failed_infer(
         e: &mut Qwen36Engine,
         at: usize,
@@ -7836,13 +7836,13 @@ mod tests {
 
     #[test]
     fn a_request_a_failed_infer_left_busy_is_made_idle_before_the_scrub() {
-        // Task 46, pawan-03: after `unknown C++ exception in infer` the GPU request stayed busy;
+        // On an Arc 140V box, after `unknown C++ exception in infer` the GPU request stayed busy;
         // the scrub's `reset_state` was refused ("Infer Request is busy") and the recreate that
         // followed released the busy request and never returned. The scrub now cancels and waits
         // the request back to idle (bounded) before it resets anything. A decision pass fails
         // here; the chat task after it gets the recovery.
         let mut e = mock_box();
-        e.retry_disabled_for_test = true; // Task 57 off: the task fails, the next one recovers
+        e.retry_disabled_for_test = true; // retry off: the task fails, the next one recovers
         let events = busy_after_failed_infer(&mut e, 0, 3); // the pass's prefill infer
         e.submit(verbalizer_pass("d1")).unwrap();
         let c = run_to_final(&mut e);
@@ -7870,8 +7870,8 @@ mod tests {
         assert!(!e.infer_failed && e.engine_failed.is_none() && !e.stages_dirty);
     }
 
-    /// Task 54: arm stage 1 of a mock box so its next infer fails and leaves the request
-    /// `Cancelled` for good once cancelled (`busy` forever), as the GPU request did on pawan-01.
+    /// Arm stage 1 of a mock box so its next infer fails and leaves the request `Cancelled`
+    /// for good once cancelled (`busy` forever), as the GPU request did on an Arc 140V box.
     fn stuck_on_next_infer(e: &mut Qwen36Engine) -> Arc<std::sync::Mutex<Vec<&'static str>>> {
         let at = infers(e, 1);
         busy_after_failed_infer(e, at, u32::MAX)
@@ -7898,7 +7898,7 @@ mod tests {
         // (`create_infer_request` on a GPU OOM). The engine fails, so the server exits for a
         // restart, and does not refuse every later task on a dirty stage for ever.
         let mut e = mock_box();
-        e.retry_disabled_for_test = true; // Task 57 off: the task fails, the next one recovers
+        e.retry_disabled_for_test = true; // retry off: the task fails, the next one recovers
         busy_after_failed_infer(&mut e, 0, 1);
         e.submit(chat("c1")).unwrap();
         assert!(run_to_final(&mut e).error.is_some(), "the first task fails");
@@ -7927,7 +7927,7 @@ mod tests {
         // After a recovery the cold scrub's `reset_state` fails, but `recreate_request` works.
         // The stage is recreated, so the engine does not fail and every later task is served.
         let mut e = mock_box();
-        e.retry_disabled_for_test = true; // Task 57 off: the task fails, the next one recovers
+        e.retry_disabled_for_test = true; // retry off: the task fails, the next one recovers
         let events = busy_after_failed_infer(&mut e, 0, 1);
         e.submit(chat("c1")).unwrap();
         assert!(run_to_final(&mut e).error.is_some(), "the first task fails");
@@ -7958,7 +7958,7 @@ mod tests {
         // too. The engine fails in that scrub: the next admission no longer sees the fault and
         // would refuse every task on a dirty stage (`stage state reset failed`) for ever.
         let mut e = mock_box();
-        e.retry_disabled_for_test = true; // Task 57 off: the task fails, the next one recovers
+        e.retry_disabled_for_test = true; // retry off: the task fails, the next one recovers
         let events = busy_after_failed_infer(&mut e, 0, 1);
         e.submit(chat("c1")).unwrap();
         assert!(run_to_final(&mut e).error.is_some(), "the first task fails");
@@ -7994,7 +7994,7 @@ mod tests {
 
     #[test]
     fn a_stage_whose_request_never_goes_idle_is_recompiled_and_chat_and_decisions_keep_serving() {
-        // Task 54 fix round 2, pawan-01: after `unknown C++ exception in infer` stage6 stayed
+        // On an Arc 140V box, after `unknown C++ exception in infer` stage6 stayed
         // `Cancelled` for the whole wait and was abandoned. A fresh request from the same compiled
         // model then failed its first infer (the fault corrupts per-CompiledModel state), so the
         // stage is now recompiled from its IR, the old copy leaked (never dropped), and the next
@@ -8008,7 +8008,7 @@ mod tests {
         ] {
             let what = format!("{} then {}", fail.task_id, next.task_id);
             let mut e = mock_box();
-            e.retry_disabled_for_test = true; // Task 57 off: the task fails, the next one recovers
+            e.retry_disabled_for_test = true; // retry off: the task fails, the next one recovers
             e.stage_idle_timeout = Duration::from_millis(200);
             let events = stuck_on_next_infer(&mut e);
             let old_drops = drops_of(mock1(&mut e));
@@ -8086,13 +8086,13 @@ mod tests {
 
     #[test]
     fn the_degraded_warning_fires_once_at_the_second_recompile_and_the_metrics_count() {
-        // Task 54 fix round 3: one leaked copy is harmless, two slow decode ~16%. The warn comes
+        // One leaked copy is harmless, two slow decode ~16%. The warn comes
         // at the second successful recompile, never at the first, never again. The metrics are
         // process-global and other recompile tests run in parallel, so they are asserted as
         // lower-bound deltas; the engine's own totals are exact.
         use cascadia_metrics::{ENGINE_LEAKED_STAGE_BYTES, ENGINE_STAGE_RECOMPILES_TOTAL};
         let mut e = mock_box();
-        e.retry_disabled_for_test = true; // Task 57 off: the task fails, the next one recovers
+        e.retry_disabled_for_test = true; // retry off: the task fails, the next one recovers
         e.stage_idle_timeout = Duration::from_millis(100);
         arm_recompile(&mut e);
         let (c0, b0) = (
@@ -8140,10 +8140,10 @@ mod tests {
 
     #[test]
     fn the_third_abandon_fails_the_engine_past_the_cap_of_two_recompiles() {
-        // Task 54 fix round 2: each recompile leaks a whole stage (about 1.5-2.5 GB on the 9B
+        // Each recompile leaks a whole stage (about 1.5-2.5 GB on the 9B
         // tree), so an engine recompiles at most twice; the third abandon fails it.
         let mut e = mock_box();
-        e.retry_disabled_for_test = true; // Task 57 off: the task fails, the next one recovers
+        e.retry_disabled_for_test = true; // retry off: the task fails, the next one recovers
         assert_eq!((e.rebuild.cap, MAX_RECOMPILES), (2, 2));
         e.stage_idle_timeout = Duration::from_millis(100);
         let ctl = arm_recompile(&mut e);
@@ -8178,7 +8178,7 @@ mod tests {
         assert_eq!(ctl.lock().unwrap().built, ["stage1", "stage1"]);
         assert_eq!(e.rebuild.recompiled, 2);
         assert!(e.engine_failed.is_some());
-        // Task 56: the handle grabbed before the failure carries the same reason.
+        // The handle grabbed before the failure carries the same reason.
         assert_eq!(watched.reason(), e.engine_failed);
 
         // Every later task, either route: refused at once, nothing touches a stage.
@@ -8209,7 +8209,7 @@ mod tests {
         );
     }
 
-    /// Task 58: measured stage weight files (bytes).
+    /// Measured stage weight files (bytes).
     const STAGE6_9B: u64 = 1_490_000_000;
     const STAGE7_9B: u64 = 2_470_000_000;
     const WHOLE_9B: u64 = 8_966_000_000; // 7.398 + 0.948 GiB
@@ -8226,7 +8226,7 @@ mod tests {
 
     #[test]
     fn small_stages_keep_the_cap_of_two() {
-        // Task 58: the 8-stage 9B tree's stages leak at most 2.47 GB each.
+        // The 8-stage 9B tree's stages leak at most 2.47 GB each.
         let stages: Vec<_> = [STAGE6_9B, STAGE7_9B, STAGE6_9B]
             .into_iter()
             .map(recipe_of)
@@ -8245,7 +8245,7 @@ mod tests {
 
     #[test]
     fn one_big_local_stage_gets_the_cap_of_one() {
-        // Task 58: a 1-stage 9B tree's one stage is the whole model.
+        // A 1-stage 9B tree's one stage is the whole model.
         assert_eq!(LARGE_LEAK_MAX_RECOMPILES, 1);
         assert_eq!(largest_leak_bytes(None, &[recipe_of(WHOLE_9B)]), WHOLE_9B);
         assert_eq!(recompile_cap(WHOLE_9B), 1);
@@ -8254,7 +8254,7 @@ mod tests {
 
     #[test]
     fn a_pipeline_rank_with_a_big_stage_gets_the_cap_of_one() {
-        // Task 58: a 27B 2-stage pipeline rank leaks 12-15 GB per recompile; two of those on a
+        // A 27B 2-stage pipeline rank leaks 12-15 GB per recompile; two of those on a
         // 32 GB box that shares RAM with the GPU are not safe either.
         assert_eq!(recompile_cap(STAGE_27B), 1);
         for (bytes, cap) in [(STAGE_27B, 1), (STAGE7_9B, 2)] {
@@ -8269,7 +8269,7 @@ mod tests {
         }
     }
 
-    /// Task 58: a single box over one mock IR (a 1-stage tree), recompile armed.
+    /// A single box over one mock IR (a 1-stage tree), recompile armed.
     fn mock_one_stage_box() -> Qwen36Engine {
         let mut e = bare_engine(1, "{}");
         e.rank = 0;
@@ -8299,8 +8299,8 @@ mod tests {
 
     #[test]
     fn a_box_with_one_big_stage_recovers_once_and_its_second_abandon_fails_the_engine() {
-        // Task 58: the first fault recovers (one recompile) and Task 57 retries the request, which
-        // is served; the second abandon is past the cap of one, so the engine fails (Task 56: the
+        // The first fault recovers (one recompile) and the retry serves the request, which
+        // is served; the second abandon is past the cap of one, so the engine fails (the
         // server exits for a supervisor restart) instead of leaking a second whole-model copy.
         let mut e = mock_one_stage_box();
         e.stage_idle_timeout = Duration::from_millis(100);
@@ -8352,10 +8352,10 @@ mod tests {
 
     #[test]
     fn a_request_that_cannot_be_abandoned_fails_the_engine_and_reports_it() {
-        // Task 56: a stuck request whose abandon fails is not recompiled; the engine fails, and
+        // A stuck request whose abandon fails is not recompiled; the engine fails, and
         // rank 0 reports it on the handle the server watches, with the same reason.
         let mut e = mock_box();
-        e.retry_disabled_for_test = true; // Task 57 off: the task fails, the next one recovers
+        e.retry_disabled_for_test = true; // retry off: the task fails, the next one recovers
         e.stage_idle_timeout = Duration::from_millis(100);
         let watched = e.failure();
         stuck_on_next_infer(&mut e);
@@ -8409,7 +8409,7 @@ mod tests {
 
     #[test]
     fn a_failed_recompile_fails_the_engine() {
-        // Task 54 fix round 2: if the IR cannot be compiled again, there is nothing to serve on:
+        // If the IR cannot be compiled again, there is nothing to serve on:
         // the engine fails and says which stage and that the compile failed.
         let mut e = mock_box();
         e.stage_idle_timeout = Duration::from_millis(100);
@@ -8451,11 +8451,11 @@ mod tests {
 
     #[test]
     fn a_recompile_that_never_returns_fails_the_engine_within_the_bound() {
-        // Task 54 fix round 2: the recompile runs on a helper thread bounded by
+        // The recompile runs on a helper thread bounded by
         // `RECOMPILE_TIMEOUT` (short here); a compile that never returns fails the engine after
         // the bound instead of hanging, and later tasks are refused at once.
         let mut e = mock_box();
-        e.retry_disabled_for_test = true; // Task 57 off: the task fails, the next one recovers
+        e.retry_disabled_for_test = true; // retry off: the task fails, the next one recovers
         e.stage_idle_timeout = Duration::from_millis(150);
         let ctl = arm_recompile(&mut e);
         e.rebuild.timeout = Duration::from_millis(150);
@@ -8491,7 +8491,7 @@ mod tests {
 
     #[test]
     fn a_recompiled_stage_that_fails_its_first_infer_fails_the_engine() {
-        // Task 54: a fresh copy whose first infer fails points at the device, not the stage: the
+        // A fresh copy whose first infer fails points at the device, not the stage: the
         // engine fails rather than recompile again.
         let mut e = mock_box();
         e.stage_idle_timeout = Duration::from_millis(100);
@@ -8538,7 +8538,7 @@ mod tests {
         // `spawn` drops the closure that owns the copy. The copy is wrapped in `Forget` first, so
         // it is leaked, and the engine fails as before.
         let mut e = mock_box();
-        e.retry_disabled_for_test = true; // Task 57 off: the task fails, the next one recovers
+        e.retry_disabled_for_test = true; // retry off: the task fails, the next one recovers
         e.stage_idle_timeout = Duration::from_millis(100);
         let ctl = arm_recompile(&mut e);
         stuck_on_next_infer(&mut e);
@@ -8568,12 +8568,12 @@ mod tests {
 
     #[test]
     fn a_recompiled_stage_whose_first_infer_never_returns_fails_the_engine_within_the_bound() {
-        // Task 54 fix round 1, kept: the fresh copy's first infer is bounded (a wedged device
+        // The fresh copy's first infer is bounded (a wedged device
         // queue). Chat and decisions both: the task fails within the bound, later ones at once.
         for next in [chat("c2"), verbalizer_pass("d2")] {
             let id = next.task_id.clone();
             let mut e = mock_box();
-            e.retry_disabled_for_test = true; // Task 57 off: the task fails, the next one recovers
+            e.retry_disabled_for_test = true; // retry off: the task fails, the next one recovers
             e.stage_idle_timeout = Duration::from_millis(150);
             let ctl = arm_recompile(&mut e);
             ctl.lock().unwrap().hang_first_infer = true;
@@ -8614,10 +8614,10 @@ mod tests {
 
     #[test]
     fn a_recompiled_emb_whose_first_infer_never_returns_fails_the_engine_within_the_bound() {
-        // Task 54 re-review: the embeddings take the same path as a stage. A stuck emb request is
+        // The embeddings take the same path as a stage. A stuck emb request is
         // abandoned and the emb recompiled; its first infer is bounded too.
         let mut e = mock_box();
-        e.retry_disabled_for_test = true; // Task 57 off: the task fails, the next one recovers
+        e.retry_disabled_for_test = true; // retry off: the task fails, the next one recovers
         e.stage_idle_timeout = Duration::from_millis(150);
         let ctl = arm_recompile(&mut e);
         ctl.lock().unwrap().hang_first_infer = true;
@@ -8665,9 +8665,9 @@ mod tests {
 
     #[test]
     fn a_priming_fold_that_leaves_a_request_stuck_is_recompiled_within_its_own_admission() {
-        // Task 46 failed the admitting task here (the fold that primes a warm restore left its
-        // request busy). Task 54: the cold path's reset recompiles the stage, and the same task
-        // is served from a cold prefill. Since Task 55 a warm pass right after a decision pass
+        // This once failed the admitting task (the fold that primes a warm restore left its
+        // request busy). Now the cold path's reset recompiles the stage, and the same task
+        // is served from a cold prefill. A warm pass right after a decision pass
         // restores over the primed requests with no fold, so a chat turn runs in between: its
         // finish resets the requests, and the next restore must prime them.
         let mut e = mock_box();
@@ -8700,10 +8700,10 @@ mod tests {
 
     #[test]
     fn a_failed_task_reports_the_prefix_it_resumed_from_the_cache() {
-        // Task 45: the BUG-1 shape, a warm restore and then a throw in the suffix's prefill. The
+        // The BUG-1 shape, a warm restore and then a throw in the suffix's prefill. The
         // error chunk says how much was resumed, so the API's failure line can say "hit".
         let mut e = mock_box();
-        e.retry_disabled_for_test = true; // Task 57 off: the task fails, the next one recovers
+        e.retry_disabled_for_test = true; // retry off: the task fails, the next one recovers
         e.prefix_cache = crate::prefix_cache::PrefixCache::new(1 << 20);
         let min = crate::prefix_cache::MIN_PREFIX_TOKENS;
         let pass = |id: &str, first: bool| {
@@ -8720,7 +8720,7 @@ mod tests {
         let OvStage::Mock(m) = &mut e.stages[1] else {
             unreachable!()
         };
-        // Task 55: the restore writes over the requests the first pass left primed, with no
+        // The restore writes over the requests the first pass left primed, with no
         // priming fold, so the suffix is the next infer.
         m.fail_infer_at = Some(m.infers);
         e.submit(pass("warm", false)).unwrap();
@@ -8759,7 +8759,7 @@ mod tests {
         assert!(e.last_timing.is_none());
     }
 
-    // ---- Task 55: H-lite, decision requests stay primed between restored passes ----
+    // ---- Decision requests stay primed between restored passes ----
 
     /// A pass of one Kev-like request: every question shares the prefix `0..min` (the cached
     /// state); the suffix differs per question `q`. The first pass snapshots the prefix, the
@@ -8815,7 +8815,7 @@ mod tests {
 
     #[test]
     fn warm_passes_after_a_warm_pass_restore_over_the_live_requests() {
-        // H-lite: hits 2..n write the restored state over the requests the previous pass left
+        // Hits 2..n write the restored state over the requests the previous pass left
         // primed: no recreate, no priming fold, no reset. The answers equal a fresh engine's cold
         // ones (the mock's logit reads the state depth, so a stale or dropped state would show).
         let min = crate::prefix_cache::MIN_PREFIX_TOKENS;
@@ -8921,7 +8921,7 @@ mod tests {
     #[test]
     fn a_failed_decision_pass_still_scrubs() {
         let mut e = cached_box();
-        e.retry_disabled_for_test = true; // Task 57 off: the task fails, the next one recovers
+        e.retry_disabled_for_test = true; // retry off: the task fails, the next one recovers
         answer(&mut e, shared_prefix_pass("q0", 0, true));
         // The warm pass restores over the live requests, then its suffix infer throws.
         let at = infers(&e, 1);
@@ -9000,15 +9000,15 @@ mod tests {
 
     #[test]
     fn a_restore_onto_a_just_recompiled_stage_primes_it_first() {
-        // Task 54 x Task 55: a warm pass gets stage 1 stuck; the next warm pass's admission
+        // A warm pass gets stage 1 stuck; the next warm pass's admission
         // recompiles it. The fresh stage is un-run, and a set_state onto an un-run request is
         // dropped (the mock drops it too, which would change the answer), so the restore must
         // prime it with one fold first, bounded as its first infer.
         let mut e = cached_box();
-        e.retry_disabled_for_test = true; // Task 57 off: the task fails, the next one recovers
+        e.retry_disabled_for_test = true; // retry off: the task fails, the next one recovers
         e.stage_idle_timeout = Duration::from_millis(200);
         answer(&mut e, shared_prefix_pass("q0", 0, true));
-        let events = stuck_on_next_infer(&mut e); // q1's suffix (no priming fold since Task 55)
+        let events = stuck_on_next_infer(&mut e); // q1's suffix (no priming fold)
         e.submit(shared_prefix_pass("q1", 1, false)).unwrap();
         assert!(run_to_final(&mut e).error.is_some());
         let n = events.lock().unwrap().len();
@@ -9067,7 +9067,7 @@ mod tests {
                 assert_eq!(resets, 0);
             } else {
                 assert!(!e.decision_scrub_deferred && !e.primed && !e.state_restored);
-                assert_eq!(resets, 1, "the finish recreates, as before Task 55");
+                assert_eq!(resets, 1, "the finish recreates");
                 assert!(e.timing.recreate);
             }
         }
@@ -9075,11 +9075,11 @@ mod tests {
 
     #[test]
     fn a_relay_whose_engine_failed_fails_the_heads_task_well_under_the_reply_bound() {
-        // Task 46 review I1: a relay rank whose stage request stays busy used to ack RESET and
+        // A relay rank whose stage request stays busy used to ack RESET and
         // then drop every FORWARD, so each head task waited out `recv_timeout` (60 s). The relay
         // now returns a connection-fatal error instead of the ack; `run_relay_loop` exits and the
         // closed socket fails the head's exchange at once. Rank 1 is driven here as
-        // `run_relay_loop` drives it: on a connection-fatal error the stage is dropped. Task 54:
+        // `run_relay_loop` drives it: on a connection-fatal error the stage is dropped.
         // a relay recompiles the stage like a single box does, so this rank has used up its
         // recompiles (cap 0) and its engine fails.
         let _knob = crate::timeout_knob_lock();
@@ -9111,7 +9111,7 @@ mod tests {
             match relay.step() {
                 Err(e) if e.is_connection_fatal() => {
                     let failed = relay.engine_failed.is_some();
-                    // Task 56: a relay exits through this error, never through the handle.
+                    // A relay exits through this error, never through the handle.
                     assert_eq!(relay.failure().reason(), None);
                     drop(relay); // the process exit closes the socket
                     return (e.to_string(), failed);
@@ -9168,7 +9168,7 @@ mod tests {
 
     #[test]
     fn a_relay_recompiles_a_stuck_stage_and_the_heads_task_is_served() {
-        // Task 54 in pipeline mode: the relay's RESET runs the same recovery as a single box, so a
+        // In pipeline mode the relay's RESET runs the same recovery as a single box, so a
         // request left stuck on rank 1 is abandoned and its stage recompiled inside the RESET, the
         // ack follows, and the head's task is served. No frame changes: the head only sees a
         // slower ack.
@@ -9253,7 +9253,7 @@ mod tests {
 
     #[test]
     fn a_middle_rank_whose_downstream_link_desyncs_exits_connection_fatal() {
-        // Task 59 (pawan-03): the next rank died while this one waited for its RESET_ACK. The
+        // The next rank died while this one waited for its RESET_ACK. The
         // desynced link fails the engine, so the relay step returns the connection-fatal error
         // and `run_relay_loop` exits for a supervisor restart, instead of refusing every frame.
         let _knob = crate::timeout_knob_lock();
@@ -9300,7 +9300,7 @@ mod tests {
         );
         let reason = e.engine_failed.clone().expect("a desync fails the engine");
         assert!(reason.contains("desynced"), "{reason}");
-        // A relay exits through this error, never through the Task 56 handle.
+        // A relay exits through this error, never through the failure handle.
         assert_eq!(e.failure().reason(), None);
         // And keeps exiting: no later step reads the link again.
         assert!(e.step().expect_err("still failed").is_connection_fatal());
@@ -9310,8 +9310,8 @@ mod tests {
     }
 
     #[test]
-    fn a_downstream_rank_serves_resets_as_before_task_41() {
-        // A pre-41 rank 0 sends RESET with `pos` 0; the relay acks it and serves the task.
+    fn a_downstream_rank_serves_resets_as_before_system2() {
+        // A pre-System-2 rank 0 sends RESET with `pos` 0; the relay acks it and serves the task.
         let rt = pipe_rt();
         let (server, mut client) = rt.block_on(async {
             let mut server = ActivationServer::new("127.0.0.1", 0);
@@ -9359,7 +9359,7 @@ mod tests {
         assert_eq!(infers(&e, 0), 2);
     }
 
-    // ---- Task 57: retry a request once after a native infer failure recovers ----
+    // ---- Retry a request once after a native infer failure recovers ----
 
     /// cascadia-runner's `MAX_CONSECUTIVE_EMPTY_STEPS`: a stream closes at this many empty steps
     /// in a row.
@@ -9509,7 +9509,7 @@ mod tests {
         assert_eq!(infers(&e, 1), 1, "the pass's prefill only, no re-run");
     }
 
-    /// Task 61: the step that fails a task and admits its retry returns nothing, and tells the
+    /// The step that fails a task and admits its retry returns nothing, and tells the
     /// runner it was progress, so a queued stream does not count it toward its empty-step limit.
     /// Any other step does not.
     #[test]
@@ -9559,10 +9559,7 @@ mod tests {
             e.pending.is_empty() && e.retry.is_none(),
             "no third attempt"
         );
-        assert!(
-            e.scrub_pending,
-            "the next admission recovers, as before Task 57"
-        );
+        assert!(e.scrub_pending, "the next admission recovers");
         e.submit(chat("c2")).unwrap();
         let c = run_to_final(&mut e);
         assert!(c.error.is_none(), "{c:?}");
@@ -9627,7 +9624,7 @@ mod tests {
     #[test]
     fn a_failure_that_fails_the_engine_is_not_retried() {
         // A recompiled stage whose first infer fails fails the engine at the failure itself
-        // (Task 54): no retry, the task's own error.
+        // no retry, the task's own error.
         let mut e = mock_box();
         e.stage_idle_timeout = Duration::from_millis(100);
         let ctl = arm_recompile(&mut e);
@@ -9670,7 +9667,7 @@ mod tests {
 
     #[test]
     fn a_retry_resumes_over_a_generated_id_past_the_tokenizer_vocab() {
-        // Task 61: the model picks id 6, a logit row past the tiny tokenizer's 5 ids but inside
+        // The model picks id 6, a logit row past the tiny tokenizer's 5 ids but inside
         // the model's vocab (8), as a padded row would be. Stage 1's decode 2 fails one token in;
         // the retry resumes over that id instead of refusing it as an invalid resume prefix.
         let mut clean = mock_box();

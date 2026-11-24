@@ -665,7 +665,7 @@ mod tests {
 
     #[test]
     fn number_choice_values_key_exactly_like_systemone() {
-        // H16/L9: the key is Python's str() of the EXACT parsed literal, as `/v1/systemone`
+        // The key is Python's str() of the EXACT parsed literal, as `/v1/systemone`
         // renders the same literal: every digit of a big int, the correctly rounded 17-digit float
         // (serde_json's default parser misrounds this one), Python repr for the rest.
         let lits = [
@@ -731,7 +731,7 @@ mod tests {
 
     #[test]
     fn an_integer_choice_value_of_any_size_keeps_every_digit() {
-        // Task 26 M1: 310+ digits overflow f64, which an internally tagged enum's buffering used
+        // 310+ digits overflow f64, which an internally tagged enum's buffering used
         // to hit ("number out of range"); `/v1/systemone` reads the literal as a big int.
         let big = format!("1{}", "0".repeat(400));
         let (r, meta) = to_internal(&oa(&one_choice(&format!(
@@ -776,7 +776,7 @@ mod tests {
 
     #[test]
     fn duplicate_keys_in_the_body_are_rejected() {
-        // Task 25 review (a): a repeated top-level key used to be a 400, not last-one-wins.
+        // A repeated top-level key used to be a 400, not last-one-wins.
         let q = r#""questions": [{"type": "predicate", "name": "a", "instructions": "x"}]"#;
         for body in [
             format!(r#"{{"input": "x", "input": "y", {q}}}"#),
@@ -792,7 +792,7 @@ mod tests {
 
     #[test]
     fn an_unknown_part_type_is_echoed_truncated() {
-        // Task 25 review (b): the echoed `type` is capped at 64 characters.
+        // The echoed `type` is capped at 64 characters.
         let long = "é".repeat(1000);
         let body = format!(
             r#"{{"input": [{{"role": "user", "content": [{{"type": "{long}"}}]}}], "questions": []}}"#
@@ -863,7 +863,7 @@ mod tests {
         let (r2, _) = to_internal(&oa(r#"{"input": "x", "questions": [{"type": "choice", "name": "c", "instructions": "x", "choices": [{"value": 1e5}, {"value": 2.50}]}]}"#)).unwrap();
         assert_eq!(r2.questions["c"].option_keys(), ["100000.0", "2.5"]);
         assert_eq!(meta[2].level_labels, ["Cosmetic", "Blocked"]);
-        // EDGE-4: `-0` is Python's int 0 (key "0"); `0.0` and `-0.0` keep their float keys.
+        // `-0` is Python's int 0 (key "0"); `0.0` and `-0.0` keep their float keys.
         let (r3, m3) = to_internal(&oa(r#"{"input": "x", "questions": [{"type": "choice", "name": "c", "instructions": "x", "choices": [{"value": -0}, {"value": 0.0}, {"value": -0.0}]}]}"#)).unwrap();
         assert_eq!(r3.questions["c"].option_keys(), ["0", "0.0", "-0.0"]);
         assert_eq!(m3[0].choice_values[0], OrderedValue::Number(0.into()));

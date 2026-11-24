@@ -321,7 +321,7 @@ def _positive_int(s):
 
 # Export peak RAM (process tree working set) as a multiple of the base IR's int8 weights
 # (openvino_language_model.bin + openvino_text_embeddings_model.bin: 7.40 + 0.95 = 8.35 GiB for
-# Qwen3.5-9B), measured on pawan-01 (Task 58): 1 stage peaked at 8.25 GiB for JEV's graft (no
+# Qwen3.5-9B), measured on an Arc 140V box: 1 stage peaked at 8.25 GiB for JEV's graft (no
 # --weights, 0.99x) and 20.3 / 20.6 GiB for Kev's / Clef's --weights swap (2.43x / 2.47x);
 # Only 1-stage exports are checked: multi-stage peaks do not scale from these (8 stages measured
 # 3.1 / 5.1 / 5.3 GiB; Clef-27B at 2 stages needs about 16 GB, far under 2.5 x its weights / 2).
@@ -442,7 +442,7 @@ def main():
         ap.error(f"{a.family} needs {flag}")
     if a.family == "jev" and a.weights and not a.weights_not_merged:
         # JEV always grafts its adapter; shards uploaded with that adapter merged in would get it
-        # twice, and a reference built on the same shards with the same --lora agrees (P2-BLD-1).
+        # twice, and a reference built on the same shards with the same --lora agrees.
         ap.error("jev --weights grafts the adapter onto those shards: pass --weights-not-merged to state "
                  "they do not already contain it (run tools/decision/backbone_diff.py STOCK_REPO WEIGHTS "
                  "--adapter ADAPTER_DIR first; VERDICT: MERGED means export without --weights instead)")

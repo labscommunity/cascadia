@@ -87,7 +87,7 @@ impl Engine for MockEngine {
         // heads `-(i^2)/4`, so the first option always wins). The `DECISION_*_ID` sentinel
         // prompt ids exercise the API's error paths.
         if let Some(d) = &task.decision {
-            // In a `require_warm` pass: its prefix snapshot was evicted (SEC-3).
+            // In a `require_warm` pass: its prefix snapshot was evicted.
             if d.require_warm && d.prompt_ids.contains(&DECISION_EVICTED_ID) {
                 return Ok(vec![(
                     task.task_id.clone(),
@@ -109,7 +109,7 @@ impl Engine for MockEngine {
             }
             let non_finite = d.prompt_ids.contains(&DECISION_NON_FINITE_ID);
             // A joint head (Clef) slices one logits vector per question: there the logits are
-            // -(i^2)/4, not evenly spaced, so a wrong slice offset changes the softmax (P2-CE-3).
+            // -(i^2)/4, not evenly spaced, so a wrong slice offset changes the softmax.
             let joint = matches!(d.head, cascadia_types::ReadoutHead::Joint { .. });
             let logits: Vec<f32> = (0..d.head.output_len())
                 .map(|i| match (non_finite, i % 3) {

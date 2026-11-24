@@ -41,7 +41,7 @@ def test_int8_asym_single_signed_rows_keep_zero_in_range():
 
 
 def test_q_asym_zero_and_constant_rows():
-    # H32: a zero row keeps a positive scale and dequantizes to exactly 0; a constant row's range
+    # a zero row keeps a positive scale and dequantizes to exactly 0; a constant row's range
     # is [0, c] (or [c, 0]), so it lands on the top (bottom) code and dequantizes to ~c.
     w = np.array([[0.0] * 4, [0.25] * 4, [-0.5] * 4], dtype=np.float32)
     q, zp, s = ws.q_asym(w, 8, axis=-1)
@@ -55,7 +55,7 @@ def test_q_asym_zero_and_constant_rows():
 
 
 def test_q_asym_u4_groups():
-    # H32: the u4 path quantizes [out, G, 128] per group (axis -1) into 0..15
+    # the u4 path quantizes [out, G, 128] per group (axis -1) into 0..15
     rng = np.random.default_rng(3)
     w = rng.normal(size=(2, 3, 128)).astype(np.float32)
     q, zp, s = ws.q_asym(w, 4, axis=-1)
@@ -70,7 +70,7 @@ def test_q_asym_u4_groups():
 
 @pytest.mark.parametrize("dtype", [np.float16, np.float32, np.float64])
 def test_q_asym_output_dtypes_do_not_follow_the_input(dtype):
-    # H32: whatever the checkpoint dtype, the codes are u8 and the scale f16 (the stock IR's types)
+    # whatever the checkpoint dtype, the codes are u8 and the scale f16 (the stock IR's types)
     w = np.linspace(-1, 2, 16, dtype=dtype).reshape(2, 8)
     q, zp, s = ws.q_asym(w, 8, axis=-1)
     assert (q.dtype, zp.dtype, s.dtype) == (np.uint8, np.uint8, np.float16)
@@ -411,7 +411,7 @@ def test_swap_stage_round_trips_through_check_swap():
 
 
 def test_swap_stage_leaves_other_consumers_of_a_shared_float_constant_alone():
-    """H31: a float constant also read by an op that is not one of FLOAT_KINDS keeps feeding that op
+    """A float constant also read by an op that is not one of FLOAT_KINDS keeps feeding that op
     the stock value; only the matched consumer gets the swapped weights."""
     ov = pytest.importorskip("openvino")
     from openvino import opset13 as ops
@@ -430,7 +430,7 @@ def test_swap_stage_leaves_other_consumers_of_a_shared_float_constant_alone():
 
 
 def test_swap_stage_u4_projection_round_trips():
-    """H32: a u4 [out, G, 128] projection is re-quantized per group with u4 codes and zero points."""
+    """A u4 [out, G, 128] projection is re-quantized per group with u4 codes and zero points."""
     ov = pytest.importorskip("openvino")
     from openvino import opset13 as ops
     out_f, g = 2, 2
@@ -473,7 +473,7 @@ def test_swap_stage_missing_projection_fails_check_swap():
         ws.check_swap(report, range(0, 2), types, last=True)
 
 
-# ---- BLD-4: swap_embeddings refuses an embeddings layout it would silently corrupt ---------------
+# ---- swap_embeddings refuses an embeddings layout it would silently corrupt ---------------
 
 def _embeddings_xml(ov, ops, path, asym=False, scale_rows=None):
     rows, hid = 6, 4

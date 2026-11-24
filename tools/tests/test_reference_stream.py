@@ -62,7 +62,7 @@ def write_lora(path, model, modules, rank=2, seed=1, prefix="model."):
     return t
 
 
-# H41: every key prefix weight_swap.LORA_KEY (and so the export's graft) accepts
+# every key prefix weight_swap.LORA_KEY (and so the export's graft) accepts
 @pytest.mark.parametrize("prefix", ["model.", "", "model.language_model.", "language_model."])
 def test_lora_merged_per_layer_matches_merged_full_model(tmp_path, prefix):
     model = tiny(tmp_path)
@@ -106,12 +106,12 @@ def test_streams_several_passes_of_different_lengths(tmp_path):
 def test_lm_rows_reads_lm_head(tmp_path):
     model = tiny(tmp_path)
     assert torch.equal(rs.lm_rows(str(tmp_path), [5, 0, 5]), model.lm_head.weight.detach()[[5, 0, 5]])
-    # H42: the checkpoint is opened once, not per call
+    # the checkpoint is opened once, not per call
     assert rs._lm_head(str(tmp_path)) is rs._lm_head(str(tmp_path))
 
 
 def test_stream_hidden_restores_the_callers_thread_count(tmp_path):
-    # H42: set_num_threads is process-wide; the reference must not leave its setting behind
+    # set_num_threads is process-wide; the reference must not leave its setting behind
     tiny(tmp_path)
     before = torch.get_num_threads()
     want = 1 if before != 1 else 2
@@ -301,7 +301,7 @@ def test_lm_head_adapter_fails_outside_jev(tmp_path):
 
 def write_audit_adapter(tmp_path, model, config=True):
     """limits-audit B2 repro on the tiny model: a decoder LoRA plus embed_tokens.lora_embedding_A/B
-    and a saved `norm` (modules_to_save). Before Task 23 the reference merged the decoder LoRA and
+    and a saved `norm` (modules_to_save). Before this change the reference merged the decoder LoRA and
     silently dropped the rest, exactly as the export did, so parity agreed on a wrong model."""
     from safetensors.torch import save_file
     t = write_lora(tmp_path / "adapter_model.safetensors", model, ["layers.0.mlp.down_proj"])

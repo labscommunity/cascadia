@@ -76,7 +76,7 @@ def test_dump_passes_align_to_records(tmp_path):
 
 
 def test_jev_choice_lines_with_strategy_and_round_still_align(tmp_path):
-    # Task 37: a JEV choice pass's dump line also names its plan and round. Within the trained
+    # A JEV choice pass's dump line also names its plan and round. Within the trained
     # slots that is one "native" round-1 pass per question, which the tools read as before.
     lines, plain = [], []
     for r in records()[:3]:
@@ -97,7 +97,7 @@ def test_jev_choice_lines_with_strategy_and_round_still_align(tmp_path):
     assert len(list(cg.align_lines(plain, records()[:3]))) == 3, "and the lines without them"
 
 
-# ---- H39: align is strict, and reference_top1 reads each spike's stored option order -----------
+# ---- align is strict, and reference_top1 reads each spike's stored option order -----------
 
 def _line(*qids, lo=0):
     return {"parts": [[q, lo + i, lo + i + 1] for i, q in enumerate(qids)], "readout": {}}
@@ -146,7 +146,7 @@ def test_reference_top1_choice_order_per_family():
 
 
 def test_noul_tie_reads_the_same_in_codec_golden_and_parity_check():
-    # H40: p = 0.5 used to be "true" for codec_golden and "false" for parity_check
+    # p = 0.5 used to be "true" for codec_golden and "false" for parity_check
     ans = {"type": "noul", "noul": 0.5}
     assert cg.top1(ans) == "false"
     p = pc.answer_probs(ans)
@@ -183,7 +183,7 @@ def test_noul_reference_compares_both_stored_probabilities():
     assert cg.reference_top1("jev", {"type": "noul"}, {"probs": [0.50000001, 0.49999999]}) == "false"
 
 
-# ---- H37: each pass's logit ranges must tile its head's outputs ----------------------------------
+# ---- each pass's logit ranges must tile its head's outputs ----------------------------------
 
 @pytest.mark.parametrize("head,parts", [
     ({"kind": "verbalizer", "token_ids": [5, 6, 7]}, [["q", 0, 3]]),
@@ -207,13 +207,13 @@ def test_check_parts_refuses_ranges_that_do_not(head, parts, capsys):
 
 
 def test_float_branch_reads_values_not_digits_in_strings():
-    # H38: "1e" / ".5" inside a string used to count as float coverage
+    # "1e" / ".5" inside a string used to count as float coverage
     assert "float" not in cg.branches({"state": {"note": "item 1e5 costs .5"}, "questions": {}})
     assert {"float", "float:2.5"} <= cg.branches({"state": {"x": [{"y": 2.5}]}, "questions": {}})
     assert "float" not in cg.branches({"state": {"n": 3}, "questions": {}})
 
 
-# ---- BLD-1: backbone_diff matches across checkpoint layouts and always ends with a verdict ---------
+# ---- backbone_diff matches across checkpoint layouts and always ends with a verdict ---------
 
 _LAYER_SUFFIXES = ["self_attn.q_proj.weight", "self_attn.o_proj.weight", "mlp.gate_proj.weight",
                    "mlp.up_proj.weight", "mlp.down_proj.weight", "input_layernorm.weight",
@@ -482,7 +482,7 @@ def test_clef_injection_record_keeps_only_template_specials():
     cg.check_specials("clef s03", jsm.encode_record(tok, cg.clef_sanitized(INJECT, added)).input_ids, added_ids, template)
 
 
-# ---- DRIFT-1 / BLD-2: a no-ref parity run writes its own slice of the dump ------------------------
+# ---- a no-ref parity run writes its own slice of the dump ------------------------
 
 def _pass_line(qid):
     return json.dumps({"parts": [[qid, 0, 2]], "readout": {"prompt_ids": [1], "head": {"kind": "verbalizer", "token_ids": [1, 2]}}})
@@ -545,7 +545,7 @@ def test_parity_run_without_ref_needs_dump(capsys):
     assert e.value.code == 2 and "--dump" in capsys.readouterr().err
 
 
-# ---- QUA-11: check_kev's kev patch is one context manager that restores the module ----------------
+# ---- check_kev's kev patch is one context manager that restores the module ----------------
 
 def test_kev_with_golden_patches_and_restores():
     import types
@@ -563,7 +563,7 @@ def test_kev_with_golden_patches_and_restores():
     assert (kev.records, kev.user_tokens) == orig, "restored on error too"
 
 
-# ---- FID-3: JEV choice answers are gated, on jev.py's own (sorted) prompts --------------------------
+# ---- JEV choice answers are gated, on jev.py's own (sorted) prompts --------------------------
 
 def _jev_ref(recs):
     """reference_jev.pt-shaped entries: noul [false, true], choices sorted, 6 score levels; top-1 index 0."""
@@ -656,7 +656,7 @@ def test_jev_sorted_server_layout_tokenizes_to_jev_py_questions():
     assert got == want
 
 
-# ---- Fix round 2: backbone_diff (P2-BLD-1, P2-BLD-2, P2-BLD-4) -----------------------------------
+# ---- backbone_diff -----------------------------------
 
 DUMMY_TOKEN = "hf_dummy_test_value_not_a_secret"
 
@@ -688,7 +688,7 @@ def test_backbone_diff_merged_when_every_difference_is_an_adapter_target():
     assert (v, code) == ("MERGED", 3)
     assert "--lora" in lines[-1]
     assert seen == [sorted(changed)]
-    # P3-BLD-5: the all-on-target pattern alone is not a proof
+    # the all-on-target pattern alone is not a proof
     v, code, lines = _run(_hdr("model."), _hdr("model.", changed=changed), adapter=_TARGETS.__contains__)
     assert (v, code) == ("UNKNOWN", 2)
     for verdict, code in (("FINETUNED", 0), ("UNKNOWN", 2)):
@@ -768,7 +768,7 @@ def test_backbone_diff_reads_local_snapshot_dirs(tmp_path, monkeypatch, capsys):
 
 
 def test_backbone_diff_config_only_adapter_cannot_prove_merged(tmp_path, monkeypatch, capsys):
-    """P3-BLD-5: with only adapter_config.json there are no lora tensors to verify a merge: UNKNOWN."""
+    """With only adapter_config.json there are no lora tensors to verify a merge: UNKNOWN."""
     import backbone_diff as bd
     ad = tmp_path / "cfg"
     ad.mkdir()
@@ -846,7 +846,7 @@ def test_backbone_diff_http_error_never_shows_the_token(monkeypatch):
     assert "401" in str(e.value) and DUMMY_TOKEN not in str(e.value)
 
 
-# ---- Fix round 3: HF_TOKEN hygiene (P3-BLD-2) ----------------------------------------------------
+# ---- HF_TOKEN hygiene ----------------------------------------------------
 
 CRLF_DUMMY = "hf_dummy_crlf_not_a_secret\r\n"
 INNER_DUMMY = "hf_dummy_inner\r\nnot_a_secret"
@@ -914,7 +914,7 @@ def test_backbone_diff_cli_with_a_malformed_token_prints_no_token(tmp_path):
         assert part not in r.stdout and part not in r.stderr
 
 
-# ---- Fix round 3: config-only target_modules (P3-BLD-4) ------------------------------------------
+# ---- config-only target_modules ------------------------------------------
 
 @pytest.mark.parametrize("tm", ["all-linear", ["all-linear"], "ALL-LINEAR"])
 def test_backbone_diff_all_linear_target_modules(tmp_path, tm):
@@ -943,7 +943,7 @@ def test_backbone_diff_targets_matching_nothing_are_unknown(tmp_path):
         assert (v, code) == ("UNKNOWN", 2) and "match none" in lines[-1]
 
 
-# ---- Fix round 3: MERGED must be proved (P3-BLD-5) -----------------------------------------------
+# ---- MERGED must be proved -----------------------------------------------
 
 def _bf16_bits(x):
     """float32 array -> bf16 bit patterns (round to nearest even)."""
@@ -1064,10 +1064,10 @@ def test_backbone_diff_merge_check_unknown_when_it_cannot_run(tmp_path, monkeypa
     assert e.value.code == 2 and "at most 16 bytes" in capsys.readouterr().out.strip().splitlines()[-1]
 
 
-# ---- Fix round 4: FINETUNED needs a residual beyond rounding (P4-BLD-2) ---------------------------
+# ---- FINETUNED needs a residual beyond rounding ---------------------------
 
 def _reviewer_merge(dstd, seed=0, out=1024, inp=4096, r=32, scale=2.0):
-    """P4-BLD-2's reproduction: a 1024x4096 bf16 weight of std 0.02 and an r=32, scale-2 adapter whose
+    """A reproduction: a 1024x4096 bf16 weight of std 0.02 and an r=32, scale-2 adapter whose
     delta has std `dstd`, merged in bf16. -> (stock, merged, lora_A, lora_B, scale, rng), all float64."""
     import numpy as np
     rng = np.random.default_rng(seed)
@@ -1102,7 +1102,7 @@ def test_backbone_diff_merge_below_resolution_is_unknown_not_finetuned():
     assert bd.merge_evidence(w3, merged3, la3, lb3, scale, "BF16")[0] == "MERGED"
 
 
-# ---- Fix round 4: config-only regex target_modules see the VLM prefix (P4-BLD-3) ------------------
+# ---- config-only regex target_modules see the VLM prefix ------------------
 
 @pytest.mark.parametrize("rx", [
     r".*language_model.*\.(q_proj|k_proj|v_proj|o_proj|gate_proj|up_proj|down_proj)",
@@ -1123,7 +1123,7 @@ def test_backbone_diff_config_regex_matches_vlm_module_names(tmp_path, rx):
     assert (v, code) == ("UNKNOWN", 2) and "no merge check" in lines[-1], lines[-1]
 
 
-# ---- Fix round 4: a run's answers can be saved and gated against (P4-DRIFT-3) --------------------
+# ---- a run's answers can be saved and gated against --------------------
 
 def _answering_server(monkeypatch, dump, flip=None):
     """pc.systemone replaced by a server that appends one pass per question and answers every question

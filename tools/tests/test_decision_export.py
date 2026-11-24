@@ -417,7 +417,7 @@ def test_cli_jev_lora_from_adapter_dir_and_no_validate(cli, monkeypatch):
     ad = tmp / "jev" / "adapter_vllm"
     run("jev", "--base-ir", str(base), "--adapter-dir", str(ad), "--out", str(tmp / "t"))
     (_, a, kw, assets_first), = calls
-    assert a == (str(base), str(tmp / "t"), 1, False, None)  # Task 58: a single box is one stage
+    assert a == (str(base), str(tmp / "t"), 1, False, None)  # a single box is one stage
     assert kw == {"weights": None, "lora": os.path.join(str(ad), "adapter_model.safetensors"),
                   "lora_scale": None, "final_hidden": False}
     assert assets_first
@@ -452,7 +452,7 @@ def test_cli_clef_weights_default_to_clef_dir(cli, monkeypatch):
 
 @pytest.mark.parametrize("flags", [["--lora", "L.safetensors"], ["--lora-scale", "1.0"]])
 def test_cli_clef_refuses_a_lora(cli, monkeypatch, capsys, flags):
-    # H36: Clef's joint head reads its own full checkpoint; a grafted adapter would move it
+    # Clef's joint head reads its own full checkpoint; a grafted adapter would move it
     run, calls, base, tmp = cli
     monkeypatch.setattr(de, "write_clef_profile", lambda *a, **kw: pytest.fail("clef profile written"))
     with pytest.raises(SystemExit) as e:
@@ -727,7 +727,7 @@ def test_cli_bad_head_pt_is_a_clean_error(cli, monkeypatch, capsys, content):
 
 
 def test_cli_jev_weights_need_the_not_merged_statement(cli, monkeypatch, capsys):
-    """P2-BLD-1: --weights plus the grafted --lora applies the adapter twice when the shards already
+    """--weights plus the grafted --lora applies the adapter twice when the shards already
     hold it merged; the operator must state they do not (backbone_diff said FINETUNED, not MERGED)."""
     run, calls, base, tmp = cli
     monkeypatch.setattr(de, "write_jev_profile",
@@ -743,7 +743,7 @@ def test_cli_jev_weights_need_the_not_merged_statement(cli, monkeypatch, capsys)
     assert kw["weights"] == str(base)
 
 
-# Task 23 (limits-audit B3): head.pt features the server's pointer head does not implement.
+# head.pt features the server's pointer head does not implement.
 
 def _kev_head(pt, **meta):
     """A head.pt shaped like jaredpalmer/kev-9b's (kev.checkpoint.Meta fields + training args)."""
@@ -833,7 +833,7 @@ def test_cli_kev_unsupported_head_flag_is_a_clean_error(cli, capsys, flag):
     assert calls == [] and not (tmp / "t").exists()
 
 
-# Task 30 (limits-audit L6): --max-tokens for every family, capped like JEV by the checkpoint's
+# --max-tokens for every family, capped like JEV by the checkpoint's
 # max_position_embeddings; calibration bounds mirrored from DecisionProfile::load.
 
 def test_max_tokens_defaults_are_capped_by_max_position_embeddings():
@@ -1068,14 +1068,14 @@ def test_bounds_mirror_the_rust_constants():
     prof = _rust_consts("crates/cascadia-api/src/decisions/profile.rs")
     assert (de.MIN_TEMPERATURE, de.MAX_TEMPERATURE, de.MAX_ABS_BIAS) == \
         (prof["MIN_TEMPERATURE"], prof["MAX_TEMPERATURE"], prof["MAX_ABS_BIAS"])
-    # Task 36: the server refuses a profile with more choice labels than the exporter writes.
+    # The server refuses a profile with more choice labels than the exporter writes.
     assert de.MAX_CHOICE_LABELS == prof["MAX_CHOICE_LABELS"]
     types = _rust_consts("crates/cascadia-types/src/decision.rs")
     assert (de.MAX_DECISION_PROMPT, de.MAX_JOINT_PROMPT, de.MAX_HEAD_INPUT_BYTES) == \
         (types["MAX_DECISION_PROMPT"], types["MAX_JOINT_PROMPT"], types["MAX_HEAD_INPUT_BYTES"])
 
 
-# Task 35: JEV's extended single-token choice labels (serve_decide.py single_token_labels).
+# JEV's extended single-token choice labels (serve_decide.py single_token_labels).
 
 class _FakeTok:
     """Greedy longest-match tokenizer over `vocab` (str -> id); characters outside it get 1000+ord."""
@@ -1211,11 +1211,11 @@ def test_cli_jev_without_a_tokenizer_refused_before_any_write(cli, capsys):
 
 
 # ---------------------------------------------------------------------------
-# Task 58: single-box trees are one stage; the export's peak RAM is checked first
+# Single-box trees are one stage; the export's peak RAM is checked first
 # ---------------------------------------------------------------------------
 
 GiB = 1 << 30
-# The int8 IRs' weights on pawan-01 (language model + text embeddings bins), and its RAM.
+# The int8 IRs' weights on an Arc 140V box (language model + text embeddings bins), and its RAM.
 IR_9B = (7.398 + 0.948) * GiB
 IR_27B = (23.88 + 1.185) * GiB
 PAWAN01_RAM = 31.58 * GiB
@@ -1231,7 +1231,7 @@ def test_ir_weight_bytes_sums_the_language_model_and_embeddings_bins(tmp_path):
 
 @pytest.mark.parametrize("swap,measured", [(False, 8.25), (True, 20.3), (True, 20.6)])
 def test_peak_estimate_covers_the_measured_one_stage_peaks(monkeypatch, swap, measured):
-    # pawan-01, OpenVINO 2026.4.1, GiB: JEV's graft; Kev's and Clef's --weights swap.
+    # Arc 140V box, OpenVINO 2026.4.1, GiB: JEV's graft; Kev's and Clef's --weights swap.
     monkeypatch.setattr(de, "ir_weight_bytes", lambda d: IR_9B)
     est = de.export_peak_bytes("ir", swap) / GiB
     assert measured <= est <= measured * 1.1, est

@@ -17,7 +17,7 @@ pub(crate) struct PassTiming {
     /// Pop to prefill start: scrub, probe, restore, refusals, snapshot planning.
     pub admit: Duration,
     /// The admission's own `reset_all`, inside `admit`: a cold pass's reset, which after a
-    /// decision pass is the scrub that pass deferred (a recreate after a warm pass, Task 55).
+    /// decision pass is the scrub that pass deferred (a recreate after a warm pass).
     /// Zero on a warm hit.
     pub admit_reset: Duration,
     /// The whole restore, priming fold included (what `qwen35 prefix-cache hit` logs).
@@ -31,7 +31,7 @@ pub(crate) struct PassTiming {
     /// `set_input` (with the LE conversions) plus `output()` and `f32_from_le`, all stages.
     pub host_copy: Duration,
     pub head: Duration,
-    /// The latest `reset_all` of this pass. Since Task 55 the single-box finish defers its scrub
+    /// The latest `reset_all` of this pass. With the prefix-reuse warm path, the single-box finish defers its scrub
     /// to the next admission, so this is the admission's own (`admit_reset`): zero on a warm hit in the default
     /// restore mode (`CASCADIA_QWEN36_RESTORE_CLEAR` unset).
     pub reset: Duration,

@@ -156,7 +156,7 @@ fn engine_failure(reason: &str) -> DecisionError {
     if reason.starts_with("decision_too_long") {
         return DecisionError::TooLong("decision prompt too long for the model's head".into());
     }
-    // A `require_warm` pass whose shared-prefix snapshot was evicted (SEC-3): the engine refused
+    // A `require_warm` pass whose shared-prefix snapshot was evicted: the engine refused
     // to prefill past the request's budget. Busy, not broken: the capacity 503, retry. (A
     // snapshot that can never fit is `decision_uncacheable`, a 413, handled by the caller.)
     if reason.starts_with("decision_cold") {
@@ -232,7 +232,7 @@ pub async fn evaluate_with(
     }
     // Take the permit BEFORE tokenizing: encode() is CPU work proportional to the request.
     // Decisions have their own pool: they never take chat's permits, nor chat theirs.
-    // Counted like chat (SEC-5): a capacity refusal, the request total and the in-flight gauge.
+    // Counted like chat: a capacity refusal, the request total and the in-flight gauge.
     let permit = match ctx.permits.clone().try_acquire_owned() {
         Ok(p) => p,
         Err(_) => {
@@ -247,7 +247,7 @@ pub async fn evaluate_with(
     }
     // The permit (and the in-flight gauge) is shared with the blocking encode below: a client
     // disconnect drops this future but not a running `spawn_blocking` closure, so the permit is
-    // released only once both are done (SEC-2). Orphaned encodes stay bounded by the permit count.
+    // released only once both are done. Orphaned encodes stay bounded by the permit count.
     let held = Arc::new(Held {
         _permit: permit,
         _inflight: ctx.stats.map(|s| crate::InFlightGuard::new(s.clone())),
@@ -334,7 +334,7 @@ pub async fn evaluate_with(
             return Err(engine_failure("codec produced no answer for a question"));
         };
         // A codec bug (an off-by-one logits range, a rescale to the wrong level count) would
-        // otherwise truncate the distribution silently or panic on `probs[1]` (QUA-6).
+        // otherwise truncate the distribution silently or panic on `probs[1]`.
         if p.len() != q.option_keys().len() {
             return Err(engine_failure(&format!(
                 "codec returned {} probabilities for {} options",
@@ -343,7 +343,7 @@ pub async fn evaluate_with(
             )));
         }
         // Finite logits can still give NaN/inf probabilities if a calibration overflows
-        // (`(l + b) / t`, H17); the profile bounds prevent it, and this keeps it from ever
+        // (`(l + b) / t`); the profile bounds prevent it, and this keeps it from ever
         // reaching a client as `null` in a 200.
         if !p.iter().all(|x| x.is_finite()) {
             return Err(engine_failure("non-finite decision probabilities"));
@@ -370,8 +370,8 @@ pub async fn evaluate_with(
 /// Run tokenization work `f` off the async executor (it is CPU work proportional to the
 /// request), in one of the service's encode slots. At most `encode_slots` tokenizations run at
 /// once, whatever the decision permits allow (each can hold a few hundred MB of tokenizer
-/// transients, P2-SEC-3); this waits rather than refusing, since the request already holds its
-/// permit. The closure keeps the slot and the request's permit (SEC-2), so an orphaned encode
+/// transients); this waits rather than refusing, since the request already holds its
+/// permit. The closure keeps the slot and the request's permit, so an orphaned encode
 /// keeps both until it ends.
 async fn off_executor<T: Send + 'static>(
     svc: &Arc<DecisionService>,
@@ -428,10 +428,10 @@ async fn dump_passes(
             _ => None,
         })
         .collect();
-    // Serialize and write off the async workers (P2-SEC-5): a request's lines can reach
+    // Serialize and write off the async workers: a request's lines can reach
     // ~16 MB, and a synchronous write under the lock would stall chat streams and timers.
     // The write carries the request's permit, so a client that leaves cannot orphan
-    // request-sized writes past the permits (P3-SEC-1). A closed dump (cap reached, write
+    // request-sized writes past the permits. A closed dump (cap reached, write
     // failed) costs nothing: no clone, no serialization.
     let dumped = passes.to_vec();
     let held = held.clone();

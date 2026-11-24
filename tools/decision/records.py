@@ -74,7 +74,7 @@ def records(n=50):
 
 
 # ---------------------------------------------------------------------------------------------
-# Wide JEV choices (Task 38): choice questions past JEV's 16 trained slots, kept apart from the 50
+# Wide JEV choices: choice questions past JEV's 16 trained slots, kept apart from the 50
 # parity records above (whose saved spike references cover only those). Four requests of 17, 24,
 # 40 + 100 and 256 options, each asked once per multi-pass strategy: 12 records, 17 questions.
 # Two native questions ride along in the `single` requests only (asked once each, so their flips
