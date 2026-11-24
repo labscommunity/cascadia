@@ -618,7 +618,7 @@ def test_real_jev_tokenizer_labels_extend_the_trained_head_and_finals_parse():
         assert cg.final_indices(rec, qid, p, tok, labels, added) == fin
 
 
-# ---- end to end: server bugs in the tournament fail the wide gate (fix round 1) -----------------
+# ---- end to end: server bugs in the tournament fail the wide gate --------------------------------
 
 DIM = 300
 

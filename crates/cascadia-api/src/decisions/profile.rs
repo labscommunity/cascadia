@@ -63,8 +63,8 @@ pub struct JevProfile {
     /// kind → calibration temperature.
     pub temperature: HashMap<String, f64>,
     /// Single-token choice labels (A..Z, AA..) and their ids, at most MAX_CHOICE_LABELS, the
-    /// first `hi - lo` being the trained choice slots. A pass over m options
-    /// labels them `[..m]`. Empty in a decision.json from before the extended labels: max 16 options then.
+    /// first `hi - lo` being the trained choice slots. A pass over m options labels them `[..m]`.
+    /// Empty in a decision.json exported without extended choice labels: max 16 options then.
     #[serde(default)]
     pub choice_labels: Vec<String>,
     #[serde(default)]
@@ -314,8 +314,10 @@ mod tests {
 
     #[test]
     fn choice_labels_and_strategy_are_optional() {
-        // A decision.json from before the extended labels has neither field and keeps loading.
-        let d = std::env::temp_dir().join(format!("dprof-t36-{}", uuid::Uuid::new_v4().simple()));
+        // A decision.json exported without extended choice labels has neither field and keeps
+        // loading.
+        let d =
+            std::env::temp_dir().join(format!("dprof-labels-{}", uuid::Uuid::new_v4().simple()));
         std::fs::create_dir_all(&d).unwrap();
         let p = d.join("decision.json");
         std::fs::write(&p, jev_json("")).unwrap();
@@ -340,7 +342,10 @@ mod tests {
     fn a_switchable_tree_is_refused_and_system2_fields_are_ignored() {
         // Trees exported while System 2 shipped carry System 2's answer labels and
         // end_think_id; they load, the fields ignored. A switchable tree (jev.lora_scale) does not.
-        let d = std::env::temp_dir().join(format!("dprof-t53-{}", uuid::Uuid::new_v4().simple()));
+        let d = std::env::temp_dir().join(format!(
+            "dprof-switchable-{}",
+            uuid::Uuid::new_v4().simple()
+        ));
         std::fs::create_dir_all(&d).unwrap();
         let p = d.join("decision.json");
         let s2 = r#","answer_labels":["A","B"],"answer_label_ids":[9,10],"end_think_id":300"#;
@@ -359,7 +364,8 @@ mod tests {
 
     #[test]
     fn choice_labels_must_extend_the_trained_choice_head() {
-        let d = std::env::temp_dir().join(format!("dprof-t36b-{}", uuid::Uuid::new_v4().simple()));
+        let d =
+            std::env::temp_dir().join(format!("dprof-labels-b-{}", uuid::Uuid::new_v4().simple()));
         std::fs::create_dir_all(&d).unwrap();
         let p = d.join("decision.json");
         let many = |n: usize| {

@@ -4723,7 +4723,7 @@ mod tests {
         assert!(v["error"]["message"].is_string());
     }
 
-    /// L5: every response carries a unique `id` and the `usage` the core computed.
+    /// Every response carries a unique `id` and the `usage` the core computed.
     #[tokio::test]
     async fn openai_response_has_id_and_usage() {
         let oa = r#"{"input": "a b", "questions": [{"type": "predicate", "name": "u", "instructions": "x"}]}"#;
@@ -4742,7 +4742,7 @@ mod tests {
         assert_eq!(a["usage"]["total_tokens"].as_u64(), Some(input));
     }
 
-    /// L8: a body the request schema rejects gets OpenAI's envelope, not the framework's 422 text.
+    /// A body the request schema rejects gets OpenAI's envelope, not the framework's 422 text.
     #[tokio::test]
     async fn openai_bad_content_parts_use_openai_error_shape() {
         let q = r#""questions": [{"type": "predicate", "name": "u", "instructions": "x"}]"#;

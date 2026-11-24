@@ -412,7 +412,7 @@ def jev_pass_text(rec, qid, idx, labels, added=()):
 
 # ---------------------------------------------------------------------------------------------
 # JEV choices past the trained slots: serve_decide s1_dist's plans and combinations, copied from
-# experiments/jev-spike/vl/serve_decide.py (single_token_labels :117-125, _groups :263-267,
+# AutoTrust JEV's vl/serve_decide.py (single_token_labels :117-125, _groups :263-267,
 # s1_dist :275-303) so the tools check the server's Rust port (jev.rs groups, combine_permute,
 # tournament_final, combine_tournament) independently. The permute orders use CPython's own
 # `random`, which is what the server's PyRandom ports.

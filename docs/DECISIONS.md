@@ -737,7 +737,7 @@ wait stopped:
   - Rank 0 killed: the pipeline served again about 4 s after the kill.
   - Rank 1 killed: about 12 s. Rank 1 restarted within 3 s. Rank 0 failed its next exchange,
     answered 503 while it gave in-flight responses the 3 s grace, then exited, restarted and
-    reconnected. Before this change, rank 0 stayed up, desynced, and answered 503 for 15 minutes
+    reconnected. Without this exit, rank 0 stayed up, desynced, and answered 503 for 15 minutes
     until a manual restart.
 
   Each restart counts against the supervisor's start limit (the systemd unit allows 3 starts per
@@ -801,7 +801,7 @@ chunk of the failed attempt. A decision pass re-runs from the start, so
 its answer is the one an uninterrupted pass gives. A chat keeps every byte already sent, but its
 continuation is not always byte-identical to an uninterrupted run: re-prefilling the generated
 tokens takes a different numeric path than decoding them one at a time, so a later near-tie can
-go the other way. On two Arc 140V boxes ( OpenVINO 2026.4.0 as a fault source, 3
+go the other way. On two Arc 140V boxes (OpenVINO 2026.4.0 as a fault source, 3
 real faults in 240 rounds of 1600 tokens) every retried chat returned 200 with all 1600 tokens
 and differed from the clean runs of the same prompt. A plain-OpenVINO replay of the same resume
 on the 8-stage IRs continued token-identically across the seam and first diverged 93 and 152
@@ -886,8 +886,8 @@ holds when the engine fails instead (cap reached, no recipe, a request that cann
 and for a recompiled copy whose first infer fails or does not return: that copy is leaked too,
 never left to drop with the engine. **Each recovery costs about one stage of memory**: the
 stage's weight file, 1.49 GB for stage6 and 2.47 GB for stage7 of the 8-stage 9B int8 tree, on a
-GPU that shares the host's RAM (31.6 GB on p01). On a 1-stage tree (the single-box default) the
-one stage is the whole model, so a recovery leaks about 9 GB.
+GPU that shares the host's RAM (31.6 GB on a 32 GB Arc 140V box). On a 1-stage tree (the
+single-box default) the one stage is the whole model, so a recovery leaks about 9 GB.
 
 A recompiled stage needs nothing re-bound. Every input is set on each infer, and its variable
 state starts empty. The scrub skips its reset and rebuild (it is fresh and has never run). The
@@ -898,7 +898,7 @@ tensor copies, not bounded) and runs its first infer, which is bounded.
 OpenVINO's usual synchronous call:
 
 - The recompile is bounded by 180 s (`RECOMPILE_TIMEOUT`). A cold compile without the model
-  cache can take tens of seconds; a cache-warm one measured 1.2 to 1.7 s on p01.
+  cache can take tens of seconds; a cache-warm one measured 1.2 to 1.7 s on an Arc 140V box.
 - The recompiled stage's first infer is bounded by 30 s, the same as the idle wait.
 
 If either does not return in time, its thread and whatever it holds are leaked, never destroyed,
@@ -924,9 +924,10 @@ so its supervisor restarts it (below):
   that shares the host's RAM. There the first fault recovers and the request is retried (above);
   the second fails the engine, and the server exits for a supervisor restart (below), about 22 s
   warm for a 1-stage 9B tree. If a stage's weight file size cannot be read at load, the cap
-  stays 2, the earlier behaviour. The engine logs its cap at load (`qwen36: stage recompile
-  cap`, with `total`, `local_stages`, `largest_leak_bytes` and `cap`), and every `recompile`
-  recovery line carries `recompiled` and `cap`.
+  stays 2, the fixed cap that every tree had before the cap followed the leak size. The engine
+  logs its cap at load (`qwen36: stage recompile cap`, with `total`, `local_stages`,
+  `largest_leak_bytes` and `cap`), and every `recompile` recovery line carries `recompiled` and
+  `cap`.
 - The request could not be abandoned (the shim is out of memory), or its state cannot be read.
 - The scrub after a recovery cannot rebuild a stage request: its `recreate_request` fails. A
   failed cheap `reset_state` first gets a recreate on the next scrub; only that recreate's
@@ -1031,8 +1032,10 @@ socket closed`, instead of waiting out its reply bound on every task. The reason
 downstream rank's log. No frame changed, so a peer without this change handles it as any closed
 link.
 
-During the recovery the engine is held, so other requests wait for it. Every wait is bounded;
-before this change none was.
+During the recovery the engine is held, so other requests wait for it. Every wait is bounded:
+the idle wait and the recompiled stage's first infer by 30 s, the recompile by 180 s. Without
+these bounds, a device call that never returned held the engine, and every waiting request, with
+no end.
 
 ### BUG-1 (OpenVINO 2026.4.0 GPU fault)
 

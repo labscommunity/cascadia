@@ -169,8 +169,8 @@ def _server_noul(z_true, z_false):
 
 @pytest.mark.parametrize("lead", [2e-8, 3e-8, 5e-8, 8e-8, 1e-6, 0.0, -2e-8])
 def test_clef_reference_reads_a_near_tie_exactly_as_the_server(lead):
-    # Fix round 1: an f32 softmax rounded p(true) for a 2e-8..9e-8 lead to exactly 0.5, and the
-    # reference read "false" while the server (f64 softmax) read "true"
+    # An f32 softmax rounded p(true) for a 2e-8..9e-8 lead to exactly 0.5, and the reference
+    # read "false" while the server (f64 softmax) read "true"
     server = cg.top1(_server_noul(lead, 0.0))
     ref = cg.reference_top1("clef", {"type": "noul"}, {"probs": cg.clef_ref_probs([lead, 0.0])})
     assert ref == server == ("true" if lead > 0 else "false")
@@ -294,7 +294,7 @@ def test_backbone_diff_tensor_sha_hashes_both_ends(monkeypatch):
     assert bd.tensor_sha(("u", "BF16", (1,), 0, len(blob)), cap=1024) != base
 
 
-# ---- Fix round 1: every partial-coverage path fails loudly -------------------------------------
+# ---- every partial-coverage path fails loudly -------------------------------------------------
 
 def _server_answers(rec):
     """A fake /v1/systemone response whose top-1 is always the first option."""
@@ -1066,7 +1066,7 @@ def test_backbone_diff_merge_check_unknown_when_it_cannot_run(tmp_path, monkeypa
 
 # ---- FINETUNED needs a residual beyond rounding ---------------------------
 
-def _reviewer_merge(dstd, seed=0, out=1024, inp=4096, r=32, scale=2.0):
+def _bf16_merge_case(dstd, seed=0, out=1024, inp=4096, r=32, scale=2.0):
     """A reproduction: a 1024x4096 bf16 weight of std 0.02 and an r=32, scale-2 adapter whose
     delta has std `dstd`, merged in bf16. -> (stock, merged, lora_A, lora_B, scale, rng), all float64."""
     import numpy as np
@@ -1084,10 +1084,10 @@ def test_backbone_diff_merge_below_resolution_is_unknown_not_finetuned():
     import backbone_diff as bd
     # a genuine merge whose delta (std 1e-5, ~0.1 ulp) mostly vanishes in bf16: small cosine, but the
     # residual is far inside rounding, so it is no evidence of an independent fine-tune
-    w, merged, la, lb, scale, rng = _reviewer_merge(1e-5)
+    w, merged, la, lb, scale, rng = _bf16_merge_case(1e-5)
     v, why = bd.merge_evidence(w, merged, la, lb, scale, "BF16")
     assert v == "UNKNOWN" and "resolution" in why, why
-    w2, merged2, la2, lb2, _, _ = _reviewer_merge(2e-6, seed=1)
+    w2, merged2, la2, lb2, _, _ = _bf16_merge_case(2e-6, seed=1)
     assert bd.merge_evidence(w2, merged2, la2, lb2, scale, "BF16")[0] == "UNKNOWN"
     # independent changes on the same weight, from about one ulp down to the delta's own size: their
     # residual RMS is no larger than rounding's, but many elements sit outside a merge's rounding
@@ -1098,7 +1098,7 @@ def test_backbone_diff_merge_below_resolution_is_unknown_not_finetuned():
         assert v == "FINETUNED", (istd, why)
     assert "0.0% of elements beyond rounding" in bd.merge_evidence(w, merged, la, lb, scale, "BF16")[1]
     # and a merge of std 1e-4 is still proved
-    w3, merged3, la3, lb3, _, _ = _reviewer_merge(1e-4, seed=2)
+    w3, merged3, la3, lb3, _, _ = _bf16_merge_case(1e-4, seed=2)
     assert bd.merge_evidence(w3, merged3, la3, lb3, scale, "BF16")[0] == "MERGED"
 
 
@@ -1166,7 +1166,7 @@ def test_parity_answers_out_saves_a_reference_the_gate_reads(tmp_path, monkeypat
     assert e.value.code == 1 and "FAIL" in capsys.readouterr().out
 
 
-# ---- P5-RUN-3 / P5-RUN-5: near-tie flips against a saved run; --answers-out only after a PASS ------
+# ---- near-tie flips against a saved run; --answers-out only after a PASS -------------------------
 
 def _saved_answers(tmp_path, monkeypatch):
     dump = tmp_path / "single.jsonl"

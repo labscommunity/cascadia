@@ -133,8 +133,8 @@ def test_lora_scale_comes_from_adapter_config(tmp_path):
     assert ws.lora_scale_from_config(str(tmp_path / "adapter_model.safetensors")) == 2.0
 
 
-def write_audit_adapter(d):
-    """limits-audit B2 repro: one decoder LoRA plus an embedding LoRA, with `norm` in modules_to_save
+def write_embedding_lora_adapter(d):
+    """One decoder LoRA plus an embedding LoRA, with `norm` in modules_to_save
     (PEFT saves the trained norm as a plain tensor). A count-only check saw 1 target and 1 graft."""
     import json
     torch = pytest.importorskip("torch")
@@ -157,7 +157,7 @@ def save_adapter(path, keys):
 
 
 def test_lora_targets_refuses_embedding_lora_and_saved_modules(tmp_path):
-    path = write_audit_adapter(tmp_path)
+    path = write_embedding_lora_adapter(tmp_path)
     with pytest.raises(ValueError, match=r"embedding LoRA keys.*embed_tokens\.lora_embedding_A"):
         ws.lora_targets(path)
     p = "base_model.model.model.layers.0.mlp.down_proj"
@@ -186,7 +186,7 @@ def test_lora_targets_refuses_unpaired_and_duplicate_modules(tmp_path):
 
 def test_lora_config_refuses_modules_to_save(tmp_path):
     import json
-    write_audit_adapter(tmp_path)
+    write_embedding_lora_adapter(tmp_path)
     with pytest.raises(ValueError, match=r"modules_to_save.*norm"):
         ws.lora_scale_from_config(str(tmp_path / "adapter_model.safetensors"))
     for empty in (None, []):
@@ -194,10 +194,10 @@ def test_lora_config_refuses_modules_to_save(tmp_path):
         assert ws.lora_scale_from_config(str(tmp_path / "adapter_model.safetensors")) == 2.0
 
 
-def test_graft_lora_refuses_the_audit_adapter(tmp_path):
+def test_graft_lora_refuses_the_embedding_lora_adapter(tmp_path):
     ov = pytest.importorskip("openvino")
     from openvino import opset13 as ops
-    path = write_audit_adapter(tmp_path)
+    path = write_embedding_lora_adapter(tmp_path)
     x = ops.parameter([1, 3], np.float32, name="x")
     mm = ops.matmul(x, ops.constant(np.eye(3, dtype=np.float32)), False, True)
     mm.set_friendly_name("__module.model.model.language_model.layers.0.mlp.down_proj/ov_ext::linear/MatMul")

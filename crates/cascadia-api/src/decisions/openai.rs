@@ -708,8 +708,8 @@ mod tests {
 
     #[test]
     fn only_choice_values_are_range_checked() {
-        // Final review N1: an out-of-range float in an unknown field is skipped unread (as the
-        // typed parse skips it and as at e109a582); in a choice value it is still a 400.
+        // An out-of-range float in an unknown field is skipped unread (as the typed parse skips
+        // it); in a choice value it is still a 400.
         let ok = r#"{"input": "x", "metadata": {"x": 1e400}, "questions": [
             {"type": "predicate", "name": "p", "instructions": "q", "choices": "not read"},
             {"type": "choice", "name": "c", "instructions": "q", "extra": 1e400,

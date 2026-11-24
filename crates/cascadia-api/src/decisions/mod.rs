@@ -531,7 +531,8 @@ mod tests {
         }
     }
 
-    /// The earlier implementation (quadratic on `<|<|<|…`), kept as the equivalence oracle.
+    /// The quadratic `sanitize_user_text` (on `<|<|<|…`) that the linear one replaced, kept as
+    /// the equivalence oracle.
     fn sanitize_oracle(text: &str) -> String {
         let mut safe = String::with_capacity(text.len());
         let mut rest = text;

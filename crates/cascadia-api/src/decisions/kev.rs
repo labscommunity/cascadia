@@ -61,7 +61,7 @@ impl Budget {
 }
 
 /// kev.api.render: str/int/float/bool via Python `str()`, lists as `- item`, objects as `key: value`.
-/// Unbounded, so test-only: a nested value's indentation can expand it ~128x (scoped-review F1).
+/// Unbounded, so test-only: a nested value's indentation can expand it ~128x.
 /// The codec uses [`render_bounded`].
 #[cfg(test)]
 pub fn render(v: &OrderedValue, indent: usize) -> String {
@@ -426,7 +426,8 @@ mod tests {
             render(&ov(r#"{"n": {"a": 1}, "k": "v", "t": true}"#), 0),
             "n:\n  a: 1\nk: v\nt: True"
         );
-        // Expected strings produced by experiments/kev-spike/kev.py `render` on the same JSON.
+        // Expected strings produced by `render` in Kev's `kev/api.py` (jaredpalmer/kev) on the
+        // same JSON.
         assert_eq!(
             render(
                 &ov(r#"{"z": [1, 2.5, {"p": false, "q": [true, null]}], "a": {"b": {"c": 1e20}, "d": null}, "e": 0.1, "f": []}"#),
@@ -434,7 +435,7 @@ mod tests {
             ),
             "z:\n  - 1\n  - 2.5\n  - p: False\n    q:\n      - True\n      - \na:\n  b:\n    c: 1e+20\n  d: \ne: 0.1\nf:\n"
         );
-        // L9: an integer beyond u64 prints every digit, as Python's str(int) does.
+        // An integer beyond u64 prints every digit, as Python's str(int) does.
         assert_eq!(
             render(&ov(r#"{"id": 123456789012345678901234567890}"#), 0),
             "id: 123456789012345678901234567890"
@@ -679,7 +680,7 @@ mod tests {
 
     #[test]
     fn a_question_text_over_eight_bytes_per_row_token_is_413_before_tokenizing() {
-        // P3-SEC residual: instructions and option texts are bounded per question like the state:
+        // Instructions and option texts are bounded per question like the state:
         // the row has at most max_tokens - state tokens left, so a question rendering past 8
         // bytes per remaining token is refused before the tokenizer pays for it.
         let c = KevCodec::new(tok(), KevProfile { temperature: 1.0 }, 10, 4000).unwrap();

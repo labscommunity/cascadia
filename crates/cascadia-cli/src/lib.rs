@@ -4278,9 +4278,9 @@ mod engine_failure_tests {
         assert!(t0.elapsed() < Duration::from_secs(5));
     }
 
-    /// Fix round 1: after an engine failure, a close that overruns its bound forces the exit
-    /// (`force_exit`; `process::exit(1)` in production) rather than return into a runtime drop
-    /// that would wait on the stuck close forever.
+    /// After an engine failure, a close that overruns its bound forces the exit (`force_exit`;
+    /// `process::exit(1)` in production) rather than return into a runtime drop that would wait
+    /// on the stuck close forever.
     #[tokio::test]
     async fn an_overrunning_close_after_an_engine_failure_forces_the_exit() {
         let handle = EngineFailure::default();
@@ -4417,7 +4417,7 @@ mod engine_failure_tests {
         );
     }
 
-    /// Fix round 1: the opt-out wiring `cmd_worker` uses. With
+    /// The opt-out wiring `cmd_worker` uses. With
     /// `--keep-serving-on-engine-failure` nothing is watched, and a reported failure does not end
     /// the serve; without it the same failure does.
     #[tokio::test]

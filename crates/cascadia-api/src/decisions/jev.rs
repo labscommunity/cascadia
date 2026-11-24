@@ -521,9 +521,10 @@ fn question_raw(q: &Question, qid: &str) -> String {
 impl Codec for JevCodec {
     fn limits(&self) -> Limits {
         // Choices: as many as the profile has labels for (serve_decide's MAX_OPTIONS, 256), the
-        // ones past the trained slots answered by `plan_choice`; a profile from before the extended labels
-        // has none and stays at the trained count. Score levels: any L, mapped from JEV's 0-5
-        // scale (rescale_score). max_questions is overridden by DecisionService::limits.
+        // ones past the trained slots answered by `plan_choice`; a decision.json exported without
+        // extended choice labels has none and stays at the trained count. Score levels: any L,
+        // mapped from JEV's 0-5 scale (rescale_score). max_questions is overridden by
+        // DecisionService::limits.
         let max_options = match self.p.choice_labels.len() {
             0 => self.trained_choices(),
             n => n,
@@ -969,7 +970,7 @@ mod tests {
     }
 
     /// A JEV with `trained` choice slots after noul and score, and `labels` choice labels (0 for
-    /// a decision.json from before the extended labels). Choice slot i has bias 0.1·(i+1).
+    /// a decision.json without extended choice labels). Choice slot i has bias 0.1·(i+1).
     fn wide_profile(trained: usize, labels: usize) -> JevProfile {
         let mut p = profile();
         let n = 8 + trained;
@@ -1375,7 +1376,7 @@ mod tests {
 
     #[test]
     fn worst_final_counts_each_line_as_the_prompt_holds_it() {
-        // I1: a tokenizer that joins a leading space to a lowercase word. Alone, "wbbbbb" is 6
+        // A tokenizer that joins a leading space to a lowercase word. Alone, "wbbbbb" is 6
         // tokens and "XYZ" 3; in the prompt " wbbbbb" is 1 and " XYZ" 4. Ranking the texts alone
         // reserved a final of 16 words, and the real final with XYZ in it was 3 tokens longer.
         let (reserve, real) = reserve_and_real_final(regex_tokenizer(r" [a-z]+|[\s\S]"), "XYZ");

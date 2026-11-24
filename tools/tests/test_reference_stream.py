@@ -299,9 +299,9 @@ def test_lm_head_adapter_fails_outside_jev(tmp_path):
                      lora=str(tmp_path / "adapter.safetensors"), lora_scale=1.0, threads=1)
 
 
-def write_audit_adapter(tmp_path, model, config=True):
-    """limits-audit B2 repro on the tiny model: a decoder LoRA plus embed_tokens.lora_embedding_A/B
-    and a saved `norm` (modules_to_save). Before this change the reference merged the decoder LoRA and
+def write_embedding_lora_adapter(tmp_path, model, config=True):
+    """An adapter on the tiny model: a decoder LoRA plus embed_tokens.lora_embedding_A/B and a
+    saved `norm` (modules_to_save). Without the refusal, the reference merged the decoder LoRA and
     silently dropped the rest, exactly as the export did, so parity agreed on a wrong model."""
     from safetensors.torch import save_file
     t = write_lora(tmp_path / "adapter_model.safetensors", model, ["layers.0.mlp.down_proj"])
@@ -314,9 +314,9 @@ def write_audit_adapter(tmp_path, model, config=True):
     return str(tmp_path / "adapter_model.safetensors")
 
 
-def test_audit_adapter_refused_by_the_reference(tmp_path):
+def test_embedding_lora_adapter_refused_by_the_reference(tmp_path):
     model = tiny(tmp_path)
-    ad = write_audit_adapter(tmp_path, model)
+    ad = write_embedding_lora_adapter(tmp_path, model)
     passes = [{"readout": {"prompt_ids": [1, 2, 3]}}]
     with pytest.raises(ValueError, match="modules_to_save"):
         rs.resolve_lora_scale(ad)

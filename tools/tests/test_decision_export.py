@@ -171,15 +171,15 @@ def test_lora_key_matching_two_matmuls_cannot_cancel_one_matching_none(stubbed, 
     assert not (out / "manifest.json").exists()
 
 
-def test_lora_audit_adapter_refused_before_any_work(stubbed, tmp_path):
-    # limits-audit B2: embedding LoRA + modules_to_save ["norm"]; the real weight_swap checks run
+def test_lora_embedding_adapter_refused_before_any_work(stubbed, tmp_path):
+    # An embedding LoRA + modules_to_save ["norm"]; the real weight_swap checks run
     model, out, calls, ws, mp = stubbed
     sys.path.insert(0, os.path.dirname(__file__))
-    from test_weight_swap import save_adapter, write_audit_adapter
+    from test_weight_swap import save_adapter, write_embedding_lora_adapter
     mp.setattr(ex, "extract_stage", lambda *a: pytest.fail("extract_stage ran"))
     ad = tmp_path / "ad"
     ad.mkdir()
-    path = write_audit_adapter(ad)
+    path = write_embedding_lora_adapter(ad)
     with pytest.raises(ValueError, match="modules_to_save"):
         ex.run_export(str(model), str(out), 2, lora=path)
     # without adapter_config.json (explicit --lora-scale) the key check still refuses
@@ -469,7 +469,7 @@ def test_cli_family_inputs_required_before_export(cli, family, missing, capsys):
     assert missing in capsys.readouterr().err and calls == []
 
 
-# Fix round 1: stale manifest, writer-side checks, config source for max_tokens.
+# Stale manifest, writer-side checks, config source for max_tokens.
 
 def _jev_adapter(tmp_path, n_bias=24, choice=(8, 24), per_kind=None):
     adapter = tmp_path / "jev" / "adapter_vllm"
@@ -580,7 +580,7 @@ def test_cli_jev_max_tokens_from_weights_config(cli, monkeypatch):
     assert seen == {"mt": 4096}  # the fine-tune's config (shipped in the tree), not the base IR's 262144
 
 
-# Scoped-review fixes: Kev ships Kev's own tokenizer, and a kev export needs its backbone + adapter.
+# Kev ships Kev's own tokenizer, and a kev export needs its backbone + adapter.
 
 def test_tokenizer_override_replaces_the_weights_tokenizer_before_the_manifest(stubbed, tmp_path):
     model, out, calls, _, monkeypatch = stubbed
@@ -948,7 +948,7 @@ def test_cli_clef_max_tokens_above_the_joint_cap_is_a_clean_error(cli, monkeypat
 
 
 def test_clef_cap_follows_the_model_width_like_joint_prompt_cap():
-    # T30 M1: clef.rs clamps max_tokens to joint_prompt_cap(hidden); refuse here instead
+    # clef.rs clamps max_tokens to joint_prompt_cap(hidden); refuse here instead
     assert [de.joint_prompt_cap(h) for h in (0, 4096, 5120, 6144, 8192)] == [16384, 16384, 16384, 13653, 10240]
     assert de.resolve_max_tokens("clef", None, None, hidden=5120) == 16384
     assert de.resolve_max_tokens("clef", None, None, hidden=8192) == 10240
@@ -976,7 +976,7 @@ def test_cli_clef_cap_reads_the_base_ir_width(cli, monkeypatch, capsys):
 
 @pytest.mark.parametrize("family,default", [("jev", 32768), ("clef", 16384)])
 def test_cli_without_any_config_json_uses_the_family_default(cli, monkeypatch, family, default):
-    # T30 M4: neither --weights/--clef-dir nor the base IR has config.json: no window is known,
+    # Neither --weights/--clef-dir nor the base IR has config.json: no window is known,
     # so the family default is written (this used to be a FileNotFoundError)
     run, calls, base, tmp = cli
     seen = {}

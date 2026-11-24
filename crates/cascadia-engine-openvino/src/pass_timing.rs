@@ -31,9 +31,10 @@ pub(crate) struct PassTiming {
     /// `set_input` (with the LE conversions) plus `output()` and `f32_from_le`, all stages.
     pub host_copy: Duration,
     pub head: Duration,
-    /// The latest `reset_all` of this pass. With the prefix-reuse warm path, the single-box finish defers its scrub
-    /// to the next admission, so this is the admission's own (`admit_reset`): zero on a warm hit in the default
-    /// restore mode (`CASCADIA_QWEN36_RESTORE_CLEAR` unset).
+    /// The latest `reset_all` of this pass. With the prefix-reuse warm path, the single-box
+    /// finish defers its scrub to the next admission, so this is the admission's own
+    /// (`admit_reset`): zero on a warm hit in the default restore mode
+    /// (`CASCADIA_QWEN36_RESTORE_CLEAR` unset).
     pub reset: Duration,
     /// That reset recreated the requests (they held a restored state). False on a warm hit in the
     /// default restore mode.

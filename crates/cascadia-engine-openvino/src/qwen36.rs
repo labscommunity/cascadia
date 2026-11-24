@@ -6736,7 +6736,7 @@ mod tests {
         assert!(take_pending(&mut None, 7).is_err(), "nothing pending");
     }
 
-    // ---- B1: a late pipeline reply never desyncs the next task ----
+    // ---- a late pipeline reply never desyncs the next task ----
 
     /// A rank-0 engine wired to a scripted fake rank 1 over loopback TCP. The fake runs on
     /// `rt`; the engine's exchanges block on the same runtime through `run_async`, as in serving.
@@ -6801,7 +6801,7 @@ mod tests {
         vec![0.0; e.hidden]
     }
 
-    /// The audit's B1 scenario, for TOKEN and both decision replies: the last rank answers after
+    /// A late reply, for TOKEN and both decision replies: the last rank answers after
     /// rank 0's reply bound, so rank 0 fails that task and moves on while the late frame is still
     /// on its way. The next task must read past it to its own reply instead of failing, and the
     /// task after that must not inherit anything either.
@@ -8043,7 +8043,7 @@ mod tests {
                 after[1..abandon].iter().all(|&a| a == "wait"),
                 "{what}: {after:?}"
             );
-            // Review N1: no reset or recreate on the fresh copy; its first call is the infer.
+            // No reset or recreate on the fresh copy; its first call is the infer.
             assert_eq!(
                 &after[abandon..abandon + 3],
                 ["abandon", "recompile", "infer"],

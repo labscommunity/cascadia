@@ -6,9 +6,8 @@
 #
 # `EvidenceRoutingLayer` and `JointSchemaHead` are copied verbatim from Cloudflare's
 # Clef `joint_schema_model.py` (Apache-2.0). `TensorHead` is the same math over flat
-# tensors (from the clef-spike `step2_head_export.py`), with `cosine_similarity`
-# rewritten because OpenVINO has no conversion rule for it. The OpenVINO export
-# helpers and loaders below are additions.
+# tensors, with `cosine_similarity` rewritten because OpenVINO has no conversion rule
+# for it. The OpenVINO export helpers and loaders below are additions.
 """Clef joint schema head (PyTorch) and its OpenVINO export.
 
 The exported IR's inputs are the contract with crates/cascadia-engine-openvino/src/decision.rs:
