@@ -2363,6 +2363,21 @@ mod tests {
     #[test]
     fn relative_binary_sources_launch_exact_selected_file() {
         use std::os::unix::fs::PermissionsExt;
+        // exec of a script this process just wrote can fail with ETXTBSY: a
+        // parallel test that forks while our write fd is open hands its child a
+        // copy of that fd until the child's own exec closes it. Retry only that
+        // error, briefly; anything else fails the test as before.
+        fn run_exact(path: &std::path::Path) -> std::process::Output {
+            for _ in 0..50 {
+                match Command::new(path).env("PATH", "/nonexistent").output() {
+                    Err(e) if e.kind() == std::io::ErrorKind::ExecutableFileBusy => {
+                        std::thread::sleep(std::time::Duration::from_millis(20));
+                    }
+                    other => return other.unwrap(),
+                }
+            }
+            panic!("{} stayed ETXTBSY for 1 s", path.display());
+        }
         let cwd = std::env::current_dir().unwrap();
         let dir = tempfile::Builder::new()
             .prefix("relative-llama-")
@@ -2379,10 +2394,7 @@ mod tests {
             resolve_llama_bin(None, None, Some(relative_dir.as_os_str().to_owned())).unwrap(),
         ] {
             assert!(resolved.is_absolute());
-            let output = Command::new(resolved)
-                .env("PATH", "/nonexistent")
-                .output()
-                .unwrap();
+            let output = run_exact(&resolved);
             assert!(output.status.success());
             assert_eq!(output.stdout, b"exact-selected-binary");
         }
@@ -2405,10 +2417,7 @@ mod tests {
         )
         .unwrap();
         assert!(resolved.is_absolute());
-        let output = Command::new(resolved)
-            .env("PATH", "/nonexistent")
-            .output()
-            .unwrap();
+        let output = run_exact(&resolved);
         assert!(output.status.success());
         assert_eq!(output.stdout, b"exact-bare-binary");
     }
@@ -3117,7 +3126,11 @@ mod unix_tests {
     async fn load_health_timeout_is_error() {
         let dir = tempfile::tempdir().unwrap();
         let bin = write_script(dir.path(), "llama-server", "#!/bin/sh\nsleep 30\n");
-        let mut b = LlamaCppBuilder::new(cfg_for(bin, 0));
+        // One retry: a parallel test's fork can make the first exec of the
+        // just-written script fail with ETXTBSY (see
+        // relative_binary_sources_launch_exact_selected_file); the retry
+        // absorbs that, and the last attempt still ends in the health timeout.
+        let mut b = LlamaCppBuilder::new(cfg_for(bin, 1));
         let t0 = Instant::now();
         let err = b.load(dummy_shard()).await.err().unwrap().to_string();
         assert!(t0.elapsed() < Duration::from_secs(20));
