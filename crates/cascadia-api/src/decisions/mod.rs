@@ -770,4 +770,15 @@ mod tests {
         assert_eq!(prefill_work(&plain, true), 500);
         assert_eq!(prefill_work(&plain, false), 500);
     }
+
+    /// The shared-prefix discount needs one box with the prefix cache on. A pipeline gets no
+    /// discount, because pipelines refuse the required warm reuse.
+    #[test]
+    fn prefix_reuse_needs_one_rank_and_the_prefix_cache() {
+        use super::DecisionService;
+        assert!(DecisionService::prefix_reuse_for(1, 1 << 20));
+        assert!(!DecisionService::prefix_reuse_for(1, 0));
+        assert!(!DecisionService::prefix_reuse_for(2, 1 << 20));
+        assert!(!DecisionService::prefix_reuse_for(2, 0));
+    }
 }

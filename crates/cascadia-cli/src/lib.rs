@@ -4601,8 +4601,9 @@ mod tests {
             args
         };
         assert!(
-            load_decisions(&worker("qwen35", usable.path()), true, 0).is_some(),
-            "a usable tree on the API rank"
+            load_decisions(&worker("qwen35", usable.path()), true, 0)
+                .is_some_and(|svc| !svc.prefix_reuse),
+            "a usable tree on the API rank, with no prefix reuse while the cache is off"
         );
         assert!(
             load_decisions(&worker("qwen35", usable.path()), false, 0).is_none(),
