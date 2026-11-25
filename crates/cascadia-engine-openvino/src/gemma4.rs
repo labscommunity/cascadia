@@ -48,7 +48,7 @@ use cascadia_types::{
 use futures::stream;
 use serde::Deserialize;
 use tokenizers::Tokenizer;
-use tracing::{debug, info, warn};
+use tracing::{debug, error, info, warn};
 
 use crate::warn_limit::{StepWarn, StepWarnLimiter};
 
@@ -1016,6 +1016,9 @@ pub struct Gemma4Engine {
     /// What this stage sent downstream of each `cross_kv.*` tag, per sequence.
     cross_kv_tx: CrossKvSender,
     step_warn: StepWarnLimiter,
+    /// Set when the head's downstream link is closed for good (see `fail_if_downstream_closed`).
+    /// Handed out by `failure()`, so the server exits for a supervisor restart.
+    failure: cascadia_engine::EngineFailure,
     /// Issue-34 Option C: opaque KV blob cache for the coordination plane.
     #[cfg(feature = "kv_coord")]
     kv: crate::kv_coordination::OvKvCache,
@@ -1143,6 +1146,14 @@ impl Gemma4Engine {
         self.runtime.infer().map_err(map_ov_err)?;
         let (dtype, out_shape, bytes) = self.runtime.output(0).map_err(map_ov_err)?;
         Ok((bytes_to_f32(dtype, &bytes)?, out_shape))
+    }
+
+    /// Head only: after a failed exchange, a closed downstream link fails the engine with `cause`.
+    fn check_downstream_link(&self, cause: &dyn std::fmt::Display) {
+        if let Some(downstream) = &self.downstream {
+            let link = self.block_on(downstream.lock());
+            fail_if_downstream_closed(&self.failure, &link, cause);
+        }
     }
 
     fn block_on<F: std::future::Future>(&self, f: F) -> F::Output {
@@ -1387,6 +1398,9 @@ impl Gemma4Engine {
     fn step_first(&mut self) -> EngineResult<Vec<(TaskId, Chunk)>> {
         if self.active.is_none() && !self.pending.is_empty() {
             let task = self.pending.remove(0);
+            if let Some(refusal) = head_failed_refusal(&self.failure, &task.task_id) {
+                return Ok(refusal);
+            }
             let tok = self
                 .tokenizer
                 .clone()
@@ -1474,7 +1488,10 @@ impl Gemma4Engine {
                             let epoch = crate::kv_coordination::synth_epoch(&prompt_i32[..len]);
                             match self.send_restore_downstream(epoch) {
                                 Ok(true) => true,
-                                _ => {
+                                r => {
+                                    if let Err(e) = r {
+                                        self.check_downstream_link(&format!("RESTORE: {e}"));
+                                    }
                                     let _ = self.send_abort_downstream();
                                     false
                                 }
@@ -1578,6 +1595,7 @@ impl Gemma4Engine {
                 "step_first failed; clearing active + reset_state so next \
                  task starts fresh (downstream socket may still be dead)"
             );
+            self.check_downstream_link(&e);
             // Attribute to the failed task (if one was active) before we
             // null it, so the runner routes the failure to that task's
             // stream instead of ending whichever stream observes the Err.
@@ -1847,6 +1865,7 @@ impl Gemma4Engine {
                             let epoch = crate::kv_coordination::synth_epoch(&full);
                             if let Err(e) = self.send_capture_downstream(epoch, &full, &tenant) {
                                 warn!(error = %e, "gemma4: CAPTURE broadcast failed (best-effort)");
+                                self.check_downstream_link(&format!("CAPTURE: {e}"));
                             }
                         }
                         // Mirror into the lock-free holder cache so a busy node can serve this turn's
@@ -2021,6 +2040,10 @@ impl Engine for Gemma4Engine {
         result
     }
 
+    fn failure(&self) -> cascadia_engine::EngineFailure {
+        self.failure.clone()
+    }
+
     #[cfg(feature = "kv_coord")]
     fn kv_coordination(&mut self) -> Option<&mut dyn cascadia_engine::KvCoordination> {
         Some(self)
@@ -2062,7 +2085,13 @@ async fn token_from_reply(
 ) -> Result<i32, cascadia_transport::TransportError> {
     let Some(token) = data.first_chunk::<4>() else {
         g.close().await;
-        return Err(cascadia_transport::TransportError::SocketClosed);
+        return Err(cascadia_transport::TransportError::Io(
+            std::io::Error::other(format!(
+                "downstream reply of {} byte(s) is too short for a token; closed the link so \
+                 its real reply cannot answer the next request",
+                data.len()
+            )),
+        ));
     };
     Ok(i32::from_le_bytes(*token))
 }
@@ -2088,10 +2117,48 @@ async fn recv_prefill_reply_ceilinged(
         Err(_) => {
             // Replies carry no sequence number: left open, the late one answers the next request.
             g.close().await;
-            Err(cascadia_transport::TransportError::SocketClosed)
+            Err(cascadia_transport::TransportError::Io(
+                std::io::Error::other(format!(
+                    "no reply within the {}s prefill reply ceiling; closed the link so a late \
+                     reply cannot answer the next request",
+                    G_PREFILL_REPLY_CEILING.as_secs()
+                )),
+            ))
         }
     }
 }
+
+/// The head dials its downstream once, at connect, and nothing dials it again. So a failed
+/// exchange that closed the link fails the engine with its cause: the server exits, and its
+/// supervisor restarts the rank. Without this, every later request fails with `NotConnected`
+/// while the process stays up. The first reason is kept.
+fn fail_if_downstream_closed(
+    failure: &cascadia_engine::EngineFailure,
+    link: &ActivationClient,
+    cause: &dyn std::fmt::Display,
+) {
+    if link.is_connected() || failure.reason().is_some() {
+        return;
+    }
+    let why = format!("gemma4 head lost its downstream link: {cause}");
+    error!(reason = %why, "gemma4: engine failed; every later task is refused until a restart");
+    failure.set(why);
+}
+
+/// The refusal every task gets once the head has failed: at once, as a `backend error`.
+fn head_failed_refusal(
+    failure: &cascadia_engine::EngineFailure,
+    task_id: &TaskId,
+) -> Option<Vec<(TaskId, Chunk)>> {
+    let why = failure.reason()?;
+    warn!(task = %task_id, reason = %why, "gemma4: refusing task (engine failed)");
+    let reason = EngineError::Backend(format!("{why}; restart the server")).to_string();
+    Some(vec![(
+        task_id.clone(),
+        Chunk::error(task_id.clone(), reason),
+    )])
+}
+
 #[cfg(feature = "kv_coord")]
 /// Bound on a downstream CAPTURE/RESTORE/ABORT ack; mirrors ov-runtime's RESTORE_ACK_TIMEOUT.
 /// Every driver-side control exchange is bounded (qwen36 does the same via `reply_bounded`):
@@ -2844,6 +2911,7 @@ impl Builder for Gemma4Builder {
             external_kv: SharedKvBuf::new(self.max_ctx, external_kv_expected),
             cross_kv_tx: CrossKvSender::new(kv_deltas),
             step_warn: StepWarnLimiter::default(),
+            failure: Default::default(),
             #[cfg(feature = "kv_coord")]
             kv: crate::kv_coordination::OvKvCache::default(),
             #[cfg(feature = "kv_coord")]
@@ -2984,6 +3052,67 @@ mod tests {
             client.send_raw(b"x").await.is_ok(),
             "the connection must survive a missing ack"
         );
+    }
+
+    /// The head dials its downstream once. After the prefill ceiling closes the link, the engine
+    /// must fail with that cause, so the server exits for its supervisor. The next request gets
+    /// a refusal that names the cause, not `NotConnected`.
+    // The knob lock is held for the whole test: the ceiling must fire before the transport budget.
+    #[allow(clippy::await_holding_lock)]
+    #[tokio::test]
+    async fn a_prefill_ceiling_close_fails_the_head_and_refuses_the_next_request() {
+        let _knob = crate::timeout_knob_lock();
+        let (mut client, _peer) = connected_pair().await;
+        tokio::time::pause();
+        let err = super::recv_prefill_reply_ceilinged(&mut client)
+            .await
+            .unwrap_err();
+        tokio::time::resume();
+        let failure = cascadia_engine::EngineFailure::default();
+        super::fail_if_downstream_closed(&failure, &client, &err);
+        let reason = failure
+            .reason()
+            .expect("a closed link must fail the engine");
+        assert!(reason.contains("prefill reply ceiling"), "{reason}");
+        let refusal = super::head_failed_refusal(&failure, &TaskId::from("next"))
+            .expect("a failed engine must refuse the next request");
+        let text = refusal[0].1.error.clone().unwrap_or_default();
+        assert!(text.contains("prefill reply ceiling"), "{text}");
+    }
+
+    /// The same for a reply too short for a token: a distinct cause in the reason.
+    #[tokio::test]
+    async fn a_short_reply_close_fails_the_head_and_refuses_the_next_request() {
+        let (mut client, _peer) = connected_pair().await;
+        let err = super::token_from_reply(&mut client, &[7u8])
+            .await
+            .unwrap_err();
+        let failure = cascadia_engine::EngineFailure::default();
+        super::fail_if_downstream_closed(&failure, &client, &err);
+        let reason = failure
+            .reason()
+            .expect("a closed link must fail the engine");
+        assert!(reason.contains("too short for a token"), "{reason}");
+        let refusal = super::head_failed_refusal(&failure, &TaskId::from("next"))
+            .expect("a failed engine must refuse the next request");
+        let text = refusal[0].1.error.clone().unwrap_or_default();
+        assert!(text.contains("too short for a token"), "{text}");
+    }
+
+    /// A failed exchange that keeps the link open (a control ack timeout) must not fail the head.
+    #[cfg(feature = "kv_coord")]
+    #[tokio::test]
+    async fn a_failed_exchange_that_keeps_the_link_does_not_fail_the_head() {
+        let (mut client, _peer) = connected_pair().await;
+        tokio::time::pause();
+        let err = super::recv_control_ack_bounded(&mut client)
+            .await
+            .unwrap_err();
+        tokio::time::resume();
+        let failure = cascadia_engine::EngineFailure::default();
+        super::fail_if_downstream_closed(&failure, &client, &err);
+        assert_eq!(failure.reason(), None);
+        assert!(super::head_failed_refusal(&failure, &TaskId::from("next")).is_none());
     }
 
     async fn connected_pair() -> (cascadia_transport::ActivationClient, tokio::net::TcpStream) {
