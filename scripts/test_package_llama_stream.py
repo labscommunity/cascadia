@@ -62,6 +62,21 @@ class PackageLlamaStream(unittest.TestCase):
         )
         self.compile_sycl("libur_adapter_level_zero.so.0")
         self.compile_server()
+        self.tcm_dir = self.root / "oneapi" / "tcm" / "selected" / "lib"
+        self.compiler_docs = self.runtime.parent / "share" / "doc" / "compiler"
+        self.umf_docs = self.umf_dir.parent / "share" / "doc" / "umf"
+        for path in (
+            self.build / "LICENSE",
+            self.build / "licenses" / "LICENSE-jsonhpp",
+            self.build / "vendor" / "cpp-httplib" / "LICENSE",
+            self.compiler_docs / "licensing" / "c" / "third-party-programs.txt",
+            self.umf_docs / "LICENSE.TXT",
+        ):
+            self.write_text(path)
+
+    def write_text(self, path, text="license text\n"):
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(text)
 
     def compile(self, output, source, *flags):
         subprocess.run(
@@ -126,6 +141,34 @@ int sycl_value(void) {
     def archive_names(self):
         with tarfile.open(self.archive) as archive:
             return {Path(name).name for name in archive.getnames()}
+
+    def archive_licenses(self):
+        prefix = "cascadia-llama-sycl/licenses/"
+        with tarfile.open(self.archive) as archive:
+            return {member.name[len(prefix):] for member in archive.getmembers()
+                    if member.isfile() and member.name.startswith(prefix)}
+
+    def link_server_against(self, *libraries):
+        """Rebuild the server with an extra DT_NEEDED on each (directory, soname)."""
+        flags, calls = [], []
+        for index, (library_dir, soname) in enumerate(libraries):
+            library_dir.mkdir(parents=True, exist_ok=True)
+            name = soname.split(".so")[0][len("lib"):]
+            self.compile(library_dir / soname, f"int extra_value{index}(void) {{ return 1; }}",
+                         "-shared", "-fPIC", f"-Wl,-soname,{soname}")
+            if not (library_dir / f"lib{name}.so").exists():
+                (library_dir / f"lib{name}.so").symlink_to(soname)
+            flags += [f"-L{library_dir}", f"-l{name}", f"-Wl,-rpath,{library_dir}"]
+            calls.append(index)
+        self.compile(
+            self.bin / "llama-server",
+            "#include <stdio.h>\nextern int sycl_value(void);\n"
+            + "".join(f"extern int extra_value{i}(void);\n" for i in calls)
+            + "int main(void) { if (sycl_value()"
+            + "".join(f" + extra_value{i}()" for i in calls)
+            + f' != {42 + len(calls)}) return 73; puts("fixture server 42"); return 0; }}\n',
+            f"-L{self.runtime}", "-lsycl", f"-Wl,-rpath,{self.runtime}", *flags,
+        )
 
     def unpack_and_remove_sources(self):
         destination = self.root / "relocated"
@@ -262,6 +305,105 @@ int sycl_value(void) {
         result = self.package("--bogus")
         self.assertNotEqual(result.returncode, 0)
         self.assertIn("unknown option: --bogus", result.stderr)
+        self.assertFalse(self.archive.exists())
+
+    def test_licenses_are_exactly_the_required_texts(self):
+        # Decoys: notices of components not used directly, the OpenMP notice
+        # with no OpenMP runtime bundled, and an unbundled component.
+        self.write_text(self.compiler_docs / "licensing" / "c" / "LICENSE")
+        self.write_text(self.umf_docs / "licensing" / "third-party-programs.txt")
+        self.write_text(self.umf_docs / "licensing" / "extra-notice.txt")
+        self.write_text(self.compiler_docs / "licensing" / "openmp" / "third-party-programs.txt")
+        self.write_text(self.root / "oneapi" / "mkl" / "selected" / "share" / "doc" / "mkl"
+                        / "licensing" / "license.txt")
+        result = self.package()
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertEqual(self.archive_licenses(), {
+            "llama.cpp-LICENSE",
+            "nlohmann-json-LICENSE",
+            "cpp-httplib-LICENSE",
+            "oneapi-compiler-third-party-programs.txt",
+            "umf-LICENSE.txt",
+        })
+
+    def test_bundled_openmp_runtime_adds_its_notice(self):
+        self.write_text(self.compiler_docs / "licensing" / "openmp" / "third-party-programs.txt")
+        self.link_server_against((self.runtime, "libiomp5.so"))
+        result = self.package()
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertIn("libiomp5.so", self.archive_names())
+        self.assertIn("oneapi-openmp-third-party-programs.txt",
+                      self.archive_licenses())
+
+    def test_bundled_hwloc_without_openmp_aborts_packaging(self):
+        self.link_server_against((self.tcm_dir, "libhwloc.so.15"))
+        result = self.package()
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("hwloc", result.stderr)
+        self.assertIn("OpenMP", result.stderr)
+        self.assertFalse(self.archive.exists())
+
+    def test_bundled_hwloc_with_openmp_ships_no_tcm_text(self):
+        self.write_text(self.compiler_docs / "licensing" / "openmp" / "third-party-programs.txt")
+        self.write_text(self.tcm_dir.parent / "share" / "doc" / "tcm" / "licensing"
+                        / "third-party-programs.txt")
+        self.link_server_against((self.tcm_dir, "libhwloc.so.15"), (self.runtime, "libiomp5.so"))
+        result = self.package()
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertIn("libhwloc.so.15", self.archive_names())
+        licenses = self.archive_licenses()
+        self.assertEqual(licenses, {
+            "llama.cpp-LICENSE",
+            "nlohmann-json-LICENSE",
+            "cpp-httplib-LICENSE",
+            "oneapi-compiler-third-party-programs.txt",
+            "oneapi-openmp-third-party-programs.txt",
+            "umf-LICENSE.txt",
+        })
+
+    def move_umf_into_compiler(self):
+        """Ship UMF from the compiler's lib directory, as some releases do."""
+        for path in self.umf_dir.iterdir():
+            shutil.move(str(path), self.runtime / path.name)
+        self.umf_dir.rmdir()
+
+    def test_umf_bundled_from_another_component_ships_umf_license(self):
+        self.move_umf_into_compiler()
+        result = self.package()
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertIn("libumf.so.1.2", self.archive_names())
+        self.assertIn("umf-LICENSE.txt", self.archive_licenses())
+        self.assertIn("[compiler; +umf license]", result.stdout)
+
+    def test_umf_bundled_from_another_component_without_umf_license_aborts(self):
+        self.move_umf_into_compiler()
+        (self.umf_docs / "LICENSE.TXT").unlink()
+        result = self.package()
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("UMF is bundled from", result.stderr)
+        self.assertFalse(self.archive.exists())
+
+    def test_missing_oneapi_license_text_aborts_packaging(self):
+        (self.umf_docs / "LICENSE.TXT").unlink()
+        result = self.package()
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("required license text missing", result.stderr)
+        self.assertIn(str(self.umf_docs / "LICENSE.TXT"), result.stderr)
+        self.assertFalse(self.archive.exists())
+
+    def test_missing_llama_license_text_aborts_packaging(self):
+        (self.build / "vendor" / "cpp-httplib" / "LICENSE").unlink()
+        result = self.package()
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("vendor/cpp-httplib/LICENSE", result.stderr)
+        self.assertFalse(self.archive.exists())
+
+    def test_bundled_library_without_license_mapping_aborts_packaging(self):
+        self.link_server_against((self.root / "other", "libfoo.so.1"))
+        result = self.package()
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("no license mapping", result.stderr)
+        self.assertIn("libfoo.so.1", result.stderr)
         self.assertFalse(self.archive.exists())
 
 

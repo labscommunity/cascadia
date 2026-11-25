@@ -15,6 +15,9 @@
 # Host dependencies: glibc/ELF loader, libgcc/libstdc++, zlib, NUMA, OpenSSL,
 # and the OS GPU stack (Level Zero/OpenCL loaders and vendor drivers). These
 # must be installed on the destination; no oneAPI installation is required.
+# licenses/ holds only the licenses of components shipped and used directly:
+# llama.cpp, the code compiled into it, and the oneAPI components a bundled
+# library comes from. A bundled library with no known mapping aborts packaging.
 set -euo pipefail
 shopt -s nullglob
 
@@ -154,6 +157,91 @@ for ((index=0; index<${#sources[@]}; index++)); do
                 done
             fi
             ;;
+    esac
+done
+
+LICENSES="$PKG/licenses"
+add_license() {
+    local source="$1" dest="$2"
+    [ -f "$source" ] || fail "required license text missing: $source"
+    mkdir -p "$LICENSES"
+    cp "$source" "$LICENSES/$dest"
+}
+# nlohmann json and cpp-httplib are compiled into llama-server.
+add_license "$BUILD_DIR/LICENSE" llama.cpp-LICENSE
+add_license "$BUILD_DIR/licenses/LICENSE-jsonhpp" nlohmann-json-LICENSE
+add_license "$BUILD_DIR/vendor/cpp-httplib/LICENSE" cpp-httplib-LICENSE
+
+# Every other bundled library must come from a oneAPI component laid out as
+# <prefix>/<component>/<version>/lib, whose notices are in share/doc/<component>.
+declare -A component_roots=()
+openmp=0
+umf_from=""
+for source in "${sources[@]}"; do
+    case "$source" in "$BIN_DIR"/*) continue ;; esac
+    lib_dir="${source%/*}"
+    root="${lib_dir%/*}"
+    component="${root%/*}"
+    component="${component##*/}"
+    [ "${lib_dir##*/}" = lib ] || fail "no license mapping for bundled library $source: not in a oneAPI <component>/<version>/lib directory"
+    case "$component/${source##*/}" in
+        compiler/libiomp5*) openmp=1 ;;
+        tcm/libtcm*) fail "no license mapping for bundled library $source" ;;
+        compiler/*|mkl/*|umf/*|tcm/*|tbb/*) ;;
+        *) fail "no license mapping for bundled library $source: unknown component '$component'" ;;
+    esac
+    if [ -n "${component_roots[$component]+present}" ] && [ "${component_roots[$component]}" != "$root" ]; then
+        fail "bundled $component libraries come from two installs: ${component_roots[$component]} and $root"
+    fi
+    component_roots[$component]="$root"
+    note=""
+    case "${source##*/}" in
+        libumf*)
+            umf_from="$root"
+            [ "$component" = umf ] || note="; +umf license"
+            ;;
+    esac
+    echo "third-party: ${source##*/} <- $source [$component$note]"
+done
+# Some releases ship UMF inside another component's lib directory; its license
+# is still in the sibling umf component of the same oneAPI prefix.
+if [ -n "$umf_from" ] && [ -z "${component_roots[umf]+present}" ]; then
+    umf_prefix="${umf_from%/*}"
+    umf_prefix="${umf_prefix%/*}"
+    umf_candidates=()
+    if [ -f "$umf_prefix/umf/${umf_from##*/}/share/doc/umf/LICENSE.TXT" ]; then
+        umf_candidates=("$umf_prefix/umf/${umf_from##*/}")
+    else
+        for umf_license in "$umf_prefix"/umf/*/share/doc/umf/LICENSE.TXT; do
+            umf_candidates+=("${umf_license%/share/doc/umf/LICENSE.TXT}")
+        done
+    fi
+    [ "${#umf_candidates[@]}" = 1 ] || fail "UMF is bundled from $umf_from but its license was not found: searched $umf_prefix/umf/${umf_from##*/}/share/doc/umf/LICENSE.TXT and $umf_prefix/umf/*/share/doc/umf/LICENSE.TXT (${#umf_candidates[@]} matches)"
+    component_roots[umf]="${umf_candidates[0]}"
+fi
+# tcm ships only hwloc, whose BSD notice is carried by the OpenMP notice.
+if [ -n "${component_roots[tcm]+present}" ] && [ "$openmp" = 0 ]; then
+    fail "a tcm library (hwloc) is bundled without the OpenMP runtime, whose notice carries hwloc's license"
+fi
+add_oneapi_license() {
+    add_license "${component_roots[$1]}/share/doc/$1/$2" "$3"
+}
+for component in compiler mkl umf tbb; do
+    [ -n "${component_roots[$component]+present}" ] || continue
+    case "$component" in
+        compiler)
+            add_oneapi_license compiler licensing/c/third-party-programs.txt oneapi-compiler-third-party-programs.txt
+            [ "$openmp" = 0 ] || add_oneapi_license compiler licensing/openmp/third-party-programs.txt oneapi-openmp-third-party-programs.txt
+            ;;
+        mkl)
+            # license.txt on Linux, license.rtf on Windows.
+            docs="${component_roots[mkl]}/share/doc/mkl"
+            matches=("$docs"/licensing/license.*)
+            [ "${#matches[@]}" = 1 ] || fail "expected exactly one license text $docs/licensing/license.*, found ${#matches[@]}"
+            add_oneapi_license mkl "licensing/${matches[0]##*/}" "onemkl-${matches[0]##*/}"
+            ;;
+        umf) add_oneapi_license umf LICENSE.TXT umf-LICENSE.txt ;;
+        tbb) add_oneapi_license tbb licensing/license.txt onetbb-license.txt ;;
     esac
 done
 

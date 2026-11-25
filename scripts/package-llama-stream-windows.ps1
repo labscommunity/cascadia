@@ -16,8 +16,9 @@
 # first. Host dependencies, which the destination must provide: Windows system
 # DLLs, the MSVC runtime (VC++ redistributable) and the Intel GPU driver
 # (Level Zero / OpenCL loaders and ICDs). No oneAPI installation is required.
-# License texts for llama.cpp, the oneAPI compiler runtime and oneMKL go in
-# licenses\.
+# licenses\ holds only the licenses of components shipped and used directly:
+# llama.cpp, the code compiled into it, and the oneAPI components a bundled DLL
+# comes from. A bundled DLL with no known mapping aborts packaging.
 param(
     [Parameter(Mandatory = $true)][string]$BuildDir,
     [Parameter(Mandatory = $true)][string]$OutZip,
@@ -114,12 +115,17 @@ try {
     # The build outputs: server, its wrapper DLLs and the ggml backends.
     Copy-Item $server $pkg
     Get-ChildItem $binDir -Filter *.dll | Copy-Item -Destination $pkg
+    # Source path of every bundled third-party DLL, for the license mapping.
+    $thirdParty = [Collections.Generic.List[string]]::new()
     # Unified Runtime loads its adapters by name at run time, so imports
     # alone never reach them. Take them from the runtime the build resolved.
     foreach ($pattern in "ur_loader.dll", "ur_win_proxy_loader.dll", "ur_adapter_level_zero*.dll", "ur_adapter_opencl.dll") {
         $found = @(Get-ChildItem $runtimeDir -Filter $pattern)
         if ($found.Count -eq 0 -and $pattern -ne "ur_adapter_opencl.dll") { Fail "$pattern not found in $runtimeDir" }
-        $found | Copy-Item -Destination $pkg
+        foreach ($f in $found) {
+            Copy-Item -LiteralPath $f.FullName -Destination $pkg
+            $thirdParty.Add($f.FullName)
+        }
     }
 
     # Walk imports of every bundled PE to a fixed point.
@@ -142,6 +148,7 @@ try {
             $dest = Join-Path $pkg $dep
             if (-not (Test-Path $dest)) {
                 Copy-Item -LiteralPath $resolved $dest
+                $thirdParty.Add($resolved)
                 $queue.Enqueue($dest)
             }
         }
@@ -163,21 +170,82 @@ try {
         }
     }
 
-    # License texts: llama.cpp (source tree) and the Intel runtimes we
-    # redistribute, found relative to the DLLs actually bundled.
     $licenses = Join-Path $pkg "licenses"
-    New-Item -ItemType Directory -Force $licenses | Out-Null
-    $llamaLicense = Join-Path $BuildDir "LICENSE"
-    if (-not (Test-Path $llamaLicense)) { Fail "llama.cpp LICENSE not found at $llamaLicense" }
-    Copy-Item $llamaLicense (Join-Path $licenses "llama.cpp-LICENSE")
-    Get-ChildItem (Join-Path $BuildDir "licenses") -File -ErrorAction SilentlyContinue | ForEach-Object { Copy-Item $_.FullName (Join-Path $licenses "llama.cpp-$($_.Name)") }
-    foreach ($src in @(
-            @{ Dir = Join-Path $runtimeDir "..\share\doc\compiler\licensing\c"; Prefix = "oneapi-compiler" },
-            @{ Dir = Join-Path $mklDir "..\share\doc\mkl\licensing"; Prefix = "onemkl" })) {
-        $files = @(Get-ChildItem $src.Dir -File -ErrorAction SilentlyContinue | Where-Object Name -match '^(license|third-party-programs)')
-        if ($files.Count -eq 0) { Fail "no license texts in $($src.Dir)" }
-        $files | ForEach-Object { Copy-Item $_.FullName (Join-Path $licenses "$($src.Prefix)-$($_.Name)") }
+    function Add-License([string]$src, [string]$dest) {
+        if (-not (Test-Path -LiteralPath $src -PathType Leaf)) { Fail "required license text missing: $src" }
+        $target = Join-Path $licenses $dest
+        New-Item -ItemType Directory -Force (Split-Path -Parent $target) | Out-Null
+        Copy-Item -LiteralPath $src $target
     }
+    # nlohmann json and cpp-httplib are compiled into llama-server.
+    Add-License (Join-Path $BuildDir "LICENSE") "llama.cpp-LICENSE"
+    Add-License (Join-Path $BuildDir "licenses\LICENSE-jsonhpp") "nlohmann-json-LICENSE"
+    Add-License (Join-Path $BuildDir "vendor\cpp-httplib\LICENSE") "cpp-httplib-LICENSE"
+
+    # oneAPI DLLs sit in <prefix>\<component>\<version>\bin, with notices in
+    # share\doc\<component>.
+    $components = @{}
+    $openmp = $false
+    $umfFrom = $null
+    foreach ($src in $thirdParty) {
+        $dll = Split-Path -Leaf $src
+        $dir = Split-Path -Parent $src
+        $root = Split-Path -Parent $dir
+        $component = Split-Path -Leaf (Split-Path -Parent $root)
+        $mapped = (Split-Path -Leaf $dir) -eq "bin" -and $component -in "compiler", "mkl", "umf", "tcm", "tbb"
+        if (-not $mapped -or ($component -eq "tcm" -and $dll -match '^(lib)?tcm')) {
+            Fail "no license mapping for bundled DLL $dll ($src)"
+        }
+        if ($components.ContainsKey($component) -and $components[$component] -ne $root) {
+            Fail "bundled $component DLLs come from two installs: $($components[$component]) and $root"
+        }
+        $components[$component] = $root
+        if ($component -eq "compiler" -and $dll -like "libiomp5*") { $openmp = $true }
+        $note = ""
+        if ($dll -eq "umf.dll") {
+            $umfFrom = $root
+            if ($component -ne "umf") { $note = "; +umf license" }
+        }
+        Write-Output "third-party: $dll <- $src [$component$note]"
+    }
+    # Some releases ship UMF.dll in another component's bin directory; its
+    # license is still in the sibling umf component of the same oneAPI prefix.
+    if ($umfFrom -and -not $components.ContainsKey("umf")) {
+        $umfPrefix = Join-Path (Split-Path -Parent (Split-Path -Parent $umfFrom)) "umf"
+        $sameVersion = Join-Path $umfPrefix (Split-Path -Leaf $umfFrom)
+        $umfLicense = "share\doc\umf\LICENSE.TXT"
+        if (Test-Path -LiteralPath (Join-Path $sameVersion $umfLicense) -PathType Leaf) {
+            $umfRoots = @($sameVersion)
+        } else {
+            $umfRoots = @(Get-ChildItem -LiteralPath $umfPrefix -Directory -ErrorAction SilentlyContinue |
+                Where-Object { Test-Path -LiteralPath (Join-Path $_.FullName $umfLicense) -PathType Leaf } |
+                ForEach-Object { $_.FullName })
+        }
+        if ($umfRoots.Count -ne 1) {
+            Fail "UMF.dll is bundled from $umfFrom but its license was not found: searched $sameVersion\$umfLicense and $umfPrefix\*\$umfLicense ($($umfRoots.Count) matches)"
+        }
+        $components["umf"] = $umfRoots[0]
+    }
+    # tcm ships only hwloc, whose BSD notice is carried by the OpenMP notice.
+    if ($components.ContainsKey("tcm") -and -not $openmp) {
+        Fail "a tcm DLL (hwloc) is bundled without the OpenMP runtime, whose notice carries hwloc's license"
+    }
+    function Add-OneApiLicense([string]$component, [string]$rel, [string]$dest) {
+        Add-License (Join-Path $components[$component] "share\doc\$component\$rel") $dest
+    }
+    if ($components.ContainsKey("compiler")) {
+        Add-OneApiLicense "compiler" "licensing\c\third-party-programs.txt" "oneapi-compiler-third-party-programs.txt"
+        if ($openmp) { Add-OneApiLicense "compiler" "licensing\openmp\third-party-programs.txt" "oneapi-openmp-third-party-programs.txt" }
+    }
+    if ($components.ContainsKey("mkl")) {
+        # license.rtf on Windows, license.txt on Linux.
+        $mklDocs = Join-Path $components["mkl"] "share\doc\mkl\licensing"
+        $hits = @(Get-ChildItem -LiteralPath $mklDocs -Filter "license.*" -File -ErrorAction SilentlyContinue)
+        if ($hits.Count -ne 1) { Fail "expected exactly one license text $mklDocs\license.*, found $($hits.Count)" }
+        Add-OneApiLicense "mkl" "licensing\$($hits[0].Name)" "onemkl-$($hits[0].Name)"
+    }
+    if ($components.ContainsKey("umf")) { Add-OneApiLicense "umf" "LICENSE.TXT" "umf-LICENSE.txt" }
+    if ($components.ContainsKey("tbb")) { Add-OneApiLicense "tbb" "licensing\license.txt" "onetbb-license.txt" }
 
     # Exercise the staged server as a user would: no oneAPI, no build tree on
     # PATH. --version loads every import; --list-devices loads the UR adapters.
