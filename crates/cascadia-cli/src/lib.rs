@@ -405,9 +405,10 @@ pub struct WorkerArgs {
 
     /// Largest `/v1/chat/completions` request body (MiB); the rendered prompt
     /// is capped at the same size. 1 MiB ≈ 250 K tokens of English, the
-    /// window of the largest served models. Only `qwen35` also bounds the
-    /// prompt in TOKENS (against `max_position_embeddings`); on other engines
-    /// this byte cap is the whole guard, so lower it on an exposed endpoint.
+    /// window of the largest served models. Engines with a fixed window also
+    /// bound the prompt in TOKENS (`qwen35`, `ov-genai`, `ov-runtime`, `gemma4`, `ov-dist-spec`, the
+    /// staged sparse-MoE arches); on the others this byte cap is the whole
+    /// guard, so lower it on an exposed endpoint.
     #[arg(long, default_value_t = 1.0)]
     pub api_max_body_mb: f64,
 
