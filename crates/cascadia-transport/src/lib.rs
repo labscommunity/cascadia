@@ -1194,7 +1194,7 @@ pub fn upstream_identity(
 
 /// How often a refused peer may trigger a fresh lookup of the configured upstream host.
 const UPSTREAM_RESOLVE_EVERY: Duration = Duration::from_secs(5);
-/// Bound on one lookup; it runs inside `accept`.
+/// Bound on one lookup. It runs in its own task, so an `accept` cancelled by its caller doesn't lose it.
 const UPSTREAM_RESOLVE_TIMEOUT: Duration = Duration::from_secs(2);
 /// A refused address is logged at most once per this window (an upstream re-dials every few seconds).
 const REFUSED_LOG_EVERY: Duration = Duration::from_secs(60);
@@ -1202,6 +1202,7 @@ const REFUSED_LOG_EVERY: Duration = Duration::from_secs(60);
 type ResolveFut =
     Pin<Box<dyn std::future::Future<Output = io::Result<Vec<std::net::IpAddr>>> + Send>>;
 type Resolver = std::sync::Arc<dyn Fn(String, u16) -> ResolveFut + Send + Sync>;
+type LookupResult = Result<io::Result<Vec<std::net::IpAddr>>, tokio::time::error::Elapsed>;
 
 /// Most refused addresses remembered for per-address logging; beyond it one summary line.
 const REFUSED_LOG_CAP: usize = 256;
@@ -1224,6 +1225,8 @@ struct PeerAllow {
     /// since an allowlist that failed to resolve must not fall back to accepting any host.
     ips: Vec<std::net::IpAddr>,
     resolved_at: Option<Instant>,
+    /// The lookup in flight, at most one. It outlives a cancelled `accept`; the next one takes its result.
+    lookup: Option<tokio::task::JoinHandle<LookupResult>>,
     refused_logged: std::collections::HashMap<std::net::IpAddr, Instant>,
     /// Refusals not logged by address since the last summary (the table was full).
     refused_unlogged: u64,
@@ -1263,9 +1266,28 @@ impl PeerAllow {
         let Some((host, port)) = self.host.clone() else {
             return;
         };
-        self.resolved_at = Some(Instant::now());
-        let lookup = (self.resolver())(host.clone(), port);
-        match tokio::time::timeout(UPSTREAM_RESOLVE_TIMEOUT, lookup).await {
+        if self.lookup.is_none() {
+            self.resolved_at = Some(Instant::now());
+            let lookup = (self.resolver())(host.clone(), port);
+            self.lookup = Some(tokio::spawn(tokio::time::timeout(
+                UPSTREAM_RESOLVE_TIMEOUT,
+                lookup,
+            )));
+        }
+        // Awaiting the handle by reference is cancel safe: the lookup stays in `self.lookup`.
+        let Some(handle) = self.lookup.as_mut() else {
+            return;
+        };
+        let done = handle
+            .await
+            .unwrap_or_else(|e| Ok(Err(io::Error::other(e))));
+        self.lookup = None;
+        let kept = if self.ips.is_empty() {
+            "the address set is empty, so every peer is refused"
+        } else {
+            "keeping the last address set"
+        };
+        match done {
             Ok(Ok(found)) if !found.is_empty() => {
                 let mut ips: Vec<_> = found.into_iter().map(|ip| ip.to_canonical()).collect();
                 ips.sort();
@@ -1279,10 +1301,10 @@ impl PeerAllow {
                 warn!(upstream = %host, "upstream resolved to no address; refusing peers until it does")
             }
             Ok(Err(e)) => {
-                warn!(upstream = %host, error = %e, "upstream lookup failed; keeping the last address set")
+                warn!(upstream = %host, error = %e, "upstream lookup failed; {kept}")
             }
             Err(_) => {
-                warn!(upstream = %host, "upstream lookup timed out; keeping the last address set")
+                warn!(upstream = %host, "upstream lookup timed out; {kept}")
             }
         }
     }
@@ -1297,7 +1319,7 @@ impl PeerAllow {
         let due = self
             .resolved_at
             .is_none_or(|t| t.elapsed() >= self.resolve_every());
-        if self.host.is_some() && due {
+        if self.host.is_some() && (due || self.lookup.is_some()) {
             self.resolve_now().await;
             return self.ips.contains(&ip);
         }
@@ -1595,6 +1617,9 @@ impl ActivationServer {
         let host = host.trim_start_matches('[').trim_end_matches(']');
         self.peer_allow.host = Some((host.to_string(), port));
         self.peer_allow.ips.clear();
+        if let Some(old) = self.peer_allow.lookup.take() {
+            old.abort();
+        }
         self.peer_allow.resolve_now().await;
     }
 
@@ -3628,6 +3653,40 @@ mod tests {
 
         *answer.lock().unwrap() = Some("127.0.0.1".parse().unwrap());
         assert!(!refused(&mut server, &host, port).await);
+    }
+
+    /// A caller's timeout can cancel `accept` while a slow lookup runs. The
+    /// lookup's result must still be kept, so the next accept admits the
+    /// upstream at its new address without a new lookup slot.
+    #[tokio::test]
+    async fn a_lookup_survives_a_cancelled_accept() {
+        let (mut server, addr) = started_server(None).await;
+        let TransportAddr::Tcp { host, port } = addr else {
+            unreachable!("tcp server")
+        };
+        let answer = std::sync::Arc::new(std::sync::Mutex::new(Some("192.0.2.1".parse().unwrap())));
+        server.peer_allow.resolver = Some(scripted_resolver(answer));
+        server.peer_allow.resolve_every = Some(Duration::from_secs(2));
+        server.allow_upstream("upstream.example", 9200).await;
+        tokio::time::sleep(Duration::from_millis(2100)).await;
+
+        // The upstream moved; its lookup now takes longer than the accept wait.
+        server.peer_allow.resolver = Some(std::sync::Arc::new(|_host: String, _port: u16| {
+            Box::pin(async {
+                tokio::time::sleep(Duration::from_millis(500)).await;
+                Ok(vec!["127.0.0.1".parse().unwrap()])
+            }) as ResolveFut
+        }));
+        assert!(
+            refused(&mut server, &host, port).await,
+            "the accept wait must end before the slow lookup"
+        );
+        tokio::time::sleep(Duration::from_millis(400)).await;
+        assert!(
+            !refused(&mut server, &host, port).await,
+            "the lookup of the cancelled accept was lost"
+        );
+        assert!(server.is_connected());
     }
 
     #[tokio::test]
