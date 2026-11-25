@@ -106,7 +106,7 @@ call "%ONEAPI_ROOT%\setvars.bat" || exit /b 1
 REM GGML_NATIVE=OFF: never compile the CPU backend for the build machine. A
 REM hosted runner has AVX-512; a consumer Core Ultra does not, and ggml-cpu.dll
 REM then kills the process at load with 0xC000001D (illegal instruction).
-cmake -B build -G Ninja -DGGML_SYCL=ON -DGGML_NATIVE=OFF -DCMAKE_C_COMPILER=icx -DCMAKE_CXX_COMPILER=icx -DCMAKE_BUILD_TYPE=Release || exit /b 1
+cmake -B build -G Ninja -DGGML_SYCL=ON -DGGML_NATIVE=OFF -DCMAKE_C_COMPILER=icx -DCMAKE_CXX_COMPILER=icx -DCMAKE_BUILD_TYPE=Release -DLLAMA_OPENSSL=OFF || exit /b 1
 cmake --build build --target llama-cli llama-server -j || exit /b 1
 
 REM Prove both patches made it into the build artifacts before calling it done.
