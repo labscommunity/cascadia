@@ -1016,6 +1016,9 @@ pub struct Gemma4Engine {
     /// What this stage sent downstream of each `cross_kv.*` tag, per sequence.
     cross_kv_tx: CrossKvSender,
     step_warn: StepWarnLimiter,
+    /// Control acks the downstream link still owes: each CAPTURE/RESTORE/ABORT ack wait that
+    /// timed out leaves one ack in flight. See `recv_reply_after_late_acks`.
+    control_acks_owed: std::sync::atomic::AtomicU32,
     /// Set when the head's downstream link is closed for good (see `fail_if_downstream_closed`).
     /// Handed out by `failure()`, so the server exits for a supervisor restart.
     failure: cascadia_engine::EngineFailure,
@@ -1248,6 +1251,7 @@ impl Gemma4Engine {
             .downstream
             .clone()
             .ok_or_else(|| EngineError::Backend("no downstream".into()))?;
+        let owed = &self.control_acks_owed;
         self.block_on(async move {
             let mut guard = downstream.lock().await;
             // MID-TASK reply — deadlined; see `recv_tensor_reply` (Item 5).
@@ -1262,12 +1266,7 @@ impl Gemma4Engine {
             // the same coupling at TOKEN_RECV_DEADLINE_CEILING. Measured
             // legit worst here: 51 s (4.2k tokens, 2-stage); the ceiling
             // leaves ~6x headroom for deeper pipelines / longer prompts.
-            let (tensor, _) = if prefill {
-                recv_prefill_reply_ceilinged(&mut guard).await
-            } else {
-                guard.recv_reply().await
-            }?;
-            token_from_reply(&mut guard, &tensor.data).await
+            recv_reply_after_late_acks(&mut guard, prefill, owed).await
         })
         .map_err(|e| EngineError::Backend(e.to_string()))
     }
@@ -2128,6 +2127,48 @@ async fn recv_prefill_reply_ceilinged(
     }
 }
 
+/// A token reply read on the downstream link. Replies come in request order, so a control ack
+/// whose wait timed out arrives ahead of this reply. Up to `owed` such acks are skipped, so a
+/// late ack costs neither the link nor the token. Any other frame goes to `token_from_reply`.
+async fn recv_reply_after_late_acks(
+    g: &mut cascadia_transport::ActivationClient,
+    prefill: bool,
+    owed: &std::sync::atomic::AtomicU32,
+) -> Result<i32, cascadia_transport::TransportError> {
+    use std::sync::atomic::Ordering::Relaxed;
+    loop {
+        let (tensor, _) = if prefill {
+            recv_prefill_reply_ceilinged(g).await
+        } else {
+            g.recv_reply().await
+        }?;
+        if owed.load(Relaxed) > 0 && is_control_ack(&tensor) {
+            owed.fetch_sub(1, Relaxed);
+            debug!("gemma4: skipped a late control ack ahead of a reply");
+            continue;
+        }
+        // An ack still owed behind this reply never comes: the downstream answers in order.
+        owed.store(0, Relaxed);
+        return token_from_reply(g, &tensor.data).await;
+    }
+}
+
+/// A CAPTURE/RESTORE/ABORT ack: I8 (no reply frame is) with an ack opcode.
+#[cfg(feature = "kv_coord")]
+fn is_control_ack(t: &WireTensor) -> bool {
+    t.dtype == WireDType::I8
+        && matches!(
+            t.data.first(),
+            Some(&(G_OPCODE_CAPTURE_ACK | G_OPCODE_RESTORE_ACK | G_OPCODE_ABORT_ACK))
+        )
+}
+
+/// Without `kv_coord` the head sends no control frames, so no ack is ever owed.
+#[cfg(not(feature = "kv_coord"))]
+fn is_control_ack(_: &WireTensor) -> bool {
+    false
+}
+
 /// The head dials its downstream once, at connect, and nothing dials it again. So a failed
 /// exchange that closed the link fails the engine with its cause: the server exits, and its
 /// supervisor restarts the rank. Without this, every later request fails with `NotConnected`
@@ -2172,12 +2213,17 @@ const G_CONTROL_ACK_TIMEOUT: std::time::Duration = std::time::Duration::from_sec
 #[cfg(feature = "kv_coord")]
 async fn recv_control_ack_bounded(
     g: &mut cascadia_transport::ActivationClient,
+    owed: &std::sync::atomic::AtomicU32,
 ) -> Result<WireTensor, cascadia_transport::TransportError> {
     // Left open on purpose, unlike a token reply: capture is best-effort, and a peer that never
-    // acks must not cost the connection. A late ack ends it at `token_from_reply`.
+    // acks must not cost the connection. The ack is counted as owed, and the next reply read
+    // skips it when it arrives late (`recv_reply_after_late_acks`).
     let (ack, _) = tokio::time::timeout(G_CONTROL_ACK_TIMEOUT, g.recv())
         .await
-        .map_err(|_| cascadia_transport::TransportError::SocketClosed)??;
+        .map_err(|_| {
+            owed.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            cascadia_transport::TransportError::SocketClosed
+        })??;
     Ok(ack)
 }
 const G_OPCODE_CAPTURE_V2: u8 = 7;
@@ -2209,6 +2255,7 @@ impl Gemma4Engine {
             ));
         }
         let t = WireTensor::new(WireDType::I8, [1, 1, data.len() as u32], data);
+        let owed = &self.control_acks_owed;
         let ack = self
             .block_on(async move {
                 let mut g = downstream.lock().await;
@@ -2216,7 +2263,7 @@ impl Gemma4Engine {
                 // Bounded, for the same reason ov-runtime bounds its CAPTURE ack: a peer on an
                 // older build that meets G_OPCODE_CAPTURE_V2 errors WITHOUT acking, and an
                 // unbounded wait here wedges this rank while it holds the downstream lock.
-                let ack = recv_control_ack_bounded(&mut g).await?;
+                let ack = recv_control_ack_bounded(&mut g, owed).await?;
                 Ok::<_, cascadia_transport::TransportError>(ack)
             })
             .map_err(|e| EngineError::Backend(e.to_string()))?;
@@ -2235,13 +2282,14 @@ impl Gemma4Engine {
         let mut data = vec![G_OPCODE_RESTORE];
         data.extend_from_slice(&epoch.to_le_bytes());
         let t = WireTensor::new(WireDType::I8, [1, 1, data.len() as u32], data);
+        let owed = &self.control_acks_owed;
         let ack = self
             .block_on(async move {
                 let mut g = downstream.lock().await;
                 g.send(&t).await?;
                 // Bounded like CAPTURE above: an unbounded wait on a dead peer
                 // wedges this rank while it holds the downstream lock.
-                let ack = recv_control_ack_bounded(&mut g).await?;
+                let ack = recv_control_ack_bounded(&mut g, owed).await?;
                 Ok::<_, cascadia_transport::TransportError>(ack)
             })
             .map_err(|e| EngineError::Backend(e.to_string()))?;
@@ -2258,12 +2306,13 @@ impl Gemma4Engine {
             .clone()
             .ok_or_else(|| EngineError::Backend("no downstream".into()))?;
         let t = WireTensor::new(WireDType::I8, [1, 1, 1], vec![G_OPCODE_ABORT]);
+        let owed = &self.control_acks_owed;
         self.block_on(async move {
             let mut g = downstream.lock().await;
             g.send(&t).await?;
             // Bounded like CAPTURE above: an unbounded wait on a dead peer
             // wedges this rank while it holds the downstream lock.
-            let _ = recv_control_ack_bounded(&mut g).await?;
+            let _ = recv_control_ack_bounded(&mut g, owed).await?;
             Ok::<_, cascadia_transport::TransportError>(())
         })
         .map_err(|e| EngineError::Backend(e.to_string()))
@@ -2911,6 +2960,7 @@ impl Builder for Gemma4Builder {
             external_kv: SharedKvBuf::new(self.max_ctx, external_kv_expected),
             cross_kv_tx: CrossKvSender::new(kv_deltas),
             step_warn: StepWarnLimiter::default(),
+            control_acks_owed: Default::default(),
             failure: Default::default(),
             #[cfg(feature = "kv_coord")]
             kv: crate::kv_coordination::OvKvCache::default(),
@@ -2963,7 +3013,7 @@ mod tests {
         tokio::time::pause();
         let res = tokio::time::timeout(
             G_CONTROL_ACK_TIMEOUT * 4,
-            super::recv_control_ack_bounded(&mut client),
+            super::recv_control_ack_bounded(&mut client, &Default::default()),
         )
         .await;
         match res {
@@ -3046,7 +3096,11 @@ mod tests {
     async fn a_control_ack_timeout_keeps_the_connection() {
         let (mut client, _peer) = connected_pair().await;
         tokio::time::pause();
-        assert!(super::recv_control_ack_bounded(&mut client).await.is_err());
+        assert!(
+            super::recv_control_ack_bounded(&mut client, &Default::default())
+                .await
+                .is_err()
+        );
         tokio::time::resume();
         assert!(
             client.send_raw(b"x").await.is_ok(),
@@ -3105,7 +3159,7 @@ mod tests {
     async fn a_failed_exchange_that_keeps_the_link_does_not_fail_the_head() {
         let (mut client, _peer) = connected_pair().await;
         tokio::time::pause();
-        let err = super::recv_control_ack_bounded(&mut client)
+        let err = super::recv_control_ack_bounded(&mut client, &Default::default())
             .await
             .unwrap_err();
         tokio::time::resume();
@@ -3113,6 +3167,50 @@ mod tests {
         super::fail_if_downstream_closed(&failure, &client, &err);
         assert_eq!(failure.reason(), None);
         assert!(super::head_failed_refusal(&failure, &TaskId::from("next")).is_none());
+    }
+
+    /// A RESTORE ack that times out and then arrives late is ahead of the cold prefill's token
+    /// reply. The reply read must skip it and get the real token, and the link must stay open.
+    #[cfg(feature = "kv_coord")]
+    #[tokio::test]
+    async fn a_late_control_ack_is_skipped_by_the_next_reply_read() {
+        let (mut client, mut peer) = connected_pair().await;
+        let owed = std::sync::atomic::AtomicU32::new(0);
+        tokio::time::pause();
+        assert!(super::recv_control_ack_bounded(&mut client, &owed)
+            .await
+            .is_err());
+        tokio::time::resume();
+        let ack = WireTensor::new(WireDType::I8, [1, 1, 2], vec![G_OPCODE_RESTORE_ACK, 1]);
+        cascadia_transport::send_tensor(&mut peer, &ack)
+            .await
+            .unwrap();
+        let reply = WireTensor::new(WireDType::I32, [1, 1, 1], 42i32.to_le_bytes().to_vec());
+        cascadia_transport::send_tensor(&mut peer, &reply)
+            .await
+            .unwrap();
+        let token = super::recv_reply_after_late_acks(&mut client, true, &owed)
+            .await
+            .unwrap();
+        assert_eq!(token, 42);
+        assert!(client.is_connected());
+        assert_eq!(owed.load(std::sync::atomic::Ordering::Relaxed), 0);
+    }
+
+    /// With no ack owed, a control ack in a reply read is still an unexpected frame: it closes.
+    #[cfg(feature = "kv_coord")]
+    #[tokio::test]
+    async fn a_control_ack_that_is_not_owed_still_closes_the_link() {
+        let (mut client, mut peer) = connected_pair().await;
+        let owed = std::sync::atomic::AtomicU32::new(0);
+        let ack = WireTensor::new(WireDType::I8, [1, 1, 2], vec![G_OPCODE_RESTORE_ACK, 1]);
+        cascadia_transport::send_tensor(&mut peer, &ack)
+            .await
+            .unwrap();
+        assert!(super::recv_reply_after_late_acks(&mut client, true, &owed)
+            .await
+            .is_err());
+        crate::assert_closed(&mut client, &mut peer).await;
     }
 
     async fn connected_pair() -> (cascadia_transport::ActivationClient, tokio::net::TcpStream) {
