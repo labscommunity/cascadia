@@ -20,7 +20,9 @@
 //! tokenizer adds special tokens at all (TinyLlama-1.1B-Chat adds a BOS its
 //! template lacks); it fails loudly on a tokenizer that adds none, so it
 //! cannot pass vacuously. Optional: CASCADIA_BOS_PARITY_DEVICE (default CPU)
-//! and CASCADIA_BOS_PARITY_VLM_MODEL=<vlm-ir-dir> to check the VLM path too.
+//! and CASCADIA_BOS_PARITY_VLM_MODEL=<vlm-ir-dir> to check the VLM path too
+//! (a Gemma 3 export such as gemma-3-4b-it doubles the BOS there, so it
+//! exercises the drop; the raw path shows the doubled count).
 //! Skips when CASCADIA_BOS_PARITY_MODEL is unset (the VLM test: when
 //! CASCADIA_BOS_PARITY_VLM_MODEL is unset).
 //!
@@ -187,11 +189,17 @@ fn a_templated_prompt_carries_one_bos_on_the_vlm_pipeline() {
     };
     let device = std::env::var("CASCADIA_BOS_PARITY_DEVICE").unwrap_or_else(|_| "CPU".into());
     let vlm = LlmPipeline::vlm(&model, &device, false, &PluginConfig::new()).expect("vlm pipeline");
-    let (rendered, templated_tokens, _) = rendered_prompt(&vlm, &model);
+    let (rendered, templated_tokens, with_special) = rendered_prompt(&vlm, &model);
     let reference = vlm.generate(USER, &cfg(false)).expect("reference generate");
     let ours = vlm
         .generate(&rendered, &cfg(true))
         .expect("templated generate");
+    // Not flagged templated, the shim leaves the VLM prompt as it is: the
+    // doubled BOS the templated path drops (or, for a tokenizer that adds
+    // none, the same count).
+    let mut raw_cfg = cfg(true);
+    raw_cfg.prompt_templated = false;
+    let raw = vlm.generate(&rendered, &raw_cfg).expect("raw generate");
     eprintln!(
         "vlm reference: {:?} ({:?} prompt tokens)",
         reference.text, reference.prompt_tokens
@@ -199,6 +207,21 @@ fn a_templated_prompt_carries_one_bos_on_the_vlm_pipeline() {
     eprintln!(
         "vlm templated: {:?} ({:?} prompt tokens)",
         ours.text, ours.prompt_tokens
+    );
+    eprintln!(
+        "vlm raw:       {:?} ({:?} prompt tokens)",
+        raw.text, raw.prompt_tokens
+    );
+    if with_special > templated_tokens {
+        eprintln!(
+            "vlm: the tokenizer adds a BOS the template already wrote ({templated_tokens} tokens, \
+             {with_special} with special tokens): the templated prompt dropped one"
+        );
+    }
+    assert_eq!(
+        raw.prompt_tokens,
+        Some(with_special),
+        "raw VLM path changed"
     );
     assert_eq!(
         reference.prompt_tokens,
