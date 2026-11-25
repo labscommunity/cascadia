@@ -1218,7 +1218,7 @@ GiB = 1 << 30
 # The int8 IRs' weights on an Arc 140V box (language model + text embeddings bins), and its RAM.
 IR_9B = (7.398 + 0.948) * GiB
 IR_27B = (23.88 + 1.185) * GiB
-PAWAN01_RAM = 31.58 * GiB
+ARC140V_RAM = 31.58 * GiB
 
 
 def test_ir_weight_bytes_sums_the_language_model_and_embeddings_bins(tmp_path):
@@ -1249,7 +1249,7 @@ def test_memory_refusal_names_the_estimate_the_ram_and_the_fallback(monkeypatch)
                    "weights, x2.5 for the --weights swap), but this machine has 16.0 GiB: export with "
                    "--stages 8 instead (a single-box tree for a low-memory machine, one stage in memory "
                    "at a time), or pass --skip-memory-check to try anyway")
-    assert de.memory_refusal("ir", True, PAWAN01_RAM) is None
+    assert de.memory_refusal("ir", True, ARC140V_RAM) is None
     assert de.memory_refusal("ir", False, 16 * GiB) is None  # JEV's graft: about 8.3 GiB
     assert de.memory_refusal("ir", True, None) is None  # RAM unknown: not refused
 
@@ -1280,7 +1280,7 @@ def test_cli_exports_when_the_estimate_fits(cli, monkeypatch):
     run, calls, base, tmp = cli
     _clef(monkeypatch)
     monkeypatch.setattr(de, "ir_weight_bytes", lambda d: IR_9B)
-    monkeypatch.setattr(de, "physical_ram_bytes", lambda: int(PAWAN01_RAM))
+    monkeypatch.setattr(de, "physical_ram_bytes", lambda: int(ARC140V_RAM))
     run("clef", "--base-ir", str(base), "--clef-dir", "C", "--out", str(tmp / "t"))
     (_, a, _, _), = calls
     assert a[2] == 1

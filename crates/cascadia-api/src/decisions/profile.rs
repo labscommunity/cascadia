@@ -268,7 +268,8 @@ mod tests {
     fn calibration_that_can_overflow_is_refused() {
         // `(logit + bias) / temperature` must stay finite for every finite f32 logit, or
         // softmax turns it into NaN probabilities.
-        let d = std::env::temp_dir().join(format!("dprof-h17-{}", uuid::Uuid::new_v4().simple()));
+        let d =
+            std::env::temp_dir().join(format!("dprof-overflow-{}", uuid::Uuid::new_v4().simple()));
         std::fs::create_dir_all(&d).unwrap();
         let p = d.join("decision.json");
         let jev = |bias: &str, t: &str| {
