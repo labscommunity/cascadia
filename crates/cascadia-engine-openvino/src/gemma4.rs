@@ -1268,7 +1268,7 @@ impl Gemma4Engine {
             // leaves ~6x headroom for deeper pipelines / longer prompts.
             recv_reply_after_late_acks(&mut guard, prefill, owed).await
         })
-        .map_err(|e| EngineError::Backend(e.to_string()))
+        .map_err(downstream_recv_error)
     }
 
     fn recv_hidden_from_upstream(&mut self) -> EngineResult<(Vec<f32>, [usize; 3], i64, u64)> {
@@ -2084,13 +2084,14 @@ async fn token_from_reply(
 ) -> Result<i32, cascadia_transport::TransportError> {
     let Some(token) = data.first_chunk::<4>() else {
         g.close().await;
-        return Err(cascadia_transport::TransportError::Io(
-            std::io::Error::other(format!(
+        return Err(cascadia_transport::TransportError::Io(std::io::Error::new(
+            std::io::ErrorKind::ConnectionAborted,
+            format!(
                 "downstream reply of {} byte(s) is too short for a token; closed the link so \
                  its real reply cannot answer the next request",
                 data.len()
-            )),
-        ));
+            ),
+        )));
     };
     Ok(i32::from_le_bytes(*token))
 }
@@ -2116,13 +2117,14 @@ async fn recv_prefill_reply_ceilinged(
         Err(_) => {
             // Replies carry no sequence number: left open, the late one answers the next request.
             g.close().await;
-            Err(cascadia_transport::TransportError::Io(
-                std::io::Error::other(format!(
+            Err(cascadia_transport::TransportError::Io(std::io::Error::new(
+                std::io::ErrorKind::ConnectionAborted,
+                format!(
                     "no reply within the {}s prefill reply ceiling; closed the link so a late \
                      reply cannot answer the next request",
                     G_PREFILL_REPLY_CEILING.as_secs()
-                )),
-            ))
+                ),
+            )))
         }
     }
 }
@@ -2150,6 +2152,20 @@ async fn recv_reply_after_late_acks(
         // An ack still owed behind this reply never comes: the downstream answers in order.
         owed.store(0, Relaxed);
         return token_from_reply(g, &tensor.data).await;
+    }
+}
+
+/// A token-reply recv error as `step_first` and `step_middle` get it. A link that this side closed
+/// (kind `ConnectionAborted`) stays a typed `Io` error, so `is_connection_fatal` reads its kind and a
+/// relay rank exits for a rebuild. Other errors keep their `Backend` text.
+fn downstream_recv_error(e: cascadia_transport::TransportError) -> EngineError {
+    match e {
+        cascadia_transport::TransportError::Io(io)
+            if io.kind() == std::io::ErrorKind::ConnectionAborted =>
+        {
+            EngineError::Io(io)
+        }
+        e => EngineError::Backend(e.to_string()),
     }
 }
 
@@ -3087,6 +3103,38 @@ mod tests {
         let (mut client, mut peer) = connected_pair().await;
         assert!(super::token_from_reply(&mut client, &[7u8]).await.is_err());
         crate::assert_closed(&mut client, &mut peer).await;
+    }
+
+    /// A relay rank exits for a rebuild only on an `is_connection_fatal` error. Both closes of the
+    /// downstream link must give `step_middle` such an error, or the stage stays up with no link.
+    #[allow(clippy::await_holding_lock)]
+    #[tokio::test]
+    async fn both_downstream_closes_are_connection_fatal_on_a_relay_rank() {
+        let _knob = crate::timeout_knob_lock();
+        let (mut client, _peer) = connected_pair().await;
+        let short = super::downstream_recv_error(
+            super::token_from_reply(&mut client, &[7u8])
+                .await
+                .unwrap_err(),
+        );
+        assert!(short.is_connection_fatal(), "{short}");
+        assert!(
+            short.to_string().contains("too short for a token"),
+            "{short}"
+        );
+        let (mut client, _peer) = connected_pair().await;
+        tokio::time::pause();
+        let ceiling = super::downstream_recv_error(
+            super::recv_prefill_reply_ceilinged(&mut client)
+                .await
+                .unwrap_err(),
+        );
+        tokio::time::resume();
+        assert!(ceiling.is_connection_fatal(), "{ceiling}");
+        assert!(
+            ceiling.to_string().contains("prefill reply ceiling"),
+            "{ceiling}"
+        );
     }
 
     /// The mirror: a peer on an older build never acks a CAPTURE it can't parse. That costs one
