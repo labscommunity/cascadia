@@ -76,6 +76,21 @@ fn hidden_frame_bytes_per_token(cfg: &PipelineConfig, layer_end: u32) -> usize {
     (cfg.hidden_size as usize + tail) * std::mem::size_of::<f32>()
 }
 
+/// The prompt bound for a stage that sends hidden frames downstream. A prefill sends one frame per
+/// `chunk` tokens, so when a full span fits `MAX_TENSOR_BYTES` only the model window applies.
+/// Otherwise (one pass is `usize::MAX`) the whole-prompt frame bound applies.
+fn hidden_frame_prompt_window(
+    window: Option<u32>,
+    frame_bytes_per_token: usize,
+    chunk: usize,
+) -> Option<u32> {
+    if chunk.saturating_mul(frame_bytes_per_token) <= cascadia_transport::MAX_TENSOR_BYTES {
+        window
+    } else {
+        crate::forwarded_prompt_window(window, frame_bytes_per_token)
+    }
+}
+
 fn default_true() -> bool {
     true
 }
@@ -2809,7 +2824,7 @@ impl Builder for Gemma4Builder {
             prompt_window: {
                 let window = crate::pipeline_model_window(&self.pipeline_dir);
                 if self.downstream.is_some() {
-                    crate::forwarded_prompt_window(window, self.frame_bytes_per_token)
+                    hidden_frame_prompt_window(window, self.frame_bytes_per_token, prefill_chunk())
                 } else {
                     window
                 }
@@ -3100,6 +3115,26 @@ mod tests {
             serde_json::from_str(r#"{"layer_start":0,"layer_end":6,"stateful":true}"#).unwrap();
         assert!(cfg.layer_types.is_empty());
         assert!(!sliding_layers_unwindowed(&cfg));
+    }
+
+    #[test]
+    fn a_spanned_prefill_bounds_the_prompt_by_one_span_frame() {
+        // E2B stage 0 at layer_end 18 sends 23,552 bytes per token. One whole-prompt frame passes
+        // MAX_TENSOR_BYTES past 11,397 tokens; a 1,024-token span frame does not.
+        let window = Some(131_072);
+        let spanned = hidden_frame_prompt_window(window, 23_552, PREFILL_CHUNK);
+        assert!(spanned > Some(11_397), "{spanned:?}");
+        assert_eq!(spanned, window);
+        let one_pass = prefill_chunk_from(None, Some("0"));
+        assert_eq!(
+            hidden_frame_prompt_window(window, 23_552, one_pass),
+            Some(11_397)
+        );
+        // A span whose frame passes the cap keeps the whole-prompt bound.
+        assert_eq!(
+            hidden_frame_prompt_window(window, 23_552, 20_000),
+            Some(11_397)
+        );
     }
 
     #[test]
