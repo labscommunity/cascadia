@@ -460,8 +460,9 @@ pub struct TransferStats {
 /// Slowest transfer tolerated, so a peer moving a byte per wait can't hold a stage forever.
 const MIN_TRANSFER_BYTES_PER_SEC: u64 = 64 * 1024;
 
-/// Bounds one transfer by progress, not total time: it fails after `idle` without a byte, or once
-/// it has taken longer than its size needs at [`MIN_TRANSFER_BYTES_PER_SEC`].
+/// Bounds one transfer by progress and by total time: it fails after `idle` without a byte, or once
+/// it has taken longer than its size needs at [`MIN_TRANSFER_BYTES_PER_SEC`] (at least `idle`),
+/// capped at `idle * PREFILL_REPLY_TIMEOUT_FACTOR` so a large declared size can't hold a stage.
 struct TransferDeadline {
     idle: Duration,
     started: Instant,
@@ -474,7 +475,9 @@ impl TransferDeadline {
         Self {
             idle,
             started: Instant::now(),
-            ceiling: idle.max(Duration::from_secs(len as u64 / MIN_TRANSFER_BYTES_PER_SEC)),
+            ceiling: idle
+                .max(Duration::from_secs(len as u64 / MIN_TRANSFER_BYTES_PER_SEC))
+                .min(idle.saturating_mul(PREFILL_REPLY_TIMEOUT_FACTOR)),
             len,
         }
     }
@@ -1112,15 +1115,15 @@ async fn recv_exact_frame_start_strict(
 }
 
 async fn recv_exact<R: AsyncRead + Unpin>(sock: &mut R, buf: &mut [u8]) -> TransportResult<()> {
-    // DEFAULT_TIMEOUT bounds total wall-clock time we'll wait for `buf`
-    // to fill. A peer that opens a connection and stops sending — or
-    // sends one byte per second — must not be able to pin a worker
-    // thread forever. 60 s is generous for a single tensor frame on a
-    // multi-MB Llama hidden state over Thunderbolt, and small enough
-    // that a wedged peer is detected within one or two heartbeats.
+    // A peer that opens a connection and stops sending — or sends one
+    // byte per second — must not be able to pin a worker thread forever.
     // Waiting for a frame to BEGIN is exempt — see recv_exact_frame_start.
     //
-    // Progress is what's bounded, not total time: gemma4 sends 23,552 bytes
+    // The bound is a TransferDeadline with idle = recv_timeout() (60 s by
+    // default): the read fails after recv_timeout() without a byte, or once
+    // the total time passes max(recv_timeout(), len / 64 KiB/s), capped at
+    // recv_timeout() * PREFILL_REPLY_TIMEOUT_FACTOR (600 s by default).
+    // Progress, not only total time, is bounded: gemma4 sends 23,552 bytes
     // per token, so a healthy slow link can need minutes for one frame.
     recv_exact_progress(sock, buf, recv_timeout()).await
 }
@@ -3838,6 +3841,36 @@ mod tests {
         assert!(
             elapsed >= Duration::from_millis(1800) && elapsed < Duration::from_secs(4),
             "must stop at the minimum rate, not the idle wait: {elapsed:?}"
+        );
+    }
+
+    /// A large declared size must not buy a peer above the minimum rate more
+    /// than the total cap of `idle * PREFILL_REPLY_TIMEOUT_FACTOR`.
+    #[tokio::test]
+    async fn progressing_body_fails_at_the_total_cap() {
+        let (mut sock, mut peer) = tokio::io::duplex(64 * 1024);
+        let idle = Duration::from_millis(200); // total cap: 2 s
+        const LEN: usize = 512 * 1024; // 8 s at the minimum rate, 3.2 s at the peer's rate
+        let writer = tokio::spawn(async move {
+            for chunk in vec![1u8; LEN].chunks(8 * 1024) {
+                if peer.write_all(chunk).await.is_err() {
+                    return;
+                }
+                tokio::time::sleep(Duration::from_millis(50)).await;
+            }
+        });
+        let mut buf = vec![0u8; LEN];
+        let t0 = Instant::now();
+        let got = recv_exact_progress(&mut sock, &mut buf, idle).await;
+        let elapsed = t0.elapsed();
+        writer.abort();
+        assert!(
+            matches!(&got, Err(TransportError::Io(e)) if e.kind() == io::ErrorKind::TimedOut),
+            "got {got:?}"
+        );
+        assert!(
+            elapsed >= Duration::from_millis(1800) && elapsed < Duration::from_millis(3000),
+            "must stop at the total cap: {elapsed:?}"
         );
     }
 
