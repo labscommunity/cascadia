@@ -345,7 +345,7 @@ def extract_stage(xml_path: str, spec: ModelSpec, a: int, b: int, first: bool, l
     return stage
 
 
-def build_manifest(spec: ModelSpec, source: str) -> dict:
+def build_manifest(spec: ModelSpec, source: str, final_hidden: bool = False) -> dict:
     """The manifest.json head the engine reads (`Manifest::parse` in
     crates/cascadia-engine-openvino/src/qwen36.rs); `stages` is filled in
     as the stages are written.
@@ -355,8 +355,14 @@ def build_manifest(spec: ModelSpec, source: str) -> dict:
     `qwen3_5_moe`, and `last_logits_only` defaults to false — so a renamed
     key fails at load for the dense tree but serves a mis-shaped one for the
     MoE. Pure, so those names are pinned by unit test.
+
+    `final_hidden_output` (engine default false) says the last stage also
+    outputs the final-norm hidden at index 1 (exporter `--final-hidden`).
+    It is written only when true, so a chat export's manifest stays
+    byte-identical to one from an exporter that predates the key: ranks
+    compare manifests byte for byte (HELLO) and `kv_fingerprint` hashes them.
     """
-    return {
+    m = {
         "arch": spec.model_type,
         "family": spec.family,
         "hidden_size": spec.hidden,
@@ -364,8 +370,11 @@ def build_manifest(spec: ModelSpec, source: str) -> dict:
         "layer_types": spec.layer_types,
         "source": source,
         "last_logits_only": True,
-        "stages": [],
     }
+    if final_hidden:
+        m["final_hidden_output"] = True
+    m["stages"] = []
+    return m
 
 
 def validate_verdict(top1: bool, overlap: int, d: float, n: float, m: int) -> bool:
@@ -397,10 +406,43 @@ def build_feeds(model, hidden_size: int, hidden=None, embeds=None):
     return feeds
 
 
-def run_export(model_dir, output_dir, num_stages=2, validate=False, layer_split=None):
+def run_export(model_dir, output_dir, num_stages=2, validate=False, layer_split=None,
+               weights=None, lora=None, lora_scale=None, final_hidden=False, tokenizer=None):
     """Cut the official int4 OV IR in `model_dir` into `num_stages` stage
     dirs under `output_dir` + manifest + aux files. Entry point for
-    `cascadia shard` dispatch (export_shards.py) and for main() below."""
+    `cascadia shard` dispatch (export_shards.py) and for main() below.
+
+    Decision-tree options (all off = the unchanged chat export):
+      * `weights`: HF checkpoint dir whose weights replace the IR's in every
+        stage (weight_swap.swap_stage, verified by check_swap) and in the
+        text-embeddings IR (swap_embeddings).
+      * `lora`: PEFT adapter_model.safetensors grafted as fp32 side branches;
+        `lora_scale=None` takes the scale from the adapter_config.json beside
+        it, an explicit value overrides it (with a warning when they differ).
+        The grafted-branch total over all stages must equal the adapter's
+        target count.
+      * `final_hidden`: the last stage also outputs the final-norm hidden
+        (output 1, `final_hidden`); recorded as manifest `final_hidden_output`.
+      * `tokenizer`: a tokenizer.json that replaces the one the tree would
+        otherwise ship (the `weights` checkpoint's, else the stock IR's), for a
+        head whose prompts were built with a different tokenizer (Kev: its own
+        tokenizer.json, not the Base checkpoint's). Copied before the manifest.
+
+    manifest.json is written last, as the commit marker: a stale one from an
+    earlier run in `output_dir` is removed first, so a failed export (LoRA
+    graft count, embeddings swap) never leaves a loadable tree behind.
+    """
+    if validate and (weights or lora):
+        # _validate compares the chain against the STOCK full model and stock
+        # embeddings: a correct --weights export would fail it, and a --lora
+        # export would pass or fail regardless of the graft.
+        raise SystemExit(
+            "--validate checks the stage chain against the stock IR, so it cannot "
+            "judge a --weights/--lora export; drop --validate (decision trees are "
+            "checked by the golden/parity gates instead)"
+        )
+    if tokenizer is not None and not os.path.isfile(tokenizer):
+        raise SystemExit(f"tokenizer override {tokenizer} not found")
     import openvino as ov
 
     xml = os.path.join(model_dir, "openvino_language_model.xml")
@@ -411,6 +453,16 @@ def run_export(model_dir, output_dir, num_stages=2, validate=False, layer_split=
             f"not on safetensors"
         )
     spec = read_model_spec(model_dir)
+    if weights and os.path.exists(os.path.join(weights, "config.json")):
+        wspec = read_model_spec(weights)
+        mine = (spec.hidden, spec.num_layers, spec.layer_types)
+        theirs = (wspec.hidden, wspec.num_layers, wspec.layer_types)
+        if mine != theirs:
+            raise SystemExit(
+                f"--weights {weights} is not the IR's architecture: hidden/num_layers "
+                f"{wspec.hidden}/{wspec.num_layers} vs {spec.hidden}/{spec.num_layers}"
+                + ("" if wspec.layer_types == spec.layer_types else ", layer_types differ")
+            )
     ranges = stage_ranges(spec.num_layers, num_stages, layer_split)
     check_stage_ranges(spec, ranges)
     print(
@@ -419,12 +471,47 @@ def run_export(model_dir, output_dir, num_stages=2, validate=False, layer_split=
         f"{spec.layer_types.count(FULL)} {FULL}) vocab={spec.vocab}",
         flush=True,
     )
-    manifest = build_manifest(spec, os.path.basename(os.path.abspath(model_dir)))
+    stale = os.path.join(output_dir, "manifest.json")
+    if os.path.exists(stale):
+        os.remove(stale)
+    manifest = build_manifest(spec, os.path.basename(os.path.abspath(model_dir)),
+                              final_hidden=final_hidden)
+
+    grafted = []
+    if lora:
+        from weight_swap import lora_scale_from_config
+        # ValueError (rank/alpha patterns, DoRA, LoRA bias, modules_to_save) propagates: the
+        # graft would be wrong for those adapters whatever the scale.
+        try:
+            cfg_scale = lora_scale_from_config(lora)
+        except FileNotFoundError:
+            if lora_scale is None:
+                raise SystemExit(f"no adapter_config.json beside {lora}: download it, or pass --lora-scale")
+            cfg_scale = lora_scale
+        if lora_scale is not None and abs(lora_scale - cfg_scale) > 1e-9:
+            print(f"WARNING: --lora-scale {lora_scale} overrides adapter_config.json's {cfg_scale}", flush=True)
+        lora_scale = cfg_scale if lora_scale is None else lora_scale
+        from weight_swap import lora_targets
+        # ValueError (embedding LoRA, modules_to_save tensors, unpaired keys) before the long export
+        want = lora_targets(lora)
 
     for i, (a, b) in enumerate(ranges):
         first, last = i == 0, i == len(ranges) - 1
         t0 = time.time()
         stage = extract_stage(xml, spec, a, b, first, last)
+        if weights:
+            from weight_swap import Weights, check_swap, swap_stage
+            report = swap_stage(stage, Weights(weights))
+            check_swap(report, range(a, b + 1), spec.layer_types, last)
+            print(f"  stage{i}: swapped layers {a}..{b} from {weights}", flush=True)
+        if lora:
+            from weight_swap import graft_lora
+            g = graft_lora(stage, lora, lora_scale, layers=range(a, b + 1), lm_head=last)
+            grafted += g
+            print(f"  stage{i}: grafted {len(g)} LoRA branches", flush=True)
+        if last and final_hidden:
+            from weight_swap import add_final_hidden_output
+            add_final_hidden_output(stage)
         sdir = os.path.join(output_dir, f"stage{i}")
         os.makedirs(sdir, exist_ok=True)
         ov.save_model(stage, os.path.join(sdir, "stage.xml"), compress_to_fp16=False)
@@ -434,22 +521,51 @@ def run_export(model_dir, output_dir, num_stages=2, validate=False, layer_split=
             "inputs": [p.get_friendly_name() for p in stage.get_parameters()],
             "state_vars": sorted({s.get_variable_id() for s in stage.get_sinks()}),
         }
+        # Peak memory = one stage (plus its swapped constants), not all of them.
+        del stage
+        import gc
+        gc.collect()
         manifest["stages"].append(info)
         print(f"stage{i}: layers {a}..{b} saved in {time.time()-t0:.0f}s "
               f"inputs={info['inputs']} states={len(info['state_vars'])}", flush=True)
 
-    with open(os.path.join(output_dir, "manifest.json"), "w") as f:
-        json.dump(manifest, f, indent=2)
+    if lora:
+        # exact coverage: a count would let a module grafted twice hide one grafted nowhere
+        from collections import Counter
+        n = Counter(grafted)
+        twice = sorted(m for m, c in n.items() if c > 1)
+        missing = sorted(set(want) - set(n))
+        extra = sorted(set(n) - set(want))
+        if twice or missing or extra:
+            raise SystemExit(f"LoRA graft does not cover the adapter's {len(want)} modules exactly once: "
+                             f"grafted more than once: {twice}; not grafted: {missing}; not in the adapter: {extra}")
+
     # aux files the engine needs alongside the stages (single-dir UX)
     import shutil
-    for aux in ("openvino_text_embeddings_model.xml", "openvino_text_embeddings_model.bin",
-                "tokenizer.json", "generation_config.json", "config.json",
-                # API renders /v1/chat/completions through this when present
-                # (legacy "role: content" formatting otherwise)
-                "chat_template.jinja"):
-        src = os.path.join(model_dir, aux)
+    embeddings = ("openvino_text_embeddings_model.xml", "openvino_text_embeddings_model.bin")
+    for aux in embeddings + ("tokenizer.json", "generation_config.json", "config.json",
+                             # API renders /v1/chat/completions through this when present
+                             # (legacy "role: content" formatting otherwise)
+                             "chat_template.jinja"):
+        if weights and aux in embeddings:
+            continue  # written by swap_embeddings below
+        # the fine-tune's tokenizer/config win over the stock IR's
+        src = os.path.join(weights, aux) if weights and aux in ("tokenizer.json", "config.json") else None
+        if src is None or not os.path.exists(src):
+            src = os.path.join(model_dir, aux)
         if os.path.exists(src):
             shutil.copy2(src, os.path.join(output_dir, aux))
+    if tokenizer is not None:
+        shutil.copy2(tokenizer, os.path.join(output_dir, "tokenizer.json"))
+        print(f"tokenizer.json from {tokenizer}", flush=True)
+    if weights:
+        from weight_swap import Weights, swap_embeddings
+        swap_embeddings(os.path.join(model_dir, "openvino_text_embeddings_model.xml"),
+                        Weights(weights), output_dir)
+        print(f"text embeddings swapped from {weights}", flush=True)
+    # last: the manifest marks the tree complete
+    with open(os.path.join(output_dir, "manifest.json"), "w") as f:
+        json.dump(manifest, f, indent=2)
     print("manifest + aux files written", flush=True)
 
     if not validate:
@@ -606,8 +722,13 @@ def main():
                     "(e.g. 48 on the 64-layer Qwen3.8-27B -> 48/16)")
     ap.add_argument("--validate", action="store_true",
                     help="chain stages vs full model on one synthetic token")
+    ap.add_argument("--weights", default=None, help="HF checkpoint whose weights replace the IR's (same architecture)")
+    ap.add_argument("--lora", default=None, help="PEFT adapter_model.safetensors grafted as fp32 side branches")
+    ap.add_argument("--lora-scale", type=float, default=None, help="override adapter_config.json's lora_alpha / r")
+    ap.add_argument("--final-hidden", action="store_true", help="last stage also outputs final-norm hidden (decision heads)")
     args = ap.parse_args()
-    run_export(args.model, args.out, args.total, args.validate, args.layer_split)
+    run_export(args.model, args.out, args.total, args.validate, args.layer_split,
+               weights=args.weights, lora=args.lora, lora_scale=args.lora_scale, final_hidden=args.final_hidden)
 
 
 if __name__ == "__main__":
