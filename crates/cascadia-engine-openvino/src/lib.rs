@@ -195,10 +195,9 @@ mod model_window_tests {
 
     #[test]
     fn a_forwarded_prompt_is_bounded_by_the_frame_it_becomes() {
-        // Measured frames: gemma4 refused 11,428 tokens at 269,152,256 bytes (23,552 per token) and
-        // ov-dist-spec 4,034 at 1,034,769,408 (256,512). ov-runtime sends f16 at hidden 4096.
+        // Measured frames: gemma4 refused 11,428 tokens at 269,152,256 bytes (23,552 per token).
+        // ov-runtime sends f16 at hidden 4096. ov-dist-spec prefills in spans and does not use this.
         assert_eq!(forwarded_prompt_window(Some(131_072), 23_552), Some(11_397));
-        assert_eq!(forwarded_prompt_window(Some(131_072), 256_512), Some(1_046));
         assert_eq!(forwarded_prompt_window(Some(131_072), 8_192), Some(32_768));
         // The lower bound wins either way.
         assert_eq!(forwarded_prompt_window(Some(4_096), 8_192), Some(4_096));

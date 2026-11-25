@@ -228,6 +228,12 @@ fn last_stage_reply(bytes: Vec<u8>, shape: [u32; MAX_RANK]) -> (Vec<u8>, [u32; M
     (bytes[bytes.len() - row..].to_vec(), [1, 1, shape[2]])
 }
 
+/// The longest prompt the driver admits. Only the model window bounds it: the driver prefills in
+/// `PREFILL_SPAN` pieces and a prefill reply keeps one row, so no frame grows with the prompt.
+fn driver_prompt_window(pipeline_dir: &std::path::Path) -> Option<u32> {
+    crate::pipeline_model_window(pipeline_dir)
+}
+
 /// A verify needs one logits row per verified token.
 fn check_verify_rows(shape: [usize; 3], logits_len: usize, need: usize) -> Result<(), EngineError> {
     if shape[1] < need || logits_len < need * shape[2] {
@@ -2349,13 +2355,7 @@ impl Builder for OvDistSpecBuilder {
             kv_model_id: self.pipeline_dir.to_string_lossy().into_owned(),
             target,
             draft: masked_draft,
-            // The tail returns f16 logits per prompt token, far wider than the hidden frame out.
-            prompt_window: crate::forwarded_prompt_window(
-                crate::pipeline_model_window(&self.pipeline_dir),
-                crate::pipeline_config_value(&self.pipeline_dir, "vocab_size").unwrap_or(0)
-                    as usize
-                    * 2,
-            ),
+            prompt_window: driver_prompt_window(&self.pipeline_dir),
             tokenizer,
             eos_token_ids: self.eos_token_ids.clone(),
             k: self.k as usize,
@@ -3959,6 +3959,28 @@ mod tests {
         assert_eq!(long.len(), 13);
         assert_eq!(long.last(), Some(&(6144..6181)));
         assert!(long.windows(2).all(|w| w[0].end == w[1].start));
+    }
+
+    #[test]
+    fn a_spanned_prefill_admits_a_prompt_past_one_whole_prompt_reply() {
+        // At vocab 128,256 one whole-prompt f16 reply passes MAX_TENSOR_BYTES at 1,047 tokens.
+        // The driver prefills in spans, so only the model window bounds the prompt.
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("config.json"),
+            r#"{"max_position_embeddings":131072,"vocab_size":128256}"#,
+        )
+        .unwrap();
+        let window = driver_prompt_window(dir.path());
+        assert_eq!(window, Some(131_072));
+        let json = r#"{"version":"1.0","truncation":null,"padding":null,
+            "added_tokens":[],"normalizer":null,
+            "pre_tokenizer":{"type":"Whitespace"},
+            "post_processor":null,"decoder":null,
+            "model":{"type":"WordLevel","vocab":{"hi":0},"unk_token":"hi"}}"#;
+        let tok = tokenizers::Tokenizer::from_bytes(json.as_bytes()).unwrap();
+        let prompt = vec!["hi"; 6007].join(" ");
+        assert!(crate::refuse_over_model_window(Some(&tok), &prompt, window, 0).is_ok());
     }
 
     // An older worker's full reply to one prefill span stays well under the frame cap.
