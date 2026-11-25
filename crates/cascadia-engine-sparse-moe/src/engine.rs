@@ -9290,4 +9290,61 @@ mod tests {
             std::time::Duration::from_secs(600)
         );
     }
+
+    /// Run a stage's `connect()` with `upstream` and dial it once from 127.0.0.1.
+    /// Returns whether `connect()` took the dial, and whether the dialer saw the
+    /// stage close the link.
+    async fn dial_stage_from_loopback(listen_host: &str, upstream: &str) -> (bool, bool) {
+        use tokio::io::AsyncReadExt;
+        let port = std::net::TcpListener::bind("127.0.0.1:0")
+            .unwrap()
+            .local_addr()
+            .unwrap()
+            .port();
+        let mut b = SparseMoEBuilder::new(
+            SparseMoEBuilderConfig::new("/nonexistent", "CPU").with_rank(1, 2),
+        );
+        b.configure_listen(listen_host, port);
+        let peers = PeerLayout::last_of(cascadia_types::PeerEndpoint::new(upstream, 9));
+        // Keep the builder alive after `connect()` so an admitted link stays open.
+        let task = tokio::spawn(async move {
+            let r = b.connect(peers).await;
+            (r, b)
+        });
+        let mut sock = loop {
+            match tokio::net::TcpStream::connect(("127.0.0.1", port)).await {
+                Ok(s) => break s,
+                Err(_) => tokio::time::sleep(Duration::from_millis(10)).await,
+            }
+        };
+        let mut buf = [0u8; 1];
+        let closed = matches!(
+            tokio::time::timeout(Duration::from_secs(2), sock.read(&mut buf)).await,
+            Ok(Ok(0)) | Ok(Err(_))
+        );
+        let accepted = match tokio::time::timeout(Duration::from_secs(2), task).await {
+            Ok(joined) => {
+                joined.unwrap().0.unwrap();
+                true
+            }
+            Err(_) => false,
+        };
+        (accepted, closed)
+    }
+
+    /// A multi-stage worker's `connect()` takes a TCP peer only from its
+    /// configured upstream host: a dial from any other host is closed and the
+    /// wait goes on.
+    #[tokio::test]
+    async fn worker_connect_accepts_only_its_upstream() {
+        // TEST-NET-1 never resolves to the dialer's 127.0.0.1.
+        assert_eq!(
+            dial_stage_from_loopback("127.0.0.1", "192.0.2.1").await,
+            (false, true)
+        );
+        assert_eq!(
+            dial_stage_from_loopback("0.0.0.0", "127.0.0.1").await,
+            (true, false)
+        );
+    }
 }
