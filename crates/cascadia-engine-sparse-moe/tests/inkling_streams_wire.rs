@@ -9,8 +9,8 @@ use std::sync::Arc;
 
 use cascadia_engine::Engine;
 use cascadia_engine_sparse_moe::dist::{
-    recv_kind_client, recv_stream_tokens_body_client, send_stream_decode, send_stream_feed,
-    send_stream_open, FrameKind, StageTransport, STREAM_FEED_OPEN,
+    recv_kind_client, recv_stream_tokens_body_client, send_forward, send_reset, send_stream_decode,
+    send_stream_feed, send_stream_open, FrameKind, StageTransport, STREAM_FEED_OPEN,
 };
 use cascadia_engine_sparse_moe::engine::PipelineEngine;
 use cascadia_engine_sparse_moe::inkling::stage::InklingRunner;
@@ -216,13 +216,33 @@ async fn three_rank_multistream_matches_single_stage() {
     }
 }
 
+/// A worker step loop as the relay loop runs it, until `stop`. Returns
+/// whether any step failed: a worker re-links in place on a lost link, so
+/// none may (a failed step would end the relay loop, and nothing rebuilds an
+/// embedded stage).
+fn spawn_worker(mut e: Box<dyn Engine>, stop: Arc<AtomicBool>) -> std::thread::JoinHandle<bool> {
+    std::thread::spawn(move || {
+        while !stop.load(Ordering::Relaxed) {
+            if e.step().is_err() {
+                return true;
+            }
+        }
+        false
+    })
+}
+
+/// Join a worker from `spawn_worker` and assert it neither panicked nor failed a step.
+async fn join_worker(w: std::thread::JoinHandle<bool>, rank: &str) {
+    let r = tokio::task::spawn_blocking(move || w.join()).await.unwrap();
+    assert!(r.is_ok(), "{rank} panicked");
+    assert!(!r.unwrap(), "{rank} failed a step instead of re-linking");
+}
+
 /// A last rank whose upstream dies hard (TCP reset, as when the previous
-/// rank's process is killed) must exit its step loop with an error so the
-/// supervisor rebuilds it, instead of spinning on `NotConnected` forever
-/// while the restarted upstream can never reconnect (the listener accepted
-/// exactly once). `streams` = 0 runs the one-task path, more runs the
-/// stream-mode readiness wait.
-async fn last_rank_exits_after_upstream_reset(streams: usize) {
+/// rank's process is killed) keeps its listener and serves the upstream's
+/// next dial in the same process. `streams` = 0 runs the one-task path, more
+/// runs the stream-mode readiness wait.
+async fn last_rank_reaccepts_after_upstream_reset(streams: usize) {
     let Some(dir) = fixture() else { return };
     let handle = tokio::runtime::Handle::current();
     let mut server = ActivationServer::new("127.0.0.1", 0);
@@ -237,6 +257,7 @@ async fn last_rank_exits_after_upstream_reset(streams: usize) {
     accept.await.unwrap();
 
     let r2 = InklingRunner::load_staged(&dir, 64, 2, 3, 3, 4, Some("eager".into()), None).unwrap();
+    let hs = r2.hidden_size();
     let mut e2 = PipelineEngine::new(
         r2,
         None,
@@ -252,17 +273,8 @@ async fn last_rank_exits_after_upstream_reset(streams: usize) {
     if streams > 0 {
         assert_eq!(e2.enable_streams(streams), streams);
     }
-    let exited = Arc::new(AtomicBool::new(false));
-    let flag = exited.clone();
-    let worker = std::thread::spawn(move || {
-        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
-        while std::time::Instant::now() < deadline {
-            if e2.step().is_err() {
-                flag.store(true, Ordering::Relaxed);
-                return;
-            }
-        }
-    });
+    let stop = Arc::new(AtomicBool::new(false));
+    let worker = spawn_worker(Box::new(e2), stop.clone());
     // Let the worker settle into its blocking receive, then kill the peer
     // hard: linger 0 turns the close into a reset. (tokio deprecates the
     // setter because a non-zero linger blocks the thread on drop; zero does
@@ -273,33 +285,65 @@ async fn last_rank_exits_after_upstream_reset(streams: usize) {
         .set_linger(Some(std::time::Duration::ZERO))
         .unwrap();
     drop(upstream);
-    worker.join().unwrap();
+
+    // The restarted upstream dials the same port and is served.
+    let mut c = ActivationClient::new("127.0.0.1", port);
+    c.connect_with_timeout(std::time::Duration::from_secs(5))
+        .await
+        .unwrap();
+    let c = Mutex::new(c);
+    let cfg = SamplingConfig::default();
+    let reply = tokio::time::timeout(std::time::Duration::from_secs(10), async {
+        if streams > 0 {
+            send_stream_open(&c, 1, 0, &cfg, &vec![0.1; 2 * hs], 2, hs as u32)
+                .await
+                .unwrap();
+            recv_kind_client(&c).await
+        } else {
+            send_reset(&c).await.unwrap();
+            send_forward(&c, 0, &cfg, &vec![0.1; hs], [1, 1, hs as u32], true)
+                .await
+                .unwrap();
+            recv_kind_client(&c).await
+        }
+    })
+    .await
+    .expect("the last rank did not serve its re-dialed upstream");
+    let want = if streams > 0 {
+        FrameKind::StreamTokens
+    } else {
+        FrameKind::Token
+    };
     assert!(
-        exited.load(Ordering::Relaxed),
-        "last rank kept stepping after its upstream reset; the supervisor can never rebuild it"
+        matches!(reply, Ok(Some(k)) if k == want),
+        "expected {want:?} on the new link, got {reply:?}"
     );
+    stop.store(true, Ordering::Relaxed);
+    c.lock().await.close().await;
+    join_worker(worker, "the last rank").await;
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn last_rank_exits_after_upstream_reset_one_task() {
-    last_rank_exits_after_upstream_reset(0).await;
+async fn last_rank_reaccepts_after_upstream_reset_one_task() {
+    last_rank_reaccepts_after_upstream_reset(0).await;
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn last_rank_exits_after_upstream_reset_streams() {
-    last_rank_exits_after_upstream_reset(3).await;
+async fn last_rank_reaccepts_after_upstream_reset_streams() {
+    last_rank_reaccepts_after_upstream_reset(3).await;
 }
 
 /// A lone stream-mode last rank (rank 2 of 3) that the test feeds frames by
-/// hand. Returns the test's end of the link, the hidden width and the worker
-/// thread, which ends when `step` fails and panics if it never does.
+/// hand. Returns the test's end of the link, the hidden width, the stop flag
+/// and the worker thread (see `spawn_worker`).
 async fn lone_last_rank(
     dir: &std::path::Path,
     handle: &tokio::runtime::Handle,
 ) -> (
     Arc<Mutex<ActivationClient>>,
     usize,
-    std::thread::JoinHandle<()>,
+    Arc<AtomicBool>,
+    std::thread::JoinHandle<bool>,
 ) {
     let (s, c) = link().await;
     let r2 = InklingRunner::load_staged(dir, 64, 2, 3, 3, 4, Some("eager".into()), None).unwrap();
@@ -317,43 +361,43 @@ async fn lone_last_rank(
         None,
     );
     assert_eq!(e2.enable_streams(3), 3);
-    let worker = std::thread::spawn(move || {
-        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
-        while std::time::Instant::now() < deadline {
-            if e2.step().is_err() {
-                return;
-            }
-        }
-        panic!("the last rank kept stepping after a bad frame");
-    });
-    (c, hs, worker)
+    let stop = Arc::new(AtomicBool::new(false));
+    let worker = spawn_worker(Box::new(e2), stop.clone());
+    (c, hs, stop, worker)
 }
 
-/// A `StreamDecode` frame that names a free slot, or one slot two times,
-/// must make the worker exit with an error. Before the fix both reached the
-/// runner's asserts and panicked the worker process.
+/// The last rank drops a link that sent it a frame it rejected: the test's
+/// end reads EOF (or an error) instead of a reply, within 5 s.
+async fn assert_link_closed(c: &Mutex<ActivationClient>, what: &str) {
+    let reply = tokio::time::timeout(std::time::Duration::from_secs(5), recv_kind_client(c))
+        .await
+        .unwrap_or_else(|_| panic!("{what}: the last rank neither replied nor closed the link"));
+    assert!(
+        !matches!(reply, Ok(Some(_))),
+        "{what}: expected the link to close, got {reply:?}"
+    );
+}
+
+/// A `StreamDecode` frame that names a free slot, or one slot two times, is
+/// rejected: the worker drops the link and keeps stepping, without a panic.
+/// Before the fix both reached the runner's asserts and panicked the worker
+/// process.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn bad_stream_decode_frame_is_rejected_without_panic() {
     let Some(dir) = fixture() else { return };
     let handle = tokio::runtime::Handle::current();
-    let join = |w: std::thread::JoinHandle<()>| async move {
-        tokio::task::spawn_blocking(move || w.join().is_ok())
-            .await
-            .unwrap()
-    };
 
     // A free slot at position 0.
-    let (c, hs, worker) = lone_last_rank(&dir, &handle).await;
+    let (c, hs, stop, worker) = lone_last_rank(&dir, &handle).await;
     send_stream_decode(&c, 1, &[(0, 0)], &vec![0.1; hs], hs as u32)
         .await
         .unwrap();
-    assert!(
-        join(worker).await,
-        "a decode of a free slot panicked the worker"
-    );
+    assert_link_closed(&c, "a decode of a free slot").await;
+    stop.store(true, Ordering::Relaxed);
+    join_worker(worker, "a decode of a free slot: the last rank").await;
 
     // An open slot listed two times.
-    let (c, hs, worker) = lone_last_rank(&dir, &handle).await;
+    let (c, hs, stop, worker) = lone_last_rank(&dir, &handle).await;
     let cfg = SamplingConfig::default();
     send_stream_open(&c, 1, 0, &cfg, &vec![0.1; 2 * hs], 2, hs as u32)
         .await
@@ -366,10 +410,9 @@ async fn bad_stream_decode_frame_is_rejected_without_panic() {
     send_stream_decode(&c, 2, &[(0, 2), (0, 2)], &vec![0.1; 2 * hs], hs as u32)
         .await
         .unwrap();
-    assert!(
-        join(worker).await,
-        "a decode that lists one slot two times panicked the worker"
-    );
+    assert_link_closed(&c, "a decode that lists one slot two times").await;
+    stop.store(true, Ordering::Relaxed);
+    join_worker(worker, "a duplicate-slot decode: the last rank").await;
 }
 
 /// A stream frame that the last rank cannot serve, here a decode of a slot
@@ -380,7 +423,7 @@ async fn bad_stream_decode_frame_is_rejected_without_panic() {
 async fn failed_stream_frame_closes_the_link_at_once() {
     let Some(dir) = fixture() else { return };
     let handle = tokio::runtime::Handle::current();
-    let (c, hs, worker) = lone_last_rank(&dir, &handle).await;
+    let (c, hs, stop, worker) = lone_last_rank(&dir, &handle).await;
     // The first window of a long prompt opens the slot; only the final
     // window would create its sampler.
     let cfg = SamplingConfig::default();
@@ -399,22 +442,14 @@ async fn failed_stream_frame_closes_the_link_at_once() {
     send_stream_decode(&c, 2, &[(0, 2)], &vec![0.1; hs], hs as u32)
         .await
         .unwrap();
-    let reply = tokio::time::timeout(std::time::Duration::from_secs(5), recv_kind_client(&c))
-        .await
-        .expect("the last rank neither replied nor closed the link");
-    assert!(
-        !matches!(reply, Ok(Some(_))),
-        "expected the link to close, got {reply:?}"
-    );
-    let joined = tokio::task::spawn_blocking(move || worker.join().is_ok())
-        .await
-        .unwrap();
-    assert!(joined, "the last rank panicked");
+    assert_link_closed(&c, "a decode of an unsampled slot").await;
+    stop.store(true, Ordering::Relaxed);
+    join_worker(worker, "the last rank").await;
 }
 
 /// A 3-rank loopback pipeline with `caps[r]` stream slots on rank `r`.
 /// Returns rank 0, the stop flag, rank 0's two links and the worker threads
-/// for ranks 1 and 2. A worker thread returns `true` when its `step` failed.
+/// for ranks 1 and 2 (see `spawn_worker`).
 #[allow(clippy::type_complexity)]
 async fn pipeline(
     dir: &std::path::Path,
@@ -469,30 +504,20 @@ async fn pipeline(
     let stop = Arc::new(AtomicBool::new(false));
     let workers = [Box::new(e1) as Box<dyn Engine>, Box::new(e2)]
         .into_iter()
-        .map(|mut e| {
-            let stop = stop.clone();
-            std::thread::spawn(move || {
-                while !stop.load(Ordering::Relaxed) {
-                    if e.step().is_err() {
-                        return true;
-                    }
-                }
-                false
-            })
-        })
+        .map(|e| spawn_worker(e, stop.clone()))
         .collect();
     (e0, stop, [c01, c12], workers)
 }
 
 /// Rank 1 configured with fewer stream slots than rank 0 (`CASCADIA_STREAMS`
-/// not set on every rank). Rank 1 must exit with an error at the first slot
-/// it cannot hold, and rank 0's task must get an error chunk soon, not hang
-/// until its reply deadline.
+/// not set on every rank). Rank 1 must drop the link at the first slot it
+/// cannot hold (and re-link, not fail its step), and rank 0's task must get an
+/// error chunk soon, not hang until its reply deadline.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn rank_with_fewer_slots_fails_fast() {
     let Some(dir) = fixture() else { return };
     let handle = tokio::runtime::Handle::current();
-    let (e0, stop, [c01, c12], mut workers) = pipeline(&dir, &handle, [3, 1, 3]).await;
+    let (e0, stop, [c01, c12], workers) = pipeline(&dir, &handle, [3, 1, 3]).await;
     let started = std::time::Instant::now();
     let (e0, got) = tokio::task::spawn_blocking(move || {
         let mut e0 = e0;
@@ -509,18 +534,13 @@ async fn rank_with_fewer_slots_fails_fast() {
         started.elapsed() < std::time::Duration::from_secs(10),
         "and fail fast, not at the reply deadline"
     );
-    let w1 = workers.remove(0);
-    let w1_failed = tokio::task::spawn_blocking(move || w1.join().unwrap())
-        .await
-        .unwrap();
-    assert!(w1_failed, "rank 1 must exit with an error");
 
     stop.store(true, Ordering::Relaxed);
     drop(e0);
     c01.lock().await.close().await;
     c12.lock().await.close().await;
-    for w in workers {
-        let _ = w.join();
+    for (w, rank) in workers.into_iter().zip(["rank 1", "rank 2"]) {
+        join_worker(w, rank).await;
     }
 }
 
@@ -578,8 +598,8 @@ async fn over_budget_stream_finishes_with_length() {
     stop.store(true, Ordering::Relaxed);
     c01.lock().await.close().await;
     c12.lock().await.close().await;
-    for w in workers {
-        let _ = w.join();
+    for (w, rank) in workers.into_iter().zip(["rank 1", "rank 2"]) {
+        join_worker(w, rank).await;
     }
     assert_eq!(piped_reason, Some(FinishReason::Length), "pipeline");
     assert_eq!(
@@ -627,58 +647,62 @@ fn run_round(e0: &mut dyn Engine, tag: &str, n: usize) -> Vec<Result<Vec<i64>, S
 
 /// Ranks 1 and 2 of the loopback pipeline plus a TCP forwarder standing in
 /// for the wire between rank 0 and rank 1. Cutting the forwarder kills the
-/// link the way a dying neighbour does: rank 0's own socket stays open and
-/// reads EOF (closing rank 0's client from the test would not exercise that).
+/// link the way a dying neighbour or network does: rank 0's own socket stays
+/// open and reads EOF (closing rank 0's client from the test would not
+/// exercise that). Ranks 1 and 2 keep running across a cut, as they do in the
+/// embedded node, where the process does not restart: they re-link in place
+/// once rank 0 dials in again.
 struct Tail {
-    ports: (u16, u16, u16),
-    /// Completes when rank 1 has accepted rank 0's dial.
-    accepted: Option<tokio::task::JoinHandle<()>>,
-    fwd: tokio::task::JoinHandle<()>,
-    c12: Arc<Mutex<ActivationClient>>,
-    workers: Vec<std::thread::JoinHandle<()>>,
+    /// Forwarder (rank 0 dials it) and rank 1's listener.
+    ports: (u16, u16),
+    /// Completes when the forwarder has carried rank 0's next dial to rank 1.
+    dialed: Option<tokio::sync::oneshot::Receiver<()>>,
+    fwd: Option<tokio::task::JoinHandle<()>>,
+    stop: Arc<AtomicBool>,
+    workers: Vec<std::thread::JoinHandle<bool>>,
+}
+
+/// Accept every dial on `listener` and splice it to rank 1's port. Aborting
+/// the task drops the listener and every spliced connection.
+fn forward(
+    listener: tokio::net::TcpListener,
+    to: u16,
+    dialed: tokio::sync::oneshot::Sender<()>,
+) -> tokio::task::JoinHandle<()> {
+    tokio::spawn(async move {
+        let mut dialed = Some(dialed);
+        let mut links = tokio::task::JoinSet::new();
+        loop {
+            let Ok((mut a, _)) = listener.accept().await else {
+                return;
+            };
+            let Ok(mut b) = tokio::net::TcpStream::connect(("127.0.0.1", to)).await else {
+                continue;
+            };
+            a.set_nodelay(true).ok();
+            b.set_nodelay(true).ok();
+            if let Some(d) = dialed.take() {
+                let _ = d.send(());
+            }
+            links.spawn(async move {
+                let _ = tokio::io::copy_bidirectional(&mut a, &mut b).await;
+            });
+        }
+    })
 }
 
 impl Tail {
-    /// `ports` = (forwarder, rank 1, rank 2); zeros pick free ports.
-    async fn start(
-        dir: &std::path::Path,
-        handle: &tokio::runtime::Handle,
-        ports: (u16, u16, u16),
-    ) -> Tail {
-        let mut s12 = ActivationServer::new("127.0.0.1", ports.2);
-        s12.start().await.unwrap();
-        let p2 = s12.port();
-        let s12 = Arc::new(Mutex::new(s12));
-        let sc = s12.clone();
-        let accept = tokio::spawn(async move { sc.lock().await.accept().await.unwrap() });
-        let mut c12 = ActivationClient::new("127.0.0.1", p2);
-        c12.connect_with_timeout(std::time::Duration::from_secs(5))
-            .await
-            .unwrap();
-        accept.await.unwrap();
-        let c12 = Arc::new(Mutex::new(c12));
+    async fn start(dir: &std::path::Path, handle: &tokio::runtime::Handle) -> Tail {
+        let (s12, c12) = link().await;
 
-        // Rank 1 accepts whenever rank 0 dials in through the forwarder.
-        let mut s01 = ActivationServer::new("127.0.0.1", ports.1);
+        // Rank 1 takes rank 0's first dial the way its builder does; later
+        // dials it re-accepts itself after a lost link.
+        let mut s01 = ActivationServer::new("127.0.0.1", 0);
         s01.start().await.unwrap();
         let p1 = s01.port();
         let s01 = Arc::new(Mutex::new(s01));
         let sc = s01.clone();
-        let accepted = tokio::spawn(async move { sc.lock().await.accept().await.unwrap() });
-
-        let listener = tokio::net::TcpListener::bind(("127.0.0.1", ports.0))
-            .await
-            .unwrap();
-        let pf = listener.local_addr().unwrap().port();
-        let fwd = tokio::spawn(async move {
-            let (mut a, _) = listener.accept().await.unwrap();
-            let mut b = tokio::net::TcpStream::connect(("127.0.0.1", p1))
-                .await
-                .unwrap();
-            a.set_nodelay(true).ok();
-            b.set_nodelay(true).ok();
-            let _ = tokio::io::copy_bidirectional(&mut a, &mut b).await;
-        });
+        tokio::spawn(async move { sc.lock().await.accept().await.unwrap() });
 
         let load = |rank, lo, hi| {
             InklingRunner::load_staged(dir, 64, rank, 3, lo, hi, Some("eager".into()), None)
@@ -689,7 +713,7 @@ impl Tail {
             None,
             StageTransport {
                 upstream: Some(s01),
-                downstream: Some(c12.clone()),
+                downstream: Some(c12),
             },
             handle.clone(),
             1,
@@ -710,44 +734,52 @@ impl Tail {
         );
         assert_eq!(e1.enable_streams(3), 3);
         assert_eq!(e2.enable_streams(3), 3);
+        let stop = Arc::new(AtomicBool::new(false));
         let workers = [Box::new(e1) as Box<dyn Engine>, Box::new(e2)]
             .into_iter()
-            .map(|mut e| {
-                std::thread::spawn(move || {
-                    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
-                    while std::time::Instant::now() < deadline {
-                        if e.step().is_err() {
-                            return;
-                        }
-                    }
-                    panic!("worker rank never exited");
-                })
-            })
+            .map(|e| spawn_worker(e, stop.clone()))
             .collect();
-        Tail {
-            ports: (pf, p1, p2),
-            accepted: Some(accepted),
-            fwd,
-            c12,
+        let mut tail = Tail {
+            ports: (0, p1),
+            dialed: None,
+            fwd: None,
+            stop,
             workers,
+        };
+        tail.restore(0).await;
+        tail
+    }
+
+    /// The wire to rank 0 comes back on the forwarder port (`0` picks one).
+    async fn restore(&mut self, port: u16) {
+        let listener = tokio::net::TcpListener::bind(("127.0.0.1", port))
+            .await
+            .unwrap();
+        self.ports.0 = listener.local_addr().unwrap().port();
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        self.dialed = Some(rx);
+        self.fwd = Some(forward(listener, self.ports.1, tx));
+    }
+
+    /// The wire to rank 0 is cut and stays down (dials are refused) until
+    /// `restore`. Rank 1 reads EOF and re-links; so does rank 2.
+    async fn cut(&mut self) {
+        if let Some(f) = self.fwd.take() {
+            f.abort();
+            // Wait for the listener to be dropped; the spliced link tasks are
+            // cancelled just after it.
+            let _ = f.await;
+            tokio::time::sleep(std::time::Duration::from_millis(200)).await;
         }
     }
 
-    /// The neighbours die: the wire to rank 0 is cut, rank 1 exits on its
-    /// upstream EOF, rank 2 on rank 1's. Returns the ports for a restart.
-    async fn kill(self) -> (u16, u16, u16) {
-        self.fwd.abort();
-        let mut workers = self.workers.into_iter();
-        let w1 = workers.next().unwrap();
-        tokio::task::spawn_blocking(move || w1.join().unwrap())
-            .await
-            .unwrap();
-        self.c12.lock().await.close().await;
-        let w2 = workers.next().unwrap();
-        tokio::task::spawn_blocking(move || w2.join().unwrap())
-            .await
-            .unwrap();
-        self.ports
+    /// End the test: cut, stop the workers, and assert neither failed a step.
+    async fn stop(mut self) {
+        self.cut().await;
+        self.stop.store(true, Ordering::Relaxed);
+        for (w, rank) in self.workers.into_iter().zip(["rank 1", "rank 2"]) {
+            join_worker(w, rank).await;
+        }
     }
 }
 
@@ -768,7 +800,7 @@ async fn rank0_redials_after_downstream_restart() {
     let tok = tokenizers::Tokenizer::from_file(dir.join("tokenizer.json")).expect("tokenizer");
     let n = PROMPTS.len();
 
-    let tail = Tail::start(&dir, &handle, (0, 0, 0)).await;
+    let mut tail = Tail::start(&dir, &handle).await;
     let mut c01 = ActivationClient::new("127.0.0.1", tail.ports.0);
     c01.connect_with_timeout(std::time::Duration::from_secs(5))
         .await
@@ -810,30 +842,30 @@ async fn rank0_redials_after_downstream_restart() {
         .collect();
     assert!(expected.iter().all(|t| !t.is_empty()));
 
-    // 1. The neighbours restart while rank 0 idles, and no request arrives.
-    // Rank 0 must notice the dead link and dial the new rank 1 by itself:
-    // until it does, rank 1 waits for that dial, unloaded, and on a real fleet
-    // every rank that restarts after it waits on the one before (seen with 11
-    // boxes: ranks 1-5 all "waiting for the previous rank to dial in" behind a
-    // rank 0 that was "serving").
-    let ports = tail.kill().await;
-    let mut tail = Tail::start(&dir, &handle, ports).await;
+    // 1. The link drops while rank 0 idles, and no request arrives. Rank 0
+    // must notice the dead link and dial rank 1 again by itself: until it
+    // does, rank 1 waits for that dial, and on a real fleet every rank behind
+    // it waits on the one before (seen with 11 boxes: ranks 1-5 all "waiting
+    // for the previous rank to dial in" behind a rank 0 that was "serving").
+    let port = tail.ports.0;
+    tail.cut().await;
+    tail.restore(port).await;
     let dialed = tokio::time::timeout(
         std::time::Duration::from_secs(10),
-        tail.accepted.take().unwrap(),
+        tail.dialed.take().unwrap(),
     )
     .await;
     assert!(
         dialed.is_ok(),
-        "rank 0 did not re-dial the restarted rank 1 while idle (no request was made)"
+        "rank 0 did not re-dial rank 1 while idle (no request was made)"
     );
     let (e0, got) = round(e0, "restarted", n).await;
     for (i, (g, e)) in got.iter().zip(&expected).enumerate() {
-        assert_eq!(g.as_ref(), Ok(e), "task {i} after the neighbours restarted");
+        assert_eq!(g.as_ref(), Ok(e), "task {i} after the link came back");
     }
 
-    // 2. The neighbours are down.
-    let ports = tail.kill().await;
+    // 2. The neighbours are unreachable.
+    tail.cut().await;
     let started = std::time::Instant::now();
     let (e0, got) = round(e0, "down", 1).await;
     assert!(
@@ -847,7 +879,7 @@ async fn rank0_redials_after_downstream_restart() {
     );
 
     // 3. They come back; rank 0 re-dials once its retry interval has passed.
-    let tail = Tail::start(&dir, &handle, ports).await;
+    tail.restore(port).await;
     tokio::time::sleep(std::time::Duration::from_millis(3200)).await;
     let (e0, got) = round(e0, "back", n).await;
     for (i, (g, e)) in got.iter().zip(&expected).enumerate() {
@@ -855,7 +887,7 @@ async fn rank0_redials_after_downstream_restart() {
     }
 
     drop(e0);
-    tail.kill().await;
+    tail.stop().await;
 }
 
 /// The link to rank 1 dies while streams are in flight: each in-flight task
@@ -868,7 +900,7 @@ async fn link_loss_mid_round_fails_each_stream_once() {
     let tok = tokenizers::Tokenizer::from_file(dir.join("tokenizer.json")).expect("tokenizer");
     let n = PROMPTS.len();
 
-    let tail = Tail::start(&dir, &handle, (0, 0, 0)).await;
+    let mut tail = Tail::start(&dir, &handle).await;
     let mut c01 = ActivationClient::new("127.0.0.1", tail.ports.0);
     c01.connect_with_timeout(std::time::Duration::from_secs(5))
         .await
@@ -953,7 +985,8 @@ async fn link_loss_mid_round_fails_each_stream_once() {
     tokio::task::spawn_blocking(move || in_flight_rx.recv().unwrap())
         .await
         .unwrap();
-    let ports = tail.kill().await;
+    let port = tail.ports.0;
+    tail.cut().await;
     cut_tx.send(()).unwrap();
     let (e0, errors) = cut.await.unwrap();
     assert_eq!(
@@ -962,8 +995,8 @@ async fn link_loss_mid_round_fails_each_stream_once() {
         "each in-flight task must end with exactly one error chunk"
     );
 
-    // The neighbours come back; rank 0 re-dials once its retry interval has passed.
-    let tail = Tail::start(&dir, &handle, ports).await;
+    // The link comes back; rank 0 re-dials once its retry interval has passed.
+    tail.restore(port).await;
     tokio::time::sleep(std::time::Duration::from_millis(3200)).await;
     let (e0, got) = tokio::task::spawn_blocking(move || {
         let mut e0 = e0;
@@ -977,7 +1010,162 @@ async fn link_loss_mid_round_fails_each_stream_once() {
     }
 
     drop(e0);
-    tail.kill().await;
+    tail.stop().await;
+}
+
+/// One-task (Forward) pipeline: the wire between rank 1 and rank 2 drops during
+/// a decode. The next Forward fails at rank 1, which owes rank 0 a Token:
+/// rank 1 must drop its links so rank 0 ends the task at once, well under its
+/// reply deadline, and once the wire is back the chain serves the next task.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn mid_rank_downstream_loss_fails_rank0_fast() {
+    let Some(dir) = fixture() else { return };
+    let handle = tokio::runtime::Handle::current();
+    let tok = tokenizers::Tokenizer::from_file(dir.join("tokenizer.json")).expect("tokenizer");
+    let load = |rank, lo, hi| {
+        InklingRunner::load_staged(&dir, 64, rank, 3, lo, hi, Some("eager".into()), None).unwrap()
+    };
+
+    // Rank 2's listener, reached by rank 1 through a forwarder that stands in
+    // for the wire between them.
+    let mut s12 = ActivationServer::new("127.0.0.1", 0);
+    s12.start().await.unwrap();
+    let p2 = s12.port();
+    let s12 = Arc::new(Mutex::new(s12));
+    let sc = s12.clone();
+    tokio::spawn(async move { sc.lock().await.accept().await.unwrap() });
+    let wire = tokio::net::TcpListener::bind(("127.0.0.1", 0))
+        .await
+        .unwrap();
+    let pw = wire.local_addr().unwrap().port();
+    let (tx, _rx) = tokio::sync::oneshot::channel();
+    let fwd = forward(wire, p2, tx);
+    let mut c12 = ActivationClient::new("127.0.0.1", pw);
+    c12.connect_with_timeout(std::time::Duration::from_secs(5))
+        .await
+        .unwrap();
+    let (s01, c01) = link().await;
+
+    let e1 = PipelineEngine::new(
+        load(1, 2, 3),
+        None,
+        StageTransport {
+            upstream: Some(s01),
+            downstream: Some(Arc::new(Mutex::new(c12))),
+        },
+        handle.clone(),
+        1,
+        3,
+        None,
+    );
+    let e2 = PipelineEngine::new(
+        load(2, 3, 4),
+        None,
+        StageTransport {
+            upstream: Some(s12),
+            downstream: None,
+        },
+        handle.clone(),
+        2,
+        3,
+        None,
+    );
+    let e0 = PipelineEngine::new(
+        load(0, 0, 2),
+        Some(tok),
+        StageTransport {
+            upstream: None,
+            downstream: Some(c01),
+        },
+        handle.clone(),
+        0,
+        3,
+        None,
+    );
+    let stop = Arc::new(AtomicBool::new(false));
+    let workers: Vec<_> = [Box::new(e1) as Box<dyn Engine>, Box::new(e2)]
+        .into_iter()
+        .map(|e| spawn_worker(e, stop.clone()))
+        .collect();
+    async fn round(
+        e0: PipelineEngine<InklingRunner>,
+        tag: &'static str,
+    ) -> (PipelineEngine<InklingRunner>, Vec<Result<Vec<i64>, String>>) {
+        tokio::task::spawn_blocking(move || {
+            let mut e0 = e0;
+            let got = run_round(&mut e0, tag, 1);
+            (e0, got)
+        })
+        .await
+        .unwrap()
+    }
+
+    let (e0, healthy) = round(e0, "healthy").await;
+    let expected = healthy[0].clone().expect("healthy round");
+
+    // Cut the wire after the first decoded token, so the next decode Forward
+    // is the frame rank 1 cannot answer (the prefill frames latch already).
+    let (in_flight_tx, in_flight_rx) = std::sync::mpsc::channel::<()>();
+    let (cut_tx, cut_rx) = std::sync::mpsc::channel::<std::time::Instant>();
+    let cut = tokio::task::spawn_blocking(move || {
+        let mut e0 = e0;
+        let mut t = GenerationTask::new("cut".to_string(), PROMPTS[0]);
+        t.max_tokens = MAX_TOKENS[0];
+        t.temperature = 0.0;
+        e0.submit(t).unwrap();
+        let mut cut_at = None;
+        for _ in 0..500 {
+            let Ok(chunks) = e0.step() else { continue };
+            for (_, c) in chunks {
+                // Rank 0 ends a task whose decode lost the wire with its
+                // partial output (an error chunk on other paths); either way
+                // it must end now, not at the reply deadline.
+                if c.error.is_some() || c.is_final {
+                    let at = cut_at.expect("the task ended before the cut");
+                    return (e0, Ok(std::time::Instant::now() - at));
+                }
+                if cut_at.is_none() {
+                    in_flight_tx.send(()).unwrap();
+                    cut_at = Some(cut_rx.recv().unwrap());
+                }
+            }
+        }
+        (e0, Err("the task never ended".to_string()))
+    });
+    tokio::task::spawn_blocking(move || in_flight_rx.recv().unwrap())
+        .await
+        .unwrap();
+    fwd.abort();
+    let _ = fwd.await;
+    // The spliced link tasks are cancelled after the forwarder itself.
+    tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+    cut_tx.send(std::time::Instant::now()).unwrap();
+    let (e0, failed_after) = cut.await.unwrap();
+    let failed_after = failed_after.expect("the task over the cut wire must end");
+    assert!(
+        failed_after < std::time::Duration::from_secs(10),
+        "rank 0 waited {failed_after:?} for a Token rank 1 could never send"
+    );
+
+    // The wire comes back on the same port; the chain re-links and serves.
+    let wire = tokio::net::TcpListener::bind(("127.0.0.1", pw))
+        .await
+        .unwrap();
+    let (tx, _rx) = tokio::sync::oneshot::channel();
+    let fwd = forward(wire, p2, tx);
+    let (e0, back) = round(e0, "back").await;
+    assert_eq!(
+        back[0].as_ref(),
+        Ok(&expected),
+        "the task after the wire came back"
+    );
+
+    drop(e0);
+    fwd.abort();
+    stop.store(true, Ordering::Relaxed);
+    for (w, rank) in workers.into_iter().zip(["rank 1", "rank 2"]) {
+        join_worker(w, rank).await;
+    }
 }
 
 /// Submit t0-t2, cancel t1 after its second token while t0 and t2 decode,
@@ -1048,7 +1236,7 @@ async fn three_rank_cancel_during_decode_frees_the_slot() {
         .unwrap()
     };
 
-    let tail = Tail::start(&dir, &handle, (0, 0, 0)).await;
+    let tail = Tail::start(&dir, &handle).await;
     let mut c01 = ActivationClient::new("127.0.0.1", tail.ports.0);
     c01.connect_with_timeout(std::time::Duration::from_secs(5))
         .await
@@ -1074,7 +1262,7 @@ async fn three_rank_cancel_during_decode_frees_the_slot() {
     })
     .await
     .unwrap();
-    tail.kill().await;
+    tail.stop().await;
     assert_eq!(after, 0, "the cancelled task got chunks after the cancel");
     assert_eq!(got[1], expected[1][..2], "t1 before the cancel");
     for i in [0, 2, 3] {

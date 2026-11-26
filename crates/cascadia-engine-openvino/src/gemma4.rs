@@ -19,7 +19,9 @@
 //! use it as their `position_ids` base and reset own KV when it is 0 — correct
 //! for any prompt length), then the hidden activation (f32, matching the IR's
 //! f32 ports; PLI rides inside it), then a self-describing cross-KV header
-//! (count + per-frame tags) and that many cross-stage shared-KV frames.
+//! (sequence id, count, per-frame tag and start row) and that many cross-stage
+//! shared-KV frames. A frame carries rows `[start, ctx)`: the first frame of a
+//! head task starts at 0, later ones only the rows the step added.
 //!
 //! Gemma 4 E2B/E4B reuse a few source layers' KV across later layers; when a
 //! shared layer's source sits in an earlier stage, that KV crosses the wire as
@@ -46,7 +48,7 @@ use cascadia_types::{
 use futures::stream;
 use serde::Deserialize;
 use tokenizers::Tokenizer;
-use tracing::{debug, info, warn};
+use tracing::{debug, error, info, warn};
 
 use crate::warn_limit::{StepWarn, StepWarnLimiter};
 
@@ -72,6 +74,21 @@ struct PipelineConfig {
 fn hidden_frame_bytes_per_token(cfg: &PipelineConfig, layer_end: u32) -> usize {
     let tail = cfg.pli_dim as usize * cfg.num_layers.saturating_sub(layer_end) as usize;
     (cfg.hidden_size as usize + tail) * std::mem::size_of::<f32>()
+}
+
+/// The prompt bound for a stage that sends hidden frames downstream. A prefill sends one frame per
+/// `chunk` tokens, so when a full span fits `MAX_TENSOR_BYTES` only the model window applies.
+/// Otherwise (one pass is `usize::MAX`) the whole-prompt frame bound applies.
+fn hidden_frame_prompt_window(
+    window: Option<u32>,
+    frame_bytes_per_token: usize,
+    chunk: usize,
+) -> Option<u32> {
+    if chunk.saturating_mul(frame_bytes_per_token) <= cascadia_transport::MAX_TENSOR_BYTES {
+        window
+    } else {
+        crate::forwarded_prompt_window(window, frame_bytes_per_token)
+    }
 }
 
 fn default_true() -> bool {
@@ -120,6 +137,9 @@ struct StageConfig {
     /// pre-v1.1 exports, which let those layers attend to the whole prefix.
     #[serde(default)]
     sliding_window: Option<u32>,
+    /// KV heads of the model's (sliding) layers, as exported.
+    #[serde(default)]
+    num_kv_heads: Option<u32>,
 }
 
 /// One entry of `external_shared_sources` in stage_config.json. Only the global
@@ -128,6 +148,12 @@ struct StageConfig {
 struct ExternalSrc {
     #[serde(default)]
     src_global_layer: u32,
+    /// The source layer's attention type and head width, as exported; they fix
+    /// the `[kvh, *, hd]` shape a frame for this source may have.
+    #[serde(default)]
+    layer_type: Option<String>,
+    #[serde(default)]
+    head_dim: Option<u32>,
 }
 
 fn read_pipeline_config(p: &Path) -> Result<PipelineConfig, EngineError> {
@@ -327,25 +353,37 @@ fn pack_cross_kv_frame(
     Ok(WireTensor::new(WireDType::F32, ws, bytes))
 }
 
-/// Encode the cross-KV header: an I64 frame whose first element is the number
-/// of cross_kv frames that follow, then that many per-frame TAGS (in send
-/// order). Each tag identifies the source layer + key/value role of the frame
-/// (`src_global_layer * 2 + is_value`), so the consumer reads exactly the right
-/// number of frames (desync-proof) and matches each to its `external_kv.*`
-/// input by tag (order- and stage-count-independent). Always sent — a header of
-/// `[0]` means no cross-stage KV (single-stage / dense shards).
-fn encode_cross_kv_header(tags: &[i64]) -> WireTensor {
-    let mut vals = Vec::with_capacity(1 + tags.len());
-    vals.push(tags.len() as i64);
-    vals.extend_from_slice(tags);
+/// First element of every cross-KV header. Marks the sequence/start-row layout,
+/// so a peer on the older tags-only layout fails the header check instead of
+/// having its frames read as deltas.
+const CROSS_KV_HEADER_MAGIC: i64 = 0x4B56_4432; // "KVD2"
+
+/// Encode the cross-KV header: an I64 frame
+/// `[MAGIC, seq, count, (tag, start) * count]`. `seq` names the sequence (one
+/// head task) the frames belong to. The tag identifies the frame's source layer
+/// and key/value role (`src_global_layer * 2 + is_value`), so the consumer reads
+/// exactly the right number of frames (desync-proof) and matches each to its
+/// `external_kv.*` input by tag (order- and stage-count-independent). `start` is
+/// the first context row the frame carries: 0 replaces the consumer's copy,
+/// anything else appends to it. Always sent — a count of 0 means no cross-stage
+/// KV (single-stage / dense shards).
+fn encode_cross_kv_header(seq: u64, entries: &[(i64, i64)]) -> WireTensor {
+    let mut vals = Vec::with_capacity(3 + entries.len() * 2);
+    vals.push(CROSS_KV_HEADER_MAGIC);
+    vals.push(seq as i64);
+    vals.push(entries.len() as i64);
+    for (tag, start) in entries {
+        vals.push(*tag);
+        vals.push(*start);
+    }
     let n = vals.len() as u32;
     WireTensor::new(WireDType::I64, [1, 1, n], i64_to_bytes(&vals))
 }
 
 /// Decode + validate the cross-KV header (see [`encode_cross_kv_header`]).
-/// Returns the per-frame tags for the frames that follow.
-fn decode_cross_kv_header(t: &WireTensor) -> EngineResult<Vec<i64>> {
-    if t.dtype != WireDType::I64 || t.data.is_empty() || !t.data.len().is_multiple_of(8) {
+/// Returns the sequence id and `(tag, start)` for each frame that follows.
+fn decode_cross_kv_header(t: &WireTensor) -> EngineResult<(u64, Vec<(i64, i64)>)> {
+    if t.dtype != WireDType::I64 || t.data.len() < 24 || !t.data.len().is_multiple_of(8) {
         return Err(EngineError::Backend(format!(
             "expected an I64 cross-KV header frame, got dtype={:?} len={} — likely a \
              desynced activation stream",
@@ -358,14 +396,394 @@ fn decode_cross_kv_header(t: &WireTensor) -> EngineResult<Vec<i64>> {
         .chunks_exact(8)
         .map(|c| i64::from_le_bytes(c.try_into().unwrap()))
         .collect();
-    let count = vals[0];
-    if count < 0 || count as usize != vals.len() - 1 {
+    if vals[0] != CROSS_KV_HEADER_MAGIC {
         return Err(EngineError::Backend(format!(
-            "cross-KV header declares {count} frames but carries {} tags",
-            vals.len() - 1
+            "cross-KV header starts with {} instead of the start-row marker — the upstream \
+             stage runs a different engine build",
+            vals[0]
         )));
     }
-    Ok(vals[1..].to_vec())
+    let count = vals[2];
+    if count < 0 || (count as usize) * 2 != vals.len() - 3 {
+        return Err(EngineError::Backend(format!(
+            "cross-KV header declares {count} frames but carries {} values",
+            vals.len() - 3
+        )));
+    }
+    let entries = vals[3..].chunks_exact(2).map(|p| (p[0], p[1])).collect();
+    Ok((vals[1] as u64, entries))
+}
+
+/// A fresh id for one head task's shared-KV sequence. Random per process, so a
+/// stream from another head (or an earlier run) cannot pass for this one.
+fn new_sequence_id() -> u64 {
+    use std::hash::{BuildHasher, Hasher};
+    static N: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let mut h = std::collections::hash_map::RandomState::new().build_hasher();
+    h.write_u64(N.fetch_add(1, std::sync::atomic::Ordering::Relaxed));
+    h.finish()
+}
+
+/// True when the stage's KV state is stored as f32, i.e. a row read back from
+/// state equals the row the step computed. A compressed KV cache
+/// (KV_CACHE_PRECISION u8/f16/…) rounds it on store, so the rows a delta
+/// assumes the consumer holds would differ from what the full send fed. The
+/// CLI knob is applied first and raw OV properties after, so the last match wins.
+fn kv_state_is_f32(kv_cache_precision: Option<&str>, ov_properties: &[(String, String)]) -> bool {
+    ov_properties
+        .iter()
+        .rev()
+        .find(|(k, _)| k.eq_ignore_ascii_case("KV_CACHE_PRECISION"))
+        .map(|(_, v)| v.as_str())
+        .or(kv_cache_precision)
+        .is_none_or(|v| v.trim().eq_ignore_ascii_case("f32"))
+}
+
+/// Rows `[from, to)` of a `[kvh, ctx, hd]` f32 tensor, kept per head.
+fn kv_rows(bytes: &[u8], kvh: usize, ctx: usize, hd: usize, from: usize, to: usize) -> Vec<u8> {
+    if from == 0 && to == ctx {
+        return bytes.to_vec();
+    }
+    let row = hd * 4;
+    let mut out = Vec::with_capacity(kvh * (to - from) * row);
+    for h in 0..kvh {
+        let base = h * ctx * row;
+        out.extend_from_slice(&bytes[base + from * row..base + to * row]);
+    }
+    out
+}
+
+/// What a producer sent of one tag in the current sequence: the context length,
+/// and the rows its last step computed (`[fresh_from, len)`).
+struct SentKv {
+    len: usize,
+    fresh_from: usize,
+    fresh: Vec<u8>,
+}
+
+/// Producer half of the shared-KV link: decides, per tag and step, whether the
+/// consumer can be sent just the new rows.
+struct CrossKvSender {
+    /// False when the KV state may be stored lossy (see [`kv_state_is_f32`]):
+    /// every frame is then a full one, as before deltas existed.
+    deltas: bool,
+    seq: u64,
+    sent: std::collections::HashMap<i64, SentKv>,
+}
+
+impl CrossKvSender {
+    fn new(deltas: bool) -> Self {
+        Self {
+            deltas,
+            seq: 0,
+            sent: std::collections::HashMap::new(),
+        }
+    }
+
+    /// The frame for one shared-KV output and its start row. Rows only grow
+    /// (the exporter's `cross_kv` is `cat(past, new)` along ctx; sliding layers
+    /// bound attention by mask, not by trimming the cache), so a step that
+    /// extends exactly what this sequence sent last time ships only its new
+    /// rows. Everything else sends the whole tensor from row 0: a new `seq`
+    /// (new task, restore), a tensor that did not grow by `tokens` (a windowed
+    /// cache), or last step's rows reading back different (lossy state).
+    #[allow(clippy::too_many_arguments)]
+    fn frame(
+        &mut self,
+        seq: u64,
+        tag: i64,
+        position: i64,
+        tokens: usize,
+        dt: ShimDType,
+        shape4: &[usize],
+        bytes: Vec<u8>,
+    ) -> EngineResult<(i64, WireTensor)> {
+        if seq != self.seq {
+            self.seq = seq;
+            self.sent.clear();
+        }
+        let full = pack_cross_kv_frame(dt, shape4, bytes)?;
+        let [kvh, ctx, hd] = full.shape.map(|d| d as usize);
+        let start = match (self.deltas, self.sent.get(&tag), usize::try_from(position)) {
+            (true, Some(s), Ok(p))
+                if s.len > 0
+                    && s.len == p
+                    && ctx == p + tokens
+                    && kv_rows(&full.data, kvh, ctx, hd, s.fresh_from, s.len) == s.fresh =>
+            {
+                p
+            }
+            _ => 0,
+        };
+        let fresh_from = ctx.saturating_sub(tokens);
+        self.sent.insert(
+            tag,
+            SentKv {
+                len: ctx,
+                fresh_from,
+                fresh: kv_rows(&full.data, kvh, ctx, hd, fresh_from, ctx),
+            },
+        );
+        if start == 0 {
+            return Ok((0, full));
+        }
+        let rows = kv_rows(&full.data, kvh, ctx, hd, start, ctx);
+        let ws = [kvh as u32, (ctx - start) as u32, hd as u32];
+        Ok((start as i64, WireTensor::new(WireDType::F32, ws, rows)))
+    }
+}
+
+/// One accumulated shared-KV tensor, `[kvh, ctx, hd]` f32, contiguous, and the
+/// sequence it belongs to.
+struct KvTensor {
+    seq: u64,
+    kvh: usize,
+    ctx: usize,
+    hd: usize,
+    data: Vec<u8>,
+}
+
+/// Context cap for held shared KV when the tree's config states no
+/// `max_position_embeddings`: the longest Gemma 4 window (262,144 on 31B), so a
+/// missing config never rejects a real context.
+const SHARED_KV_MAX_CTX_FALLBACK: usize = 262_144;
+
+/// The model's text config, from the copy the exporter puts next to the
+/// tokenizer (`text_config` when nested), or the pipeline dir's own config.json.
+fn read_text_config(pipeline_dir: &Path) -> Option<serde_json::Value> {
+    ["tokenizer/config.json", "config.json"]
+        .iter()
+        .find_map(|f| {
+            let mut v: serde_json::Value =
+                serde_json::from_slice(&std::fs::read(pipeline_dir.join(f)).ok()?).ok()?;
+            Some(match v.get_mut("text_config") {
+                Some(t) => t.take(),
+                None => v,
+            })
+        })
+}
+
+/// A positive integer field of a config object.
+fn cfg_usize(cfg: &serde_json::Value, key: &str) -> Option<usize> {
+    cfg.get(key)?
+        .as_u64()
+        .filter(|&m| m > 0)
+        .and_then(|m| usize::try_from(m).ok())
+}
+
+/// `max_position_embeddings` from the model's text config.
+fn read_max_ctx(pipeline_dir: &Path) -> Option<usize> {
+    cfg_usize(&read_text_config(pipeline_dir)?, "max_position_embeddings")
+}
+
+/// The `(kvh, hd)` each consumed source's frames must have, in
+/// `external_shared_sources` order — the same rule the exporter sizes the
+/// `external_kv.*` ports by: full-attention layers use the global head count and
+/// width where the model has them. A source whose shape cannot be worked out is
+/// a load error, since the consumer could not bound what it holds.
+fn external_kv_dims(
+    stage: &StageConfig,
+    text: Option<&serde_json::Value>,
+) -> EngineResult<Vec<(usize, usize)>> {
+    stage
+        .external_shared_sources
+        .iter()
+        .map(|e| {
+            let src = e.src_global_layer;
+            let layer_type = e.layer_type.clone().or_else(|| {
+                text?
+                    .get("layer_types")?
+                    .get(src as usize)?
+                    .as_str()
+                    .map(str::to_string)
+            });
+            let full = layer_type.as_deref() == Some("full_attention");
+            let local_kvh = text
+                .and_then(|t| cfg_usize(t, "num_key_value_heads"))
+                .or(stage.num_kv_heads.map(|k| k as usize));
+            let kvh = if full {
+                text.and_then(|t| cfg_usize(t, "num_global_key_value_heads"))
+                    .or(local_kvh)
+            } else {
+                local_kvh
+            };
+            let local_hd = text.and_then(|t| cfg_usize(t, "head_dim"));
+            let hd = e.head_dim.map(|h| h as usize).or(if full {
+                text.and_then(|t| cfg_usize(t, "global_head_dim"))
+                    .or(local_hd)
+            } else {
+                local_hd
+            });
+            match (layer_type, kvh, hd) {
+                (Some(_), Some(kvh), Some(hd)) => Ok((kvh, hd)),
+                _ => Err(EngineError::ShardRejected(format!(
+                    "cannot tell the shape of cross-stage KV from source layer {src}: \
+                     stage_config.json and the model config give no layer type, KV head count \
+                     or head width for it"
+                ))),
+            }
+        })
+        .collect()
+}
+
+/// Bytes of a `[kvh, ctx, hd]` f32 tensor, or None if that overflows.
+fn kv_bytes(kvh: usize, ctx: usize, hd: usize) -> Option<usize> {
+    kvh.checked_mul(ctx)?.checked_mul(hd)?.checked_mul(4)
+}
+
+/// The shared KV a consumer stage has received this task, per wire tag. Fed
+/// whole to the `external_kv.*` inputs each step; frames replace (start 0) or
+/// append to it.
+struct SharedKvBuf {
+    /// Most context rows a held tensor may reach: the model's window. Each
+    /// frame is bounded by the transport, but appends are not, so a peer (or a
+    /// bug) could otherwise grow a tensor without limit.
+    max_ctx: usize,
+    /// `(kvh, hd)` each consumed tag's frames must have. With `max_ctx` this
+    /// bounds a held tensor at `kvh * max_ctx * hd * 4` bytes.
+    expected: std::collections::HashMap<i64, (usize, usize)>,
+    tensors: std::collections::HashMap<i64, KvTensor>,
+}
+
+impl SharedKvBuf {
+    fn new(max_ctx: usize, expected: std::collections::HashMap<i64, (usize, usize)>) -> Self {
+        Self {
+            max_ctx,
+            expected,
+            tensors: std::collections::HashMap::new(),
+        }
+    }
+
+    fn clear(&mut self) {
+        self.tensors.clear();
+    }
+
+    /// Apply one frame (`shape` = `[kvh, rows, hd]`) of sequence `seq` at
+    /// `position`. An append must continue the same sequence at exactly the
+    /// held length, which is also the step's position, with the same heads and
+    /// width; anything else is an error and leaves the held tensor untouched —
+    /// the two ends disagree on what was sent, and feeding either would be garbage.
+    fn apply(
+        &mut self,
+        seq: u64,
+        position: i64,
+        tag: i64,
+        start: i64,
+        shape: [u32; 3],
+        data: Vec<u8>,
+    ) -> EngineResult<()> {
+        let [kvh, n, hd] = shape.map(|d| d as usize);
+        if self.expected.get(&tag) != Some(&(kvh, hd)) {
+            return Err(EngineError::Backend(format!(
+                "cross-KV frame (tag {tag}) has shape {shape:?}, but this stage's input for it \
+                 takes [kvh, hd] = {:?}",
+                self.expected.get(&tag)
+            )));
+        }
+        if kv_bytes(kvh, n, hd) != Some(data.len()) {
+            return Err(EngineError::Backend(format!(
+                "cross-KV frame (tag {tag}) carries {} bytes for shape {shape:?}",
+                data.len()
+            )));
+        }
+        if start == 0 {
+            if n > self.max_ctx {
+                return Err(EngineError::Backend(format!(
+                    "cross-KV frame (tag {tag}) carries {n} context rows, past the model's \
+                     window of {}",
+                    self.max_ctx
+                )));
+            }
+            self.tensors.insert(
+                tag,
+                KvTensor {
+                    seq,
+                    kvh,
+                    ctx: n,
+                    hd,
+                    data,
+                },
+            );
+            return Ok(());
+        }
+        let held = self.tensors.get_mut(&tag);
+        let Some(t) = held.filter(|t| {
+            start == position && t.seq == seq && t.ctx as i64 == start && t.kvh == kvh && t.hd == hd
+        }) else {
+            let have = self
+                .tensors
+                .get(&tag)
+                .map(|t| format!("seq {:x} [{}, {}, {}]", t.seq, t.kvh, t.ctx, t.hd));
+            return Err(EngineError::Backend(format!(
+                "cross-KV frame (tag {tag}, seq {seq:x}, position {position}) appends at row \
+                 {start} with shape {shape:?}, but this stage holds {} — the stages disagree on \
+                 the shared KV sent so far",
+                have.as_deref().unwrap_or("nothing")
+            )));
+        };
+        // Grow in place: move each head's rows to its new stride, last head
+        // first so no source is overwritten before it moves, then fill the gap.
+        // reserve_exact keeps the buffer at its real size instead of doubling.
+        let row = hd * 4;
+        let old = t.ctx;
+        let grown = old
+            .checked_add(n)
+            .filter(|&c| c <= self.max_ctx)
+            .and_then(|c| Some((c, kv_bytes(kvh, c, hd)?)));
+        let Some((new, bytes)) = grown else {
+            return Err(EngineError::Backend(format!(
+                "cross-KV frame (tag {tag}) would grow the shared KV from {old} to {old} + {n} \
+                 context rows, past the model's window of {}",
+                self.max_ctx
+            )));
+        };
+        t.data.reserve_exact(bytes - t.data.len());
+        t.data.resize(bytes, 0);
+        for h in (0..kvh).rev() {
+            t.data
+                .copy_within(h * old * row..(h + 1) * old * row, h * new * row);
+            t.data[h * new * row + old * row..(h + 1) * new * row]
+                .copy_from_slice(&data[h * n * row..(h + 1) * n * row]);
+        }
+        t.ctx = new;
+        Ok(())
+    }
+
+    /// The full `[1, kvh, ctx, hd]` tensor held for `tag`.
+    fn get(&self, tag: i64) -> Option<([usize; 4], &[u8])> {
+        self.tensors
+            .get(&tag)
+            .map(|t| ([1, t.kvh, t.ctx, t.hd], t.data.as_slice()))
+    }
+}
+
+/// Apply one step's cross-KV frames to `buf`. Every step must carry a frame
+/// for each consumed tag, once: the buffer outlives the step, so a missing tag
+/// would otherwise be fed last step's rows.
+fn ingest_cross_kv(
+    buf: &mut SharedKvBuf,
+    inputs: &[ExternalKvIn],
+    position: i64,
+    seq: u64,
+    entries: &[(i64, i64)],
+    frames: Vec<WireTensor>,
+) -> EngineResult<()> {
+    let mut seen = std::collections::HashSet::new();
+    for (&(tag, start), wt) in entries.iter().zip(frames) {
+        if !inputs.iter().any(|e| e.tag == tag) || !seen.insert(tag) {
+            return Err(EngineError::Backend(format!(
+                "cross-KV frame tag {tag} is not one this stage consumes, or repeats in one step"
+            )));
+        }
+        if wt.dtype != WireDType::F32 {
+            return Err(EngineError::Backend(format!(
+                "cross-KV frame (tag {tag}) has dtype {:?}, expected F32",
+                wt.dtype
+            )));
+        }
+        buf.apply(seq, position, tag, start, wt.shape, wt.data)?;
+    }
+    Ok(())
 }
 
 /// Parse a `cross_kv.{i}.key|value` / `external_kv.{i}.key|value` port name into
@@ -442,6 +860,9 @@ struct ActiveTask {
     /// resume ids, so counting the seed again keys the blob at a depth that
     /// never matches the fed sequence (same defect dist_spec fixed).
     resume_seed_len: usize,
+    /// Shared-KV sequence id this task's frames carry downstream. New per task,
+    /// so a warm task never appends to the previous task's rows.
+    kv_seq: u64,
     /// Issue-34: leading prompt tokens already warm in the OV state (RESTOREd). Prefill feeds only
     /// `prompt_ids[warm_prefix..]`. 0 ⇒ cold (default path unchanged).
     warm_prefix: usize,
@@ -468,23 +889,46 @@ fn prefill_span_end(i: usize, chunk: usize, seed_split: usize) -> usize {
     }
 }
 
-/// Effective prefill span. Default `usize::MAX` = the whole span in ONE pass (unchanged, fastest).
+/// Prefill span per chain pass; bounds the last stage's transient `[1, T, vocab]` logits buffer
+/// (~1.07 GB f32 at 1,024 with the 262144 vocab, vs ~8.4 GB for an 8,000-token single pass) and each
+/// span's wire frame.
+///
+/// Each span sends only the shared-KV rows it adds (see [`CrossKvSender::frame`]), so the span count
+/// no longer multiplies the wire cost. Before that, every span (and every decode token) re-sent the
+/// whole shared KV: on a link of about 3.5 MB/s an 8,000-token prompt took ~180 s in one pass, ~380 s
+/// at 256 and ~215 s at 1,024.
+const PREFILL_CHUNK: usize = 1024;
+
+/// Effective prefill span. Default = `PREFILL_CHUNK`.
 ///
 /// `CASCADIA_GEMMA4_FORCE_T1_PREFILL=1` ⇒ 1: fold EVERY token through the same T=1 path. A warm-resumed
 /// SUFFIX prefill (e.g. 22 tokens at position 71) and a cold FULL prefill (93 tokens at 0) otherwise hit
 /// different GEMM batch shapes; over int4 weights the rounding delta flips a token, so cross-chain
 /// warm != cold byte-identical. Under T=1 both traverse the identical per-token kernel ⇒ bit-identical.
-/// Opt-in only — production keeps the single-pass prefill (warm-resume stays greedy-equivalent there,
-/// not bit-identical). Mirrors `qwen36::prefill_chunk`.
+/// Opt-in only — production keeps batched spans (warm-resume stays greedy-equivalent there, not
+/// bit-identical). Mirrors `qwen36::prefill_chunk`.
+///
+/// `CASCADIA_GEMMA4_PREFILL_CHUNK=n` overrides the span (`0` = whole prompt in one pass); test-only,
+/// so a hardware check can still send an oversized single frame. FORCE_T1 wins over it.
 fn prefill_chunk() -> usize {
-    if std::env::var("CASCADIA_GEMMA4_FORCE_T1_PREFILL")
-        .ok()
-        .as_deref()
-        == Some("1")
-    {
-        1
-    } else {
-        usize::MAX
+    prefill_chunk_from(
+        std::env::var("CASCADIA_GEMMA4_FORCE_T1_PREFILL")
+            .ok()
+            .as_deref(),
+        std::env::var("CASCADIA_GEMMA4_PREFILL_CHUNK")
+            .ok()
+            .as_deref(),
+    )
+}
+
+fn prefill_chunk_from(force_t1: Option<&str>, chunk: Option<&str>) -> usize {
+    if force_t1 == Some("1") {
+        return 1;
+    }
+    match chunk.and_then(|v| v.trim().parse::<usize>().ok()) {
+        Some(0) => usize::MAX,
+        Some(n) => n,
+        None => PREFILL_CHUNK,
     }
 }
 
@@ -566,10 +1010,18 @@ pub struct Gemma4Engine {
     /// port + the wire tag it must be fed from. Matched against the tagged
     /// frames received from upstream each step.
     external_kv_in: Vec<ExternalKvIn>,
-    /// Cross-stage KV received from upstream this step, keyed by wire tag, ready
-    /// to feed into the `external_kv.*` inputs. Rebuilt each step.
-    pending_external_kv: std::collections::HashMap<i64, (Vec<usize>, Vec<u8>)>,
+    /// Cross-stage KV received from upstream this task, keyed by wire tag, fed
+    /// whole into the `external_kv.*` inputs each step.
+    external_kv: SharedKvBuf,
+    /// What this stage sent downstream of each `cross_kv.*` tag, per sequence.
+    cross_kv_tx: CrossKvSender,
     step_warn: StepWarnLimiter,
+    /// Control acks the downstream link still owes: each CAPTURE/RESTORE/ABORT ack wait that
+    /// timed out leaves one ack in flight. See `recv_reply_after_late_acks`.
+    control_acks_owed: std::sync::atomic::AtomicU32,
+    /// Set when the head's downstream link is closed for good (see `fail_if_downstream_closed`).
+    /// Handed out by `failure()`, so the server exits for a supervisor restart.
+    failure: cascadia_engine::EngineFailure,
     /// Issue-34 Option C: opaque KV blob cache for the coordination plane.
     #[cfg(feature = "kv_coord")]
     kv: crate::kv_coordination::OvKvCache,
@@ -650,7 +1102,7 @@ impl Gemma4Engine {
     }
 
     /// Feed cross-stage shared KV (`external_kv.{i}.{key,value}` inputs) from
-    /// the frames received from upstream this step, matched by wire TAG (source
+    /// the tensors accumulated from upstream this task, matched by wire TAG (source
     /// layer + key/value role) rather than by position — so pairing is correct
     /// regardless of port ordering, and a missing source is a clear error, not
     /// silent wrong-KV. No-op for stages with no external sources (single-stage
@@ -659,12 +1111,8 @@ impl Gemma4Engine {
         if self.external_kv_in.is_empty() {
             return Ok(());
         }
-        // Move pending + clone the (small) input list to release the &self
-        // borrows before the &mut self.runtime calls.
-        let pending = std::mem::take(&mut self.pending_external_kv);
-        let inputs = self.external_kv_in.clone();
-        for ext in &inputs {
-            let (shape, bytes) = pending.get(&ext.tag).ok_or_else(|| {
+        for ext in &self.external_kv_in {
+            let (shape, bytes) = self.external_kv.get(ext.tag).ok_or_else(|| {
                 EngineError::Backend(format!(
                     "external_kv input {} needs cross-stage KV (tag {}) but no matching frame \
                      arrived from upstream — the immediate upstream stage does not produce it. \
@@ -674,7 +1122,7 @@ impl Gemma4Engine {
                 ))
             })?;
             self.runtime
-                .set_input(&ext.name, ShimDType::F32, shape, bytes)
+                .set_input(&ext.name, ShimDType::F32, &shape, bytes)
                 .map_err(map_ov_err)?;
         }
         Ok(())
@@ -703,6 +1151,14 @@ impl Gemma4Engine {
         Ok((bytes_to_f32(dtype, &bytes)?, out_shape))
     }
 
+    /// Head only: after a failed exchange, a closed downstream link fails the engine with `cause`.
+    fn check_downstream_link(&self, cause: &dyn std::fmt::Display) {
+        if let Some(downstream) = &self.downstream {
+            let link = self.block_on(downstream.lock());
+            fail_if_downstream_closed(&self.failure, &link, cause);
+        }
+    }
+
     fn block_on<F: std::future::Future>(&self, f: F) -> F::Output {
         // The runner's ChunkStream::poll_next is itself an async fn —
         // calling block_on inside an async context panics with "Cannot
@@ -718,6 +1174,7 @@ impl Gemma4Engine {
         hidden: &[f32],
         shape: [usize; 3],
         position: i64,
+        seq: u64,
     ) -> EngineResult<()> {
         let downstream = self
             .downstream
@@ -741,12 +1198,13 @@ impl Gemma4Engine {
         // `external_kv.*` inputs. Read each from the just-completed inference,
         // pack the rank-4 [1,kvh,ctx,hd] tensor into a rank-3 wire frame
         // [kvh,ctx,hd] (batch is always 1; transport caps rank at MAX_RANK=3),
-        // and tag it by source so the consumer pairs explicitly. A self-
-        // describing header (count + tags) precedes the frames so the consumer
-        // reads exactly the right number — desync-proof. Empty header [0] for
-        // single-stage / dense shards.
+        // and tag it by source so the consumer pairs explicitly. Only the rows
+        // this step added go out once the consumer holds the rest (see
+        // `CrossKvSender::frame`). A self-describing header (seq, count, tag/start
+        // per frame) precedes the frames so the consumer reads exactly the right
+        // number — desync-proof. Count 0 for single-stage / dense shards.
         let outs = self.cross_kv_out.clone();
-        let mut tags = Vec::with_capacity(outs.len());
+        let mut entries = Vec::with_capacity(outs.len());
         let mut cross_frames = Vec::with_capacity(outs.len());
         for o in &outs {
             let (dt, oshape, bytes) = self.runtime.output(o.out_idx).map_err(map_ov_err)?;
@@ -767,10 +1225,13 @@ impl Gemma4Engine {
                     "gemma4_cross_kv_prefill_ctx"
                 );
             }
-            cross_frames.push(pack_cross_kv_frame(dt, &oshape, bytes)?);
-            tags.push(o.tag);
+            let (start, frame) = self
+                .cross_kv_tx
+                .frame(seq, o.tag, position, shape[1], dt, &oshape, bytes)?;
+            cross_frames.push(frame);
+            entries.push((o.tag, start));
         }
-        let header = encode_cross_kv_header(&tags);
+        let header = encode_cross_kv_header(seq, &entries);
         self.block_on(async move {
             let mut guard = downstream.lock().await;
             guard.send(&pos).await?;
@@ -790,44 +1251,27 @@ impl Gemma4Engine {
             .downstream
             .clone()
             .ok_or_else(|| EngineError::Backend("no downstream".into()))?;
-        let (tensor, _) = self
-            .block_on(async move {
-                let mut guard = downstream.lock().await;
-                // MID-TASK reply — deadlined; see `recv_tensor_reply` (Item 5).
-                // A prefill reply waits on every remaining stage's
-                // whole-prompt compute — widened budget (see
-                // `recv_tensor_reply_prefill`), CEILINGED here: the transport
-                // budget multiplies the operator's frame-transfer knob
-                // (recv_timeout × 10 — the rig's 600 s made it 6000 s), and the
-                // waiting head holds its admission slot the whole time, so one
-                // dead downstream turned the node into a refuse-everything wall
-                // for 100 minutes (2026-08-17 incident). ov-runtime ceilings
-                // the same coupling at TOKEN_RECV_DEADLINE_CEILING. Measured
-                // legit worst here: 51 s (4.2k tokens, 2-stage); the ceiling
-                // leaves ~6x headroom for deeper pipelines / longer prompts.
-                if prefill {
-                    recv_prefill_reply_ceilinged(&mut guard).await
-                } else {
-                    guard.recv_reply().await
-                }
-            })
-            .map_err(|e| EngineError::Backend(e.to_string()))?;
-        if tensor.data.len() < 4 {
-            return Err(EngineError::Backend(format!(
-                "downstream sent {}-byte token tensor; need at least 4",
-                tensor.data.len()
-            )));
-        }
-        let token = i32::from_le_bytes([
-            tensor.data[0],
-            tensor.data[1],
-            tensor.data[2],
-            tensor.data[3],
-        ]);
-        Ok(token)
+        let owed = &self.control_acks_owed;
+        self.block_on(async move {
+            let mut guard = downstream.lock().await;
+            // MID-TASK reply — deadlined; see `recv_tensor_reply` (Item 5).
+            // A prefill reply waits on every remaining stage's
+            // whole-prompt compute — widened budget (see
+            // `recv_tensor_reply_prefill`), CEILINGED here: the transport
+            // budget multiplies the operator's frame-transfer knob
+            // (recv_timeout × 10 — the rig's 600 s made it 6000 s), and the
+            // waiting head holds its admission slot the whole time, so one
+            // dead downstream turned the node into a refuse-everything wall
+            // for 100 minutes (2026-08-17 incident). ov-runtime ceilings
+            // the same coupling at TOKEN_RECV_DEADLINE_CEILING. Measured
+            // legit worst here: 51 s (4.2k tokens, 2-stage); the ceiling
+            // leaves ~6x headroom for deeper pipelines / longer prompts.
+            recv_reply_after_late_acks(&mut guard, prefill, owed).await
+        })
+        .map_err(downstream_recv_error)
     }
 
-    fn recv_hidden_from_upstream(&mut self) -> EngineResult<(Vec<f32>, [usize; 3], i64)> {
+    fn recv_hidden_from_upstream(&mut self) -> EngineResult<(Vec<f32>, [usize; 3], i64, u64)> {
         // Wire order per step: position frame, hidden frame, cross-KV header, then `count` cross-KV
         // frames. The position read transparently absorbs any I8 control frame (CAPTURE/RESTORE)
         // that arrives between turns (stateful workers only).
@@ -852,8 +1296,8 @@ impl Gemma4Engine {
         // Decode + strictly validate the position + header outside the transport
         // closure (so a bad frame is a clear EngineError, not a silent desync).
         let position = decode_wire_position(&pos_t)?;
-        let tags = decode_cross_kv_header(&header_t)?;
-        let n = tags.len();
+        let (seq, entries) = decode_cross_kv_header(&header_t)?;
+        let n = entries.len();
         // Strict frame-count guard (restores the old count-based check) AND the
         // distributed-deploy runtime backstop for the load-time adjacency guard
         // (which is skipped when the sibling stage_config isn't on local disk):
@@ -880,25 +1324,14 @@ impl Gemma4Engine {
                 Ok::<_, cascadia_transport::TransportError>(v)
             })
             .map_err(|e| EngineError::Backend(e.to_string()))?;
-        // Index each cross-KV frame by its tag (validating dtype), so
-        // feed_external_kv can match it to the right `external_kv.*` input.
-        self.pending_external_kv.clear();
-        for (tag, wt) in tags.iter().zip(ext_tensors.iter()) {
-            if wt.dtype != WireDType::F32 {
-                return Err(EngineError::Backend(format!(
-                    "cross-KV frame (tag {tag}) has dtype {:?}, expected F32",
-                    wt.dtype
-                )));
-            }
-            let s = &wt.shape;
-            self.pending_external_kv.insert(
-                *tag,
-                (
-                    vec![1usize, s[0] as usize, s[1] as usize, s[2] as usize],
-                    wt.data.clone(),
-                ),
-            );
-        }
+        ingest_cross_kv(
+            &mut self.external_kv,
+            &self.external_kv_in,
+            position,
+            seq,
+            &entries,
+            ext_tensors,
+        )?;
         let shape = [
             hid_t.shape[0] as usize,
             hid_t.shape[1] as usize,
@@ -917,7 +1350,7 @@ impl Gemma4Engine {
                 )))
             }
         };
-        Ok((floats, shape, position))
+        Ok((floats, shape, position, seq))
     }
 
     /// Read one frame from upstream, transparently handling any I8 control frame (CAPTURE/RESTORE/
@@ -964,6 +1397,9 @@ impl Gemma4Engine {
     fn step_first(&mut self) -> EngineResult<Vec<(TaskId, Chunk)>> {
         if self.active.is_none() && !self.pending.is_empty() {
             let task = self.pending.remove(0);
+            if let Some(refusal) = head_failed_refusal(&self.failure, &task.task_id) {
+                return Ok(refusal);
+            }
             let tok = self
                 .tokenizer
                 .clone()
@@ -1051,7 +1487,10 @@ impl Gemma4Engine {
                             let epoch = crate::kv_coordination::synth_epoch(&prompt_i32[..len]);
                             match self.send_restore_downstream(epoch) {
                                 Ok(true) => true,
-                                _ => {
+                                r => {
+                                    if let Err(e) = r {
+                                        self.check_downstream_link(&format!("RESTORE: {e}"));
+                                    }
                                     let _ = self.send_abort_downstream();
                                     false
                                 }
@@ -1130,6 +1569,7 @@ impl Gemma4Engine {
                 last_token: 0,
                 warm_prefix,
                 resume_seed_len,
+                kv_seq: new_sequence_id(),
                 started: std::time::Instant::now(),
                 t_alpha_compute: std::time::Duration::ZERO,
                 t_wire: std::time::Duration::ZERO,
@@ -1154,6 +1594,7 @@ impl Gemma4Engine {
                 "step_first failed; clearing active + reset_state so next \
                  task starts fresh (downstream socket may still be dead)"
             );
+            self.check_downstream_link(&e);
             // Attribute to the failed task (if one was active) before we
             // null it, so the runner routes the failure to that task's
             // stream instead of ending whichever stream observes the Err.
@@ -1201,8 +1642,8 @@ impl Gemma4Engine {
         // multi-token inference; the IR keeps own KV internally. The absolute
         // start-position is sent downstream so relay stages align position_ids
         // and reset on 0.
-        // Issue-34: fold the prefill in `prefill_chunk()`-sized spans. Default = whole span (one pass,
-        // unchanged/fastest). CASCADIA_GEMMA4_FORCE_T1_PREFILL=1 ⇒ T=1, so a warm-resumed SUFFIX prefill
+        // Issue-34: fold the prefill in `prefill_chunk()`-sized spans. Default = PREFILL_CHUNK (1,024),
+        // bounding the last stage's logits buffer. CASCADIA_GEMMA4_FORCE_T1_PREFILL=1 ⇒ T=1, so a warm-resumed SUFFIX prefill
         // and a cold FULL prefill traverse the identical per-token kernel. Without it the two use
         // different GEMM batch shapes (e.g. 22 vs 93 tokens) over int4 weights, and the rounding delta
         // flips a token ⇒ cross-chain warm != cold. Mirrors qwen36's FORCE_T1_PREFILL.
@@ -1292,8 +1733,11 @@ impl Gemma4Engine {
             Ok((argmax_logits(out, shape)?, std::time::Duration::ZERO))
         } else {
             let s3 = to_shape3(shape);
+            let seq = self.active.as_ref().map(|a| a.kv_seq).ok_or_else(|| {
+                EngineError::Backend("downstream send with no active task".into())
+            })?;
             let ts = std::time::Instant::now();
-            self.send_hidden_downstream(out, s3, position)?;
+            self.send_hidden_downstream(out, s3, position, seq)?;
             let token = self.recv_token_from_downstream(prefill)?;
             Ok((token, ts.elapsed()))
         }
@@ -1420,6 +1864,7 @@ impl Gemma4Engine {
                             let epoch = crate::kv_coordination::synth_epoch(&full);
                             if let Err(e) = self.send_capture_downstream(epoch, &full, &tenant) {
                                 warn!(error = %e, "gemma4: CAPTURE broadcast failed (best-effort)");
+                                self.check_downstream_link(&format!("CAPTURE: {e}"));
                             }
                         }
                         // Mirror into the lock-free holder cache so a busy node can serve this turn's
@@ -1443,7 +1888,7 @@ impl Gemma4Engine {
         // The upstream stage carries the absolute start-position; use it
         // directly as the position_ids base and reset own KV when it is 0 (a
         // new sequence). Correct for any prompt length, including 1 token.
-        let (hidden, shape, position) = self.recv_hidden_from_upstream()?;
+        let (hidden, shape, position, _) = self.recv_hidden_from_upstream()?;
         if position == 0 {
             self.runtime.reset_state().map_err(map_ov_err)?;
         }
@@ -1454,7 +1899,8 @@ impl Gemma4Engine {
     }
 
     fn step_middle(&mut self) -> EngineResult<()> {
-        let (hidden, shape, position) = self.recv_hidden_from_upstream()?;
+        // A relay's own frames continue the head's sequence.
+        let (hidden, shape, position, seq) = self.recv_hidden_from_upstream()?;
         // Multi-token hidden = prefill: the token reply waits on every
         // remaining stage's whole-prompt compute — widened budget.
         let prefill_reply = shape[1] > 1;
@@ -1464,7 +1910,7 @@ impl Gemma4Engine {
         let (out, out_shape) = self.run_relay(&hidden, shape, position)?;
         let s3 = to_shape3(&out_shape);
         // Forward the SAME absolute position downstream so every stage aligns.
-        self.send_hidden_downstream(&out, s3, position)?;
+        self.send_hidden_downstream(&out, s3, position, seq)?;
         let token = self.recv_token_from_downstream(prefill_reply)?;
         self.send_token_to_upstream(token)?;
         Ok(())
@@ -1561,6 +2007,11 @@ impl Engine for Gemma4Engine {
         } else {
             self.step_middle().map(|_| Vec::new())
         };
+        if result.is_err() && !self.spec.is_first_stage {
+            // A failed relay step may have half-applied a frame; the next task
+            // starts from row 0 anyway, so drop the memory now.
+            self.external_kv.clear();
+        }
         // Keep main's rate-limited WARN (a persistently-failing step() must
         // not flood logs), but surface the Err to the caller — step_first
         // already cleared active + reset_state, so callers can now tell
@@ -1586,6 +2037,10 @@ impl Engine for Gemma4Engine {
             },
         }
         result
+    }
+
+    fn failure(&self) -> cascadia_engine::EngineFailure {
+        self.failure.clone()
     }
 
     #[cfg(feature = "kv_coord")]
@@ -1621,6 +2076,26 @@ const G_OPCODE_ABORT_ACK: u8 = 6;
 /// H.1b (R2): CAPTURE whose body also carries the turn's TENANT (`capture_body_bytes_v2`). Separate
 /// opcode, not a wider v1 body — the v1 codec enforces an exact length and hard-errors mid-chain on
 /// a mismatch. Emitted only for a non-empty tenant, so a chain that names none stays on v1.
+/// A reply too short to be a token is a control ack that arrived after its exchange gave up. This
+/// frame's real reply is still coming and would answer the next one, so the connection goes too.
+async fn token_from_reply(
+    g: &mut cascadia_transport::ActivationClient,
+    data: &[u8],
+) -> Result<i32, cascadia_transport::TransportError> {
+    let Some(token) = data.first_chunk::<4>() else {
+        g.close().await;
+        return Err(cascadia_transport::TransportError::Io(std::io::Error::new(
+            std::io::ErrorKind::ConnectionAborted,
+            format!(
+                "downstream reply of {} byte(s) is too short for a token; closed the link so \
+                 its real reply cannot answer the next request",
+                data.len()
+            ),
+        )));
+    };
+    Ok(i32::from_le_bytes(*token))
+}
+
 /// Ceiling on the widened prefill-reply wait (transport budget = recv_timeout × 10, which is
 /// operator-frame-knob-coupled, not compute-coupled). Measured legit worst: 51 s. See the call site.
 const G_PREFILL_REPLY_CEILING: std::time::Duration = std::time::Duration::from_secs(300);
@@ -1639,9 +2114,108 @@ async fn recv_prefill_reply_ceilinged(
 > {
     match tokio::time::timeout(G_PREFILL_REPLY_CEILING, g.recv_reply_prefill()).await {
         Ok(r) => r,
-        Err(_) => Err(cascadia_transport::TransportError::SocketClosed),
+        Err(_) => {
+            // Replies carry no sequence number: left open, the late one answers the next request.
+            g.close().await;
+            Err(cascadia_transport::TransportError::Io(std::io::Error::new(
+                std::io::ErrorKind::ConnectionAborted,
+                format!(
+                    "no reply within the {}s prefill reply ceiling; closed the link so a late \
+                     reply cannot answer the next request",
+                    G_PREFILL_REPLY_CEILING.as_secs()
+                ),
+            )))
+        }
     }
 }
+
+/// A token reply read on the downstream link. Replies come in request order, so a control ack
+/// whose wait timed out arrives ahead of this reply. Up to `owed` such acks are skipped, so a
+/// late ack costs neither the link nor the token. Any other frame goes to `token_from_reply`.
+async fn recv_reply_after_late_acks(
+    g: &mut cascadia_transport::ActivationClient,
+    prefill: bool,
+    owed: &std::sync::atomic::AtomicU32,
+) -> Result<i32, cascadia_transport::TransportError> {
+    use std::sync::atomic::Ordering::Relaxed;
+    loop {
+        let (tensor, _) = if prefill {
+            recv_prefill_reply_ceilinged(g).await
+        } else {
+            g.recv_reply().await
+        }?;
+        if owed.load(Relaxed) > 0 && is_control_ack(&tensor) {
+            owed.fetch_sub(1, Relaxed);
+            debug!("gemma4: skipped a late control ack ahead of a reply");
+            continue;
+        }
+        // An ack still owed behind this reply never comes: the downstream answers in order.
+        owed.store(0, Relaxed);
+        return token_from_reply(g, &tensor.data).await;
+    }
+}
+
+/// A token-reply recv error as `step_first` and `step_middle` get it. A link that this side closed
+/// (kind `ConnectionAborted`) stays a typed `Io` error, so `is_connection_fatal` reads its kind and a
+/// relay rank exits for a rebuild. Other errors keep their `Backend` text.
+fn downstream_recv_error(e: cascadia_transport::TransportError) -> EngineError {
+    match e {
+        cascadia_transport::TransportError::Io(io)
+            if io.kind() == std::io::ErrorKind::ConnectionAborted =>
+        {
+            EngineError::Io(io)
+        }
+        e => EngineError::Backend(e.to_string()),
+    }
+}
+
+/// A CAPTURE/RESTORE/ABORT ack: I8 (no reply frame is) with an ack opcode.
+#[cfg(feature = "kv_coord")]
+fn is_control_ack(t: &WireTensor) -> bool {
+    t.dtype == WireDType::I8
+        && matches!(
+            t.data.first(),
+            Some(&(G_OPCODE_CAPTURE_ACK | G_OPCODE_RESTORE_ACK | G_OPCODE_ABORT_ACK))
+        )
+}
+
+/// Without `kv_coord` the head sends no control frames, so no ack is ever owed.
+#[cfg(not(feature = "kv_coord"))]
+fn is_control_ack(_: &WireTensor) -> bool {
+    false
+}
+
+/// The head dials its downstream once, at connect, and nothing dials it again. So a failed
+/// exchange that closed the link fails the engine with its cause: the server exits, and its
+/// supervisor restarts the rank. Without this, every later request fails with `NotConnected`
+/// while the process stays up. The first reason is kept.
+fn fail_if_downstream_closed(
+    failure: &cascadia_engine::EngineFailure,
+    link: &ActivationClient,
+    cause: &dyn std::fmt::Display,
+) {
+    if link.is_connected() || failure.reason().is_some() {
+        return;
+    }
+    let why = format!("gemma4 head lost its downstream link: {cause}");
+    error!(reason = %why, "gemma4: engine failed; every later task is refused until a restart");
+    failure.set(why);
+}
+
+/// The refusal every task gets once the head has failed: at once, as a `backend error`.
+fn head_failed_refusal(
+    failure: &cascadia_engine::EngineFailure,
+    task_id: &TaskId,
+) -> Option<Vec<(TaskId, Chunk)>> {
+    let why = failure.reason()?;
+    warn!(task = %task_id, reason = %why, "gemma4: refusing task (engine failed)");
+    let reason = EngineError::Backend(format!("{why}; restart the server")).to_string();
+    Some(vec![(
+        task_id.clone(),
+        Chunk::error(task_id.clone(), reason),
+    )])
+}
+
 #[cfg(feature = "kv_coord")]
 /// Bound on a downstream CAPTURE/RESTORE/ABORT ack; mirrors ov-runtime's RESTORE_ACK_TIMEOUT.
 /// Every driver-side control exchange is bounded (qwen36 does the same via `reply_bounded`):
@@ -1655,10 +2229,17 @@ const G_CONTROL_ACK_TIMEOUT: std::time::Duration = std::time::Duration::from_sec
 #[cfg(feature = "kv_coord")]
 async fn recv_control_ack_bounded(
     g: &mut cascadia_transport::ActivationClient,
+    owed: &std::sync::atomic::AtomicU32,
 ) -> Result<WireTensor, cascadia_transport::TransportError> {
+    // Left open on purpose, unlike a token reply: capture is best-effort, and a peer that never
+    // acks must not cost the connection. The ack is counted as owed, and the next reply read
+    // skips it when it arrives late (`recv_reply_after_late_acks`).
     let (ack, _) = tokio::time::timeout(G_CONTROL_ACK_TIMEOUT, g.recv())
         .await
-        .map_err(|_| cascadia_transport::TransportError::SocketClosed)??;
+        .map_err(|_| {
+            owed.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            cascadia_transport::TransportError::SocketClosed
+        })??;
     Ok(ack)
 }
 const G_OPCODE_CAPTURE_V2: u8 = 7;
@@ -1690,6 +2271,7 @@ impl Gemma4Engine {
             ));
         }
         let t = WireTensor::new(WireDType::I8, [1, 1, data.len() as u32], data);
+        let owed = &self.control_acks_owed;
         let ack = self
             .block_on(async move {
                 let mut g = downstream.lock().await;
@@ -1697,7 +2279,7 @@ impl Gemma4Engine {
                 // Bounded, for the same reason ov-runtime bounds its CAPTURE ack: a peer on an
                 // older build that meets G_OPCODE_CAPTURE_V2 errors WITHOUT acking, and an
                 // unbounded wait here wedges this rank while it holds the downstream lock.
-                let ack = recv_control_ack_bounded(&mut g).await?;
+                let ack = recv_control_ack_bounded(&mut g, owed).await?;
                 Ok::<_, cascadia_transport::TransportError>(ack)
             })
             .map_err(|e| EngineError::Backend(e.to_string()))?;
@@ -1716,13 +2298,14 @@ impl Gemma4Engine {
         let mut data = vec![G_OPCODE_RESTORE];
         data.extend_from_slice(&epoch.to_le_bytes());
         let t = WireTensor::new(WireDType::I8, [1, 1, data.len() as u32], data);
+        let owed = &self.control_acks_owed;
         let ack = self
             .block_on(async move {
                 let mut g = downstream.lock().await;
                 g.send(&t).await?;
                 // Bounded like CAPTURE above: an unbounded wait on a dead peer
                 // wedges this rank while it holds the downstream lock.
-                let ack = recv_control_ack_bounded(&mut g).await?;
+                let ack = recv_control_ack_bounded(&mut g, owed).await?;
                 Ok::<_, cascadia_transport::TransportError>(ack)
             })
             .map_err(|e| EngineError::Backend(e.to_string()))?;
@@ -1739,12 +2322,13 @@ impl Gemma4Engine {
             .clone()
             .ok_or_else(|| EngineError::Backend("no downstream".into()))?;
         let t = WireTensor::new(WireDType::I8, [1, 1, 1], vec![G_OPCODE_ABORT]);
+        let owed = &self.control_acks_owed;
         self.block_on(async move {
             let mut g = downstream.lock().await;
             g.send(&t).await?;
             // Bounded like CAPTURE above: an unbounded wait on a dead peer
             // wedges this rank while it holds the downstream lock.
-            let _ = recv_control_ack_bounded(&mut g).await?;
+            let _ = recv_control_ack_bounded(&mut g, owed).await?;
             Ok::<_, cascadia_transport::TransportError>(())
         })
         .map_err(|e| EngineError::Backend(e.to_string()))
@@ -1779,6 +2363,9 @@ impl Gemma4Engine {
                         .ok_or_else(|| EngineError::Backend("gemma4: bad CAPTURE body".into()))?;
                     (e, tk, crate::kv_coordination::LOCAL_NS.to_string())
                 };
+                // CAPTURE follows a task's last token, the one task-end signal a
+                // relay stage gets; the next task starts its shared KV from row 0.
+                self.external_kv.clear();
                 if let Ok(blob) = self.runtime.get_state_blob() {
                     // Mirror into the lock-free holder cache (worker rank serves rank-N GET from here).
                     self.kv_share
@@ -1805,6 +2392,7 @@ impl Gemma4Engine {
                 // No warm flag needed: gemma4 workers reset on the carried frame position, so the
                 // head's warm prefill (position = warm_len > 0) skips reset, and a cold turn
                 // (position 0) resets everyone — restored or not.
+                self.external_kv.clear();
                 let local_ok = if !self.has_own_kv() {
                     // KV-sharing tail: this stage holds no own KV (all shared upstream), so there is
                     // nothing to restore — a trivial success (never abort the chain on this rank).
@@ -1828,6 +2416,7 @@ impl Gemma4Engine {
             Some(G_OPCODE_ABORT) => {
                 let _ = self.runtime.reset_state();
                 self.position = 0;
+                self.external_kv.clear();
                 if !self.spec.is_last_stage {
                     let _ = self.send_abort_downstream();
                 }
@@ -1991,6 +2580,10 @@ pub struct Gemma4Builder {
     num_kv_shared_layers: u32,
     /// Hidden-frame size from load(), for build()'s prompt bound.
     frame_bytes_per_token: usize,
+    /// Model context window, read in load() for the shared-KV cap.
+    max_ctx: usize,
+    /// `(kvh, hd)` per `external_src_ids` entry, read in load().
+    external_kv_dims: Vec<(usize, usize)>,
     tokenizer: Option<Arc<Tokenizer>>,
     eos_token_ids: Vec<u32>,
     upstream: Option<Arc<tokio::sync::Mutex<ActivationServer>>>,
@@ -2209,6 +2802,16 @@ impl Builder for Gemma4Builder {
         self.num_kv_shared_layers = pipeline_cfg.num_kv_shared_layers;
         self.frame_bytes_per_token =
             hidden_frame_bytes_per_token(&pipeline_cfg, stage_cfg.layer_end);
+        let text_cfg = read_text_config(&self.pipeline_dir);
+        self.external_kv_dims = external_kv_dims(&stage_cfg, text_cfg.as_ref())?;
+        self.max_ctx = read_max_ctx(&self.pipeline_dir).unwrap_or_else(|| {
+            warn!(
+                fallback = SHARED_KV_MAX_CTX_FALLBACK,
+                "gemma4: config.json states no max_position_embeddings; capping shared KV at the \
+                 fallback"
+            );
+            SHARED_KV_MAX_CTX_FALLBACK
+        });
 
         events.push(LoadProgress::message(format!(
             "compiling stage {} on {}",
@@ -2258,6 +2861,7 @@ impl Builder for Gemma4Builder {
     fn build(self: Box<Self>) -> EngineResult<Box<dyn Engine>> {
         let runtime = self.runtime.ok_or(EngineError::NotLoaded)?;
         let spec = self.spec.ok_or(EngineError::NotLoaded)?;
+        let kv_deltas = kv_state_is_f32(self.kv_cache_precision.as_deref(), &self.ov_properties);
 
         // Resolve canonical port names via the alias list. v5 IRs export
         // input ports under conventional names ("input_ids", "attention_mask",
@@ -2326,6 +2930,16 @@ impl Builder for Gemma4Builder {
                 });
             }
         }
+        let mut external_kv_expected = std::collections::HashMap::new();
+        for e in &external_kv_in {
+            let dims = self
+                .external_src_ids
+                .iter()
+                .position(|&s| s == e.tag / 2)
+                .and_then(|i| self.external_kv_dims.get(i))
+                .ok_or_else(|| EngineError::Backend(format!("{}: no expected shape", e.name)))?;
+            external_kv_expected.insert(e.tag, *dims);
+        }
         if !cross_kv_out.is_empty() || !external_kv_in.is_empty() {
             info!(
                 cross_kv_out = cross_kv_out.len(),
@@ -2342,7 +2956,7 @@ impl Builder for Gemma4Builder {
             prompt_window: {
                 let window = crate::pipeline_model_window(&self.pipeline_dir);
                 if self.downstream.is_some() {
-                    crate::forwarded_prompt_window(window, self.frame_bytes_per_token)
+                    hidden_frame_prompt_window(window, self.frame_bytes_per_token, prefill_chunk())
                 } else {
                     window
                 }
@@ -2359,8 +2973,11 @@ impl Builder for Gemma4Builder {
             active: None,
             cross_kv_out,
             external_kv_in,
-            pending_external_kv: std::collections::HashMap::new(),
+            external_kv: SharedKvBuf::new(self.max_ctx, external_kv_expected),
+            cross_kv_tx: CrossKvSender::new(kv_deltas),
             step_warn: StepWarnLimiter::default(),
+            control_acks_owed: Default::default(),
+            failure: Default::default(),
             #[cfg(feature = "kv_coord")]
             kv: crate::kv_coordination::OvKvCache::default(),
             #[cfg(feature = "kv_coord")]
@@ -2412,7 +3029,7 @@ mod tests {
         tokio::time::pause();
         let res = tokio::time::timeout(
             G_CONTROL_ACK_TIMEOUT * 4,
-            super::recv_control_ack_bounded(&mut client),
+            super::recv_control_ack_bounded(&mut client, &Default::default()),
         )
         .await;
         match res {
@@ -2461,6 +3078,196 @@ mod tests {
             "prefill reply errored only after {elapsed:?} — the ceiling was not applied \
              (transport budget is {budget:?})"
         );
+    }
+
+    /// #244: a late reply has no sequence number, so a connection left open after the ceiling hands
+    /// it to the next request as that request's answer. Measured on a real chain: HTTP 200 with
+    /// the previous prompt's token spliced into the text.
+    #[tokio::test]
+    async fn prefill_ceiling_closes_the_connection_so_a_late_reply_cannot_answer_the_next_request()
+    {
+        let _knob = crate::timeout_knob_lock();
+        let (mut client, mut peer) = connected_pair().await;
+        tokio::time::pause();
+        assert!(super::recv_prefill_reply_ceilinged(&mut client)
+            .await
+            .is_err());
+        tokio::time::resume();
+        crate::assert_closed(&mut client, &mut peer).await;
+    }
+
+    /// A late control ack read as a token: the frame's real reply is still owed, so keeping the
+    /// connection would shift every later reply by one.
+    #[tokio::test]
+    async fn a_reply_too_short_for_a_token_closes_the_connection() {
+        let (mut client, mut peer) = connected_pair().await;
+        assert!(super::token_from_reply(&mut client, &[7u8]).await.is_err());
+        crate::assert_closed(&mut client, &mut peer).await;
+    }
+
+    /// A relay rank exits for a rebuild only on an `is_connection_fatal` error. Both closes of the
+    /// downstream link must give `step_middle` such an error, or the stage stays up with no link.
+    #[allow(clippy::await_holding_lock)]
+    #[tokio::test]
+    async fn both_downstream_closes_are_connection_fatal_on_a_relay_rank() {
+        let _knob = crate::timeout_knob_lock();
+        let (mut client, _peer) = connected_pair().await;
+        let short = super::downstream_recv_error(
+            super::token_from_reply(&mut client, &[7u8])
+                .await
+                .unwrap_err(),
+        );
+        assert!(short.is_connection_fatal(), "{short}");
+        assert!(
+            short.to_string().contains("too short for a token"),
+            "{short}"
+        );
+        let (mut client, _peer) = connected_pair().await;
+        tokio::time::pause();
+        let ceiling = super::downstream_recv_error(
+            super::recv_prefill_reply_ceilinged(&mut client)
+                .await
+                .unwrap_err(),
+        );
+        tokio::time::resume();
+        assert!(ceiling.is_connection_fatal(), "{ceiling}");
+        assert!(
+            ceiling.to_string().contains("prefill reply ceiling"),
+            "{ceiling}"
+        );
+    }
+
+    /// The mirror: a peer on an older build never acks a CAPTURE it can't parse. That costs one
+    /// turn its cache, and must not cost the connection, or every such turn reloads the chain.
+    #[cfg(feature = "kv_coord")]
+    #[tokio::test]
+    async fn a_control_ack_timeout_keeps_the_connection() {
+        let (mut client, _peer) = connected_pair().await;
+        tokio::time::pause();
+        assert!(
+            super::recv_control_ack_bounded(&mut client, &Default::default())
+                .await
+                .is_err()
+        );
+        tokio::time::resume();
+        assert!(
+            client.send_raw(b"x").await.is_ok(),
+            "the connection must survive a missing ack"
+        );
+    }
+
+    /// The head dials its downstream once. After the prefill ceiling closes the link, the engine
+    /// must fail with that cause, so the server exits for its supervisor. The next request gets
+    /// a refusal that names the cause, not `NotConnected`.
+    // The knob lock is held for the whole test: the ceiling must fire before the transport budget.
+    #[allow(clippy::await_holding_lock)]
+    #[tokio::test]
+    async fn a_prefill_ceiling_close_fails_the_head_and_refuses_the_next_request() {
+        let _knob = crate::timeout_knob_lock();
+        let (mut client, _peer) = connected_pair().await;
+        tokio::time::pause();
+        let err = super::recv_prefill_reply_ceilinged(&mut client)
+            .await
+            .unwrap_err();
+        tokio::time::resume();
+        let failure = cascadia_engine::EngineFailure::default();
+        super::fail_if_downstream_closed(&failure, &client, &err);
+        let reason = failure
+            .reason()
+            .expect("a closed link must fail the engine");
+        assert!(reason.contains("prefill reply ceiling"), "{reason}");
+        let refusal = super::head_failed_refusal(&failure, &TaskId::from("next"))
+            .expect("a failed engine must refuse the next request");
+        let text = refusal[0].1.error.clone().unwrap_or_default();
+        assert!(text.contains("prefill reply ceiling"), "{text}");
+    }
+
+    /// The same for a reply too short for a token: a distinct cause in the reason.
+    #[tokio::test]
+    async fn a_short_reply_close_fails_the_head_and_refuses_the_next_request() {
+        let (mut client, _peer) = connected_pair().await;
+        let err = super::token_from_reply(&mut client, &[7u8])
+            .await
+            .unwrap_err();
+        let failure = cascadia_engine::EngineFailure::default();
+        super::fail_if_downstream_closed(&failure, &client, &err);
+        let reason = failure
+            .reason()
+            .expect("a closed link must fail the engine");
+        assert!(reason.contains("too short for a token"), "{reason}");
+        let refusal = super::head_failed_refusal(&failure, &TaskId::from("next"))
+            .expect("a failed engine must refuse the next request");
+        let text = refusal[0].1.error.clone().unwrap_or_default();
+        assert!(text.contains("too short for a token"), "{text}");
+    }
+
+    /// A failed exchange that keeps the link open (a control ack timeout) must not fail the head.
+    #[cfg(feature = "kv_coord")]
+    #[tokio::test]
+    async fn a_failed_exchange_that_keeps_the_link_does_not_fail_the_head() {
+        let (mut client, _peer) = connected_pair().await;
+        tokio::time::pause();
+        let err = super::recv_control_ack_bounded(&mut client, &Default::default())
+            .await
+            .unwrap_err();
+        tokio::time::resume();
+        let failure = cascadia_engine::EngineFailure::default();
+        super::fail_if_downstream_closed(&failure, &client, &err);
+        assert_eq!(failure.reason(), None);
+        assert!(super::head_failed_refusal(&failure, &TaskId::from("next")).is_none());
+    }
+
+    /// A RESTORE ack that times out and then arrives late is ahead of the cold prefill's token
+    /// reply. The reply read must skip it and get the real token, and the link must stay open.
+    #[cfg(feature = "kv_coord")]
+    #[tokio::test]
+    async fn a_late_control_ack_is_skipped_by_the_next_reply_read() {
+        let (mut client, mut peer) = connected_pair().await;
+        let owed = std::sync::atomic::AtomicU32::new(0);
+        tokio::time::pause();
+        assert!(super::recv_control_ack_bounded(&mut client, &owed)
+            .await
+            .is_err());
+        tokio::time::resume();
+        let ack = WireTensor::new(WireDType::I8, [1, 1, 2], vec![G_OPCODE_RESTORE_ACK, 1]);
+        cascadia_transport::send_tensor(&mut peer, &ack)
+            .await
+            .unwrap();
+        let reply = WireTensor::new(WireDType::I32, [1, 1, 1], 42i32.to_le_bytes().to_vec());
+        cascadia_transport::send_tensor(&mut peer, &reply)
+            .await
+            .unwrap();
+        let token = super::recv_reply_after_late_acks(&mut client, true, &owed)
+            .await
+            .unwrap();
+        assert_eq!(token, 42);
+        assert!(client.is_connected());
+        assert_eq!(owed.load(std::sync::atomic::Ordering::Relaxed), 0);
+    }
+
+    /// With no ack owed, a control ack in a reply read is still an unexpected frame: it closes.
+    #[cfg(feature = "kv_coord")]
+    #[tokio::test]
+    async fn a_control_ack_that_is_not_owed_still_closes_the_link() {
+        let (mut client, mut peer) = connected_pair().await;
+        let owed = std::sync::atomic::AtomicU32::new(0);
+        let ack = WireTensor::new(WireDType::I8, [1, 1, 2], vec![G_OPCODE_RESTORE_ACK, 1]);
+        cascadia_transport::send_tensor(&mut peer, &ack)
+            .await
+            .unwrap();
+        assert!(super::recv_reply_after_late_acks(&mut client, true, &owed)
+            .await
+            .is_err());
+        crate::assert_closed(&mut client, &mut peer).await;
+    }
+
+    async fn connected_pair() -> (cascadia_transport::ActivationClient, tokio::net::TcpStream) {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let accept = tokio::spawn(async move { listener.accept().await.unwrap().0 });
+        let mut client = cascadia_transport::ActivationClient::new("127.0.0.1", port);
+        client.connect().await.unwrap();
+        (client, accept.await.unwrap())
     }
 
     #[tokio::test]
@@ -2586,8 +3393,67 @@ mod tests {
     }
 
     #[test]
+    fn a_spanned_prefill_bounds_the_prompt_by_one_span_frame() {
+        // E2B stage 0 at layer_end 18 sends 23,552 bytes per token. One whole-prompt frame passes
+        // MAX_TENSOR_BYTES past 11,397 tokens; a 1,024-token span frame does not.
+        let window = Some(131_072);
+        let spanned = hidden_frame_prompt_window(window, 23_552, PREFILL_CHUNK);
+        assert!(spanned > Some(11_397), "{spanned:?}");
+        assert_eq!(spanned, window);
+        let one_pass = prefill_chunk_from(None, Some("0"));
+        assert_eq!(
+            hidden_frame_prompt_window(window, 23_552, one_pass),
+            Some(11_397)
+        );
+        // A span whose frame passes the cap keeps the whole-prompt bound.
+        assert_eq!(
+            hidden_frame_prompt_window(window, 23_552, 20_000),
+            Some(11_397)
+        );
+    }
+
+    #[test]
+    fn prefill_chunk_defaults_to_1024() {
+        assert_eq!(prefill_chunk_from(None, None), 1024);
+    }
+
+    #[test]
+    fn prefill_chunk_knob_zero_is_one_pass() {
+        assert_eq!(prefill_chunk_from(None, Some("0")), usize::MAX);
+    }
+
+    #[test]
+    fn prefill_chunk_knob_sets_the_span() {
+        assert_eq!(prefill_chunk_from(None, Some("512")), 512);
+    }
+
+    #[test]
+    fn prefill_chunk_knob_garbage_keeps_the_default() {
+        assert_eq!(prefill_chunk_from(None, Some("lots")), 1024);
+        assert_eq!(prefill_chunk_from(None, Some("")), 1024);
+    }
+
+    #[test]
+    fn prefill_chunk_force_t1_wins_over_the_knob() {
+        assert_eq!(prefill_chunk_from(Some("1"), Some("512")), 1);
+        assert_eq!(prefill_chunk_from(Some("1"), Some("0")), 1);
+    }
+
+    #[test]
+    fn prefill_spans_default_chunk_splits_a_long_prompt() {
+        // 2,500-token cold prompt, no seed: 1,024 + 1,024 + 452.
+        let (mut i, mut spans) = (0, Vec::new());
+        while i < 2500 {
+            let end = prefill_span_end(i, PREFILL_CHUNK, 2500);
+            spans.push((i, end));
+            i = end;
+        }
+        assert_eq!(spans, vec![(0, 1024), (1024, 2048), (2048, 2500)]);
+    }
+
+    #[test]
     fn prefill_spans_without_seed_match_the_old_folding() {
-        // chunk = usize::MAX (default single-pass): one span over everything.
+        // chunk = usize::MAX (CASCADIA_GEMMA4_PREFILL_CHUNK=0): one span over everything.
         assert_eq!(prefill_span_end(0, usize::MAX, 10), 10);
         // explicit chunking, no seed: plain min(i+chunk, len).
         assert_eq!(prefill_span_end(0, 4, 10), 4);
@@ -2651,5 +3517,470 @@ mod tests {
         let c = final_chunk("t1".to_string(), 106, String::new(), 93, true);
         assert_eq!(c.n_tokens, Some(1));
         assert_eq!(c.token_count(), 1);
+    }
+
+    /// `[kvh, ctx, hd]` f32 tensor whose every value names its (seed, head,
+    /// absolute position, dim), so a misplaced row cannot compare equal (kept
+    /// under 2^24, where f32 still holds the `+ 0.5`). Rows
+    /// before `stored_below` are offset, as a lossy state store would change
+    /// them on read-back.
+    fn kv_tensor_stored(
+        seed: u32,
+        kvh: usize,
+        first_pos: usize,
+        ctx: usize,
+        hd: usize,
+        stored_below: usize,
+    ) -> Vec<u8> {
+        let mut v = Vec::with_capacity(kvh * ctx * hd);
+        for h in 0..kvh {
+            for p in first_pos..first_pos + ctx {
+                for d in 0..hd {
+                    let x = (seed * 100_000 + h as u32 * 10_000 + p as u32 * 10 + d as u32) as f32;
+                    v.push(if p < stored_below { x + 0.5 } else { x });
+                }
+            }
+        }
+        f32_to_bytes(&v)
+    }
+
+    fn kv_tensor(seed: u32, kvh: usize, first_pos: usize, ctx: usize, hd: usize) -> Vec<u8> {
+        kv_tensor_stored(seed, kvh, first_pos, ctx, hd, 0)
+    }
+
+    fn ext_in(tags: &[i64]) -> Vec<ExternalKvIn> {
+        tags.iter()
+            .map(|&tag| ExternalKvIn {
+                name: format!("external_kv.{tag}"),
+                tag,
+            })
+            .collect()
+    }
+
+    #[test]
+    fn cross_kv_header_round_trips_seq_tag_and_start() {
+        let entries = vec![(26, 0), (27, 0), (28, 4096), (29, 4096)];
+        let seq = 0xdead_beef_0123_4567;
+        assert_eq!(
+            decode_cross_kv_header(&encode_cross_kv_header(seq, &entries)).unwrap(),
+            (seq, entries)
+        );
+        let (s, e) = decode_cross_kv_header(&encode_cross_kv_header(7, &[])).unwrap();
+        assert_eq!((s, e.len()), (7, 0));
+    }
+
+    /// A tags-only header from a build without start rows must not be read as
+    /// one with them.
+    #[test]
+    fn cross_kv_header_rejects_the_tags_only_layout() {
+        let old = WireTensor::new(WireDType::I64, [1, 1, 3], i64_to_bytes(&[2, 26, 27]));
+        assert!(decode_cross_kv_header(&old).is_err());
+        let old_empty = WireTensor::new(WireDType::I64, [1, 1, 1], i64_to_bytes(&[0]));
+        assert!(decode_cross_kv_header(&old_empty).is_err());
+        // Four tags that the count rule alone would read as seq 9, (tag 2, start 3).
+        let old_aliased =
+            WireTensor::new(WireDType::I64, [1, 1, 5], i64_to_bytes(&[4, 9, 1, 2, 3]));
+        assert!(decode_cross_kv_header(&old_aliased).is_err());
+        let short = WireTensor::new(
+            WireDType::I64,
+            [1, 1, 4],
+            i64_to_bytes(&[CROSS_KV_HEADER_MAGIC, 7, 1, 26]),
+        );
+        assert!(decode_cross_kv_header(&short).is_err());
+    }
+
+    #[test]
+    fn sequence_ids_do_not_repeat() {
+        let ids: std::collections::HashSet<u64> = (0..1000).map(|_| new_sequence_id()).collect();
+        assert_eq!(ids.len(), 1000);
+    }
+
+    #[test]
+    fn deltas_only_when_kv_state_is_f32() {
+        let props = |k: &str, v: &str| vec![(k.to_string(), v.to_string())];
+        assert!(kv_state_is_f32(None, &[]));
+        assert!(kv_state_is_f32(Some("f32"), &[]));
+        assert!(kv_state_is_f32(Some(" F32 "), &[]));
+        assert!(!kv_state_is_f32(Some("u8"), &[]));
+        assert!(!kv_state_is_f32(Some("f16"), &[]));
+        assert!(!kv_state_is_f32(None, &props("KV_CACHE_PRECISION", "u8")));
+        assert!(!kv_state_is_f32(None, &props("kv_cache_precision", "f16")));
+        // Raw properties are applied after the CLI knob.
+        assert!(kv_state_is_f32(
+            Some("u8"),
+            &props("KV_CACHE_PRECISION", "f32")
+        ));
+        assert!(!kv_state_is_f32(
+            Some("f32"),
+            &props("KV_CACHE_PRECISION", "u8")
+        ));
+        assert!(kv_state_is_f32(Some("f32"), &props("CACHE_DIR", "x")));
+    }
+
+    #[test]
+    fn sender_sends_a_delta_only_when_it_extends_this_sequence() {
+        const KVH: usize = 2;
+        const HD: usize = 3;
+        let mut tx = CrossKvSender::new(true);
+        let send = |tx: &mut CrossKvSender, seq, pos: usize, t: usize, bytes: Vec<u8>, ctx| {
+            let (start, f) = tx
+                .frame(
+                    seq,
+                    26,
+                    pos as i64,
+                    t,
+                    ShimDType::F32,
+                    &[1, KVH, ctx, HD],
+                    bytes,
+                )
+                .unwrap();
+            (start, f.shape[1] as usize)
+        };
+        let g = |seed, ctx| kv_tensor(seed, KVH, 0, ctx, HD);
+        assert_eq!(
+            send(&mut tx, 1, 0, 4, g(1, 4), 4),
+            (0, 4),
+            "first step of a sequence"
+        );
+        assert_eq!(send(&mut tx, 1, 4, 2, g(1, 6), 6), (4, 2), "continuation");
+        assert_eq!(send(&mut tx, 1, 6, 1, g(1, 7), 7), (6, 1), "decode");
+        // Same content, same length, but a new task: the consumer holds the
+        // old sequence's rows, so only a full frame is acceptable to it.
+        assert_eq!(send(&mut tx, 2, 7, 1, g(1, 8), 8), (0, 8), "new sequence");
+        assert_eq!(send(&mut tx, 2, 8, 1, g(1, 9), 9), (8, 1));
+        assert_eq!(
+            send(&mut tx, 2, 10, 1, g(1, 11), 11),
+            (0, 11),
+            "skipped position"
+        );
+        // Did not grow by the step's tokens (a windowed cache).
+        let w = |first| kv_tensor(1, KVH, first, 6, HD);
+        assert_eq!(send(&mut tx, 2, 11, 1, w(6), 6), (0, 6));
+        // Rows the last step sent read back different (lossy state).
+        let lossy = kv_tensor_stored(1, KVH, 0, 13, HD, 12);
+        send(&mut tx, 3, 0, 12, g(1, 12), 12);
+        assert_eq!(
+            send(&mut tx, 3, 12, 1, lossy, 13),
+            (0, 13),
+            "lossy read-back"
+        );
+        let mut off = CrossKvSender::new(false);
+        send(&mut off, 1, 0, 4, g(1, 4), 4);
+        assert_eq!(
+            send(&mut off, 1, 4, 1, g(1, 5), 5),
+            (0, 5),
+            "deltas disabled"
+        );
+    }
+
+    #[test]
+    fn shared_kv_buf_appends_rows_per_head() {
+        let mut b = kv_buf(SHARED_KV_MAX_CTX_FALLBACK, &[(26, 2, 2)]);
+        b.apply(9, 0, 26, 0, [2, 3, 2], kv_tensor(1, 2, 0, 3, 2))
+            .unwrap();
+        b.apply(9, 3, 26, 3, [2, 2, 2], kv_tensor(1, 2, 3, 2, 2))
+            .unwrap();
+        let (shape, bytes) = b.get(26).unwrap();
+        assert_eq!(shape, [1, 2, 5, 2]);
+        assert_eq!(bytes, kv_tensor(1, 2, 0, 5, 2).as_slice());
+        // Grown to its exact size, not doubled.
+        assert_eq!(b.tensors[&26].data.capacity(), bytes.len());
+    }
+
+    #[test]
+    fn shared_kv_buf_rejects_an_append_it_cannot_line_up() {
+        let mut b = kv_buf(SHARED_KV_MAX_CTX_FALLBACK, &[(26, 2, 2)]);
+        let d = |p, n, kvh, hd| kv_tensor(1, kvh, p, n, hd);
+        // Nothing held yet.
+        assert!(b.apply(9, 4, 26, 4, [2, 1, 2], d(4, 1, 2, 2)).is_err());
+        b.apply(9, 0, 26, 0, [2, 4, 2], d(0, 4, 2, 2)).unwrap();
+        // Another sequence's delta onto an equal-length buffer.
+        assert!(b.apply(8, 4, 26, 4, [2, 1, 2], d(4, 1, 2, 2)).is_err());
+        // A start that is not the step's position.
+        assert!(b.apply(9, 5, 26, 4, [2, 1, 2], d(4, 1, 2, 2)).is_err());
+        // Gap, overlap, head count and width changes.
+        assert!(b.apply(9, 5, 26, 5, [2, 1, 2], d(5, 1, 2, 2)).is_err());
+        assert!(b.apply(9, 3, 26, 3, [2, 1, 2], d(3, 1, 2, 2)).is_err());
+        assert!(b.apply(9, 4, 26, 4, [1, 1, 2], d(4, 1, 1, 2)).is_err());
+        assert!(b.apply(9, 4, 26, 4, [2, 1, 3], d(4, 1, 2, 3)).is_err());
+        // Payload that does not match its shape.
+        assert!(b.apply(9, 4, 26, 4, [2, 1, 2], vec![0; 4]).is_err());
+        // The held tensor survives every rejected frame and still takes the right one.
+        assert_eq!(b.get(26).unwrap().0, [1, 2, 4, 2]);
+        b.apply(9, 4, 26, 4, [2, 1, 2], d(4, 1, 2, 2)).unwrap();
+        assert_eq!(b.get(26).unwrap().1, kv_tensor(1, 2, 0, 5, 2).as_slice());
+    }
+
+    /// Every frame is bounded by the transport; the held tensor is bounded only
+    /// here. A frame past the window, or whose size overflows, is rejected and
+    /// the held tensor is left as it was.
+    #[test]
+    fn shared_kv_buf_caps_the_context_and_rejects_overflow() {
+        let mut b = kv_buf(8, &[(26, 2, 2), (27, 2, 2)]);
+        let d = |p, n| kv_tensor(1, 2, p, n, 2);
+        assert!(
+            b.apply(9, 0, 26, 0, [2, 9, 2], d(0, 9)).is_err(),
+            "full frame past the window"
+        );
+        b.apply(9, 0, 26, 0, [2, 6, 2], d(0, 6)).unwrap();
+        assert!(
+            b.apply(9, 6, 26, 6, [2, 3, 2], d(6, 3)).is_err(),
+            "append past the window"
+        );
+        let huge = [u32::MAX; 3];
+        assert!(
+            b.apply(9, 6, 26, 6, huge, vec![0; 4]).is_err(),
+            "size overflow"
+        );
+        assert!(
+            b.apply(9, 0, 27, 0, huge, vec![0; 4]).is_err(),
+            "size overflow, full"
+        );
+        assert!(b.get(27).is_none());
+        let (shape, bytes) = b.get(26).unwrap();
+        assert_eq!((shape, bytes), ([1, 2, 6, 2], d(0, 6).as_slice()));
+        // Up to the window is still fine.
+        b.apply(9, 6, 26, 6, [2, 2, 2], d(6, 2)).unwrap();
+        assert_eq!(b.get(26).unwrap().1, kv_tensor(1, 2, 0, 8, 2).as_slice());
+    }
+
+    #[test]
+    fn max_ctx_comes_from_the_copied_model_config() {
+        let dir = tempfile::tempdir().unwrap();
+        assert_eq!(read_max_ctx(dir.path()), None);
+        std::fs::write(
+            dir.path().join("config.json"),
+            r#"{"max_position_embeddings": 4096}"#,
+        )
+        .unwrap();
+        assert_eq!(read_max_ctx(dir.path()), Some(4096));
+        std::fs::create_dir(dir.path().join("tokenizer")).unwrap();
+        std::fs::write(
+            dir.path().join("tokenizer/config.json"),
+            r#"{"text_config": {"max_position_embeddings": 131072}}"#,
+        )
+        .unwrap();
+        assert_eq!(read_max_ctx(dir.path()), Some(131072));
+    }
+
+    fn kv_buf(max_ctx: usize, dims: &[(i64, usize, usize)]) -> SharedKvBuf {
+        SharedKvBuf::new(max_ctx, dims.iter().map(|&(t, k, h)| (t, (k, h))).collect())
+    }
+
+    /// The row cap alone would let a first frame with a huge `kvh * hd` and few
+    /// rows set a row width that appends then multiply by the whole window.
+    #[test]
+    fn shared_kv_buf_takes_only_the_shape_its_input_expects() {
+        let mut b = kv_buf(SHARED_KV_MAX_CTX_FALLBACK, &[(26, 2, 2)]);
+        let wide = WireTensor::new(WireDType::F32, [1024, 1, 1024], vec![0; 1024 * 1024 * 4]);
+        assert!(
+            b.apply(9, 0, 26, 0, wide.shape, wide.data).is_err(),
+            "huge kvh * hd"
+        );
+        assert!(
+            b.apply(9, 0, 26, 0, [3, 1, 2], kv_tensor(1, 3, 0, 1, 2))
+                .is_err(),
+            "kvh"
+        );
+        assert!(
+            b.apply(9, 0, 26, 0, [2, 1, 3], kv_tensor(1, 2, 0, 1, 3))
+                .is_err(),
+            "hd"
+        );
+        assert!(
+            b.apply(9, 0, 30, 0, [2, 1, 2], kv_tensor(1, 2, 0, 1, 2))
+                .is_err(),
+            "unknown tag"
+        );
+        assert!(b.tensors.is_empty(), "a rejected frame holds nothing");
+        b.apply(9, 0, 26, 0, [2, 1, 2], kv_tensor(1, 2, 0, 1, 2))
+            .unwrap();
+    }
+
+    #[test]
+    fn external_kv_dims_follow_the_exporter_rule() {
+        let src = |l: u32, lt: Option<&str>, hd: Option<u32>| ExternalSrc {
+            src_global_layer: l,
+            layer_type: lt.map(str::to_string),
+            head_dim: hd,
+        };
+        let stage = StageConfig {
+            num_kv_heads: Some(1),
+            external_shared_sources: vec![
+                src(13, Some("sliding_attention"), Some(256)),
+                src(14, Some("full_attention"), Some(512)),
+            ],
+            ..Default::default()
+        };
+        let e2b =
+            serde_json::json!({"num_key_value_heads": 1, "head_dim": 256, "global_head_dim": 512});
+        assert_eq!(
+            external_kv_dims(&stage, Some(&e2b)).unwrap(),
+            [(1, 256), (1, 512)]
+        );
+        let global = serde_json::json!({"num_key_value_heads": 8, "num_global_key_value_heads": 2});
+        assert_eq!(
+            external_kv_dims(&stage, Some(&global)).unwrap(),
+            [(8, 256), (2, 512)]
+        );
+        // Stage config alone is enough.
+        assert_eq!(
+            external_kv_dims(&stage, None).unwrap(),
+            [(1, 256), (1, 512)]
+        );
+        // Layer type and width from the model config when the stage lacks them.
+        let bare = StageConfig {
+            external_shared_sources: vec![src(1, None, None)],
+            ..Default::default()
+        };
+        let types = serde_json::json!({"layer_types": ["sliding_attention", "full_attention"],
+            "num_key_value_heads": 1, "head_dim": 256, "global_head_dim": 512});
+        assert_eq!(external_kv_dims(&bare, Some(&types)).unwrap(), [(1, 512)]);
+        assert!(external_kv_dims(&bare, None).is_err());
+        assert!(external_kv_dims(&StageConfig::default(), None)
+            .unwrap()
+            .is_empty());
+    }
+
+    #[test]
+    fn ingest_requires_each_consumed_tag_once_per_step() {
+        let inputs = ext_in(&[26, 27]);
+        let f = || WireTensor::new(WireDType::F32, [1, 1, 1], f32_to_bytes(&[1.0]));
+        let mut b = kv_buf(SHARED_KV_MAX_CTX_FALLBACK, &[(26, 1, 1), (27, 1, 1)]);
+        let ing = |b: &mut SharedKvBuf, pos, seq, e: &[(i64, i64)], fr| {
+            ingest_cross_kv(b, &inputs, pos, seq, e, fr)
+        };
+        assert!(ing(&mut b, 0, 1, &[(26, 0), (26, 0)], vec![f(), f()]).is_err());
+        assert!(ing(&mut b, 0, 1, &[(26, 0), (30, 0)], vec![f(), f()]).is_err());
+        let i8 = WireTensor::new(WireDType::I8, [1, 1, 4], vec![0; 4]);
+        assert!(ing(&mut b, 0, 1, &[(26, 0), (27, 0)], vec![f(), i8]).is_err());
+        ing(&mut b, 0, 1, &[(26, 0), (27, 0)], vec![f(), f()]).unwrap();
+        ing(&mut b, 1, 1, &[(26, 1), (27, 1)], vec![f(), f()]).unwrap();
+        assert_eq!(b.get(26).unwrap().0, [1, 1, 2, 1]);
+        // The sequence id rides the header, so it reaches every frame.
+        assert!(ing(&mut b, 2, 2, &[(26, 2), (27, 2)], vec![f(), f()]).is_err());
+        // A delta at position 0 has nothing to extend.
+        assert!(ing(&mut b, 0, 1, &[(26, 2), (27, 2)], vec![f(), f()]).is_err());
+    }
+
+    /// Steps of one simulated chain: producer -> header/frames -> consumer.
+    /// After every step the consumer must hold exactly the tensor the
+    /// full-send path fed. Tag 26 grows like the exporter's `cat(past, new)`;
+    /// tag 28 is a hypothetical rolling window of 6 rows (rows shift).
+    #[test]
+    fn delta_frames_rebuild_the_tensors_the_full_send_fed() {
+        const KVH: usize = 2;
+        const HD: usize = 3;
+        const WIN: usize = 6;
+        enum Step {
+            /// A new head task at this position (0 = cold, >0 = warm restore)
+            /// with this content seed.
+            Task(i64, u32),
+            /// A prefill span or decode of this many tokens.
+            Run(usize),
+        }
+        use Step::*;
+        let script = [
+            Task(0, 1),
+            Run(4),
+            Run(4),
+            Run(2),
+            Run(1),
+            Run(1),
+            Run(1),
+            // Warm task at exactly the length the consumer holds, other content.
+            Task(13, 2),
+            Run(1),
+            Run(1),
+            // Warm continuation of the same content.
+            Task(15, 2),
+            Run(3),
+            Run(1),
+            // Warm task at a shorter prefix.
+            Task(5, 3),
+            Run(1),
+            Run(1),
+            Task(0, 4),
+            Run(1),
+            Run(2),
+        ];
+        // (fresh seq per task, lossy state, deltas enabled) -> delta rows (tag 26, tag 28)
+        let modes = [
+            ((true, false, true), (14, 2)),
+            // A constant seq (no task boundary seen): the read-back check alone
+            // still refuses to append onto other content.
+            ((false, false, true), (17, 2)),
+            ((true, true, true), (0, 0)),
+            ((true, false, false), (0, 0)),
+        ];
+        let inputs = ext_in(&[26, 28]);
+        for ((fresh_seq, lossy, deltas), want) in modes {
+            let mode = format!("fresh_seq={fresh_seq} lossy={lossy} deltas={deltas}");
+            let mut tx = CrossKvSender::new(deltas);
+            let mut buf = kv_buf(SHARED_KV_MAX_CTX_FALLBACK, &[(26, KVH, HD), (28, KVH, HD)]);
+            let (mut pos, mut seed, mut seq) = (0i64, 0u32, 1u64);
+            let mut delta_rows = std::collections::HashMap::<i64, usize>::new();
+            for step in &script {
+                let t = match *step {
+                    Task(p, s) => {
+                        (pos, seed) = (p, s);
+                        if fresh_seq {
+                            seq = new_sequence_id();
+                        }
+                        continue;
+                    }
+                    Run(t) => t,
+                };
+                let ctx = pos as usize + t;
+                let stored_below = if lossy { pos as usize } else { 0 };
+                let mut entries = Vec::new();
+                let mut frames = Vec::new();
+                let mut fed = Vec::new();
+                for (tag, first, len) in [(26, 0, ctx), (28, ctx.saturating_sub(WIN), ctx.min(WIN))]
+                {
+                    let full =
+                        kv_tensor_stored(seed + tag as u32, KVH, first, len, HD, stored_below);
+                    let (start, frame) = tx
+                        .frame(
+                            seq,
+                            tag,
+                            pos,
+                            t,
+                            ShimDType::F32,
+                            &[1, KVH, len, HD],
+                            full.clone(),
+                        )
+                        .unwrap();
+                    if start > 0 {
+                        assert_eq!(
+                            frame.shape[1] as usize, t,
+                            "{mode}: a delta is just the new rows"
+                        );
+                        *delta_rows.entry(tag).or_default() += t;
+                    }
+                    entries.push((tag, start));
+                    frames.push(frame);
+                    fed.push((tag, [1, KVH, len, HD], full));
+                }
+                let (hseq, header) =
+                    decode_cross_kv_header(&encode_cross_kv_header(seq, &entries)).unwrap();
+                ingest_cross_kv(&mut buf, &inputs, pos, hseq, &header, frames)
+                    .unwrap_or_else(|e| panic!("{mode}: position {pos}: {e}"));
+                for (tag, shape, full) in fed {
+                    let (s, bytes) = buf.get(tag).unwrap();
+                    assert_eq!(s, shape, "{mode}: tag {tag} at position {pos}");
+                    assert!(
+                        bytes == full.as_slice(),
+                        "{mode}: tag {tag} rows differ at {pos}"
+                    );
+                }
+                pos += t as i64;
+            }
+            let got = (
+                delta_rows.get(&26).copied().unwrap_or(0),
+                delta_rows.get(&28).copied().unwrap_or(0),
+            );
+            assert_eq!(got, want, "{mode}");
+        }
     }
 }

@@ -597,7 +597,7 @@ pub async fn recv_token_body_client(cli: &Mutex<ActivationClient>) -> TransportR
 /// the idle ceiling — the task never finalizes, and every upstream rank plus
 /// the driving API request wedges behind it instead of surfacing a fast error.
 /// On timeout this drops the connection and returns `Err`; later sends fail
-/// fast with `NotConnected` until a supervisor restarts the chain. The caller
+/// fast with `NotConnected` until the link is re-dialed. The caller
 /// picks `deadline` for the frame it just sent; for dsv4's token-at-a-time
 /// forwarding that is a single per-token budget
 /// ([`cascadia_transport::recv_timeout`]) whether the token is prefill or

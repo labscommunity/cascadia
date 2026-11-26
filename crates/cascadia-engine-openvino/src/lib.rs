@@ -35,6 +35,27 @@ pub use qwen36::{Qwen36Builder, Qwen36Engine};
 pub use rotary::{ModelTextConfig, RopeScalingConfig, Rotary};
 pub use runtime::{OvRuntimeBuilder, OvRuntimeEngine};
 
+#[cfg(test)]
+pub(crate) async fn assert_closed(
+    client: &mut cascadia_transport::ActivationClient,
+    peer: &mut tokio::net::TcpStream,
+) {
+    use tokio::io::AsyncReadExt;
+    let mut byte = [0u8; 1];
+    let read = tokio::time::timeout(std::time::Duration::from_secs(5), peer.read(&mut byte)).await;
+    assert!(
+        matches!(read, Ok(Ok(0))),
+        "the peer must see the connection close, got {read:?}"
+    );
+    assert!(
+        matches!(
+            client.recv_raw(1).await,
+            Err(cascadia_transport::TransportError::NotConnected)
+        ),
+        "later exchanges must fail instead of reading a late reply"
+    );
+}
+
 /// Tests that touch the process-global activation-timeout knob (or read a
 /// value derived from it under a precondition) must hold this lock: three
 /// runtime.rs tests set it to 1 s and back while gemma4's ceiling test asserts
@@ -174,10 +195,9 @@ mod model_window_tests {
 
     #[test]
     fn a_forwarded_prompt_is_bounded_by_the_frame_it_becomes() {
-        // Measured frames: gemma4 refused 11,428 tokens at 269,152,256 bytes (23,552 per token) and
-        // ov-dist-spec 4,034 at 1,034,769,408 (256,512). ov-runtime sends f16 at hidden 4096.
+        // Measured frames: gemma4 refused 11,428 tokens at 269,152,256 bytes (23,552 per token).
+        // ov-runtime sends f16 at hidden 4096. ov-dist-spec prefills in spans and does not use this.
         assert_eq!(forwarded_prompt_window(Some(131_072), 23_552), Some(11_397));
-        assert_eq!(forwarded_prompt_window(Some(131_072), 256_512), Some(1_046));
         assert_eq!(forwarded_prompt_window(Some(131_072), 8_192), Some(32_768));
         // The lower bound wins either way.
         assert_eq!(forwarded_prompt_window(Some(4_096), 8_192), Some(4_096));
