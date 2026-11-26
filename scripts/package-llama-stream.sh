@@ -1,9 +1,13 @@
 #!/usr/bin/env bash
 # Package a patched SYCL llama-server build into a release tarball.
 #
-# Usage: scripts/package-llama-stream.sh BUILD_DIR OUT_TARBALL
+# Usage: scripts/package-llama-stream.sh BUILD_DIR OUT_TARBALL [--no-run-check]
 #   BUILD_DIR    the DEST passed to build-llama-stream.sh (contains build/bin)
 #   OUT_TARBALL  e.g. cascadia-llama-sycl-linux-x86_64-v0.3.0.tar.gz
+#   --no-run-check  skip the staged-server run. Use it only on a builder with
+#                no Intel GPU (hosted CI): the SYCL runtime aborts at startup
+#                when it finds no device, even for --version. The relocation
+#                ldd checks still run.
 #
 # Run in the oneAPI environment used to build the server. Requires patchelf,
 # readelf and ldd. The selected SYCL runtime's dlopened UR/legacy PI plugins
@@ -11,6 +15,9 @@
 # Host dependencies: glibc/ELF loader, libgcc/libstdc++, zlib, NUMA, OpenSSL,
 # and the OS GPU stack (Level Zero/OpenCL loaders and vendor drivers). These
 # must be installed on the destination; no oneAPI installation is required.
+# licenses/ holds only the licenses of components shipped and used directly:
+# llama.cpp, the code compiled into it, and the oneAPI components a bundled
+# library comes from. A bundled library with no known mapping aborts packaging.
 set -euo pipefail
 shopt -s nullglob
 
@@ -20,6 +27,14 @@ BIN_DIR="$(realpath "$BUILD_DIR/build/bin")"
 SERVER="$BIN_DIR/llama-server"
 
 fail() { echo "ERROR: $*" >&2; exit 1; }
+
+NO_RUN_CHECK=0
+for arg in "${@:3}"; do
+    case "$arg" in
+        --no-run-check) NO_RUN_CHECK=1 ;;
+        *) fail "unknown option: $arg" ;;
+    esac
+done
 [ -x "$SERVER" ] || fail "$SERVER missing — run build-llama-stream.sh first"
 for tool in patchelf readelf ldd; do
     command -v "$tool" >/dev/null 2>&1 || fail "$tool is required for a relocatable bundle"
@@ -88,6 +103,11 @@ inspect_dependencies() {
     fi
     while IFS= read -r line; do
         if [[ "$line" == *"=> not found"* ]]; then
+            # Host libraries are destination-provided, so a packaging box
+            # without the GPU stack (a CI runner) must not fail here.
+            missing="${line%%=> not found*}"
+            missing="${missing//[[:space:]]/}"
+            is_host_library "$missing" && continue
             fail "unresolved dependency in $file: $line"
         fi
         if [[ "$line" =~ ^[[:space:]]*([^[:space:]]+)[[:space:]]+\=\>[[:space:]]+(.*)[[:space:]]+\(0x[[:xdigit:]]+\) ]]; then
@@ -140,6 +160,91 @@ for ((index=0; index<${#sources[@]}; index++)); do
     esac
 done
 
+LICENSES="$PKG/licenses"
+add_license() {
+    local source="$1" dest="$2"
+    [ -f "$source" ] || fail "required license text missing: $source"
+    mkdir -p "$LICENSES"
+    cp "$source" "$LICENSES/$dest"
+}
+# nlohmann json and cpp-httplib are compiled into llama-server.
+add_license "$BUILD_DIR/LICENSE" llama.cpp-LICENSE
+add_license "$BUILD_DIR/licenses/LICENSE-jsonhpp" nlohmann-json-LICENSE
+add_license "$BUILD_DIR/vendor/cpp-httplib/LICENSE" cpp-httplib-LICENSE
+
+# Every other bundled library must come from a oneAPI component laid out as
+# <prefix>/<component>/<version>/lib, whose notices are in share/doc/<component>.
+declare -A component_roots=()
+openmp=0
+umf_from=""
+for source in "${sources[@]}"; do
+    case "$source" in "$BIN_DIR"/*) continue ;; esac
+    lib_dir="${source%/*}"
+    root="${lib_dir%/*}"
+    component="${root%/*}"
+    component="${component##*/}"
+    [ "${lib_dir##*/}" = lib ] || fail "no license mapping for bundled library $source: not in a oneAPI <component>/<version>/lib directory"
+    case "$component/${source##*/}" in
+        compiler/libiomp5*) openmp=1 ;;
+        tcm/libtcm*) fail "no license mapping for bundled library $source" ;;
+        compiler/*|mkl/*|umf/*|tcm/*|tbb/*) ;;
+        *) fail "no license mapping for bundled library $source: unknown component '$component'" ;;
+    esac
+    if [ -n "${component_roots[$component]+present}" ] && [ "${component_roots[$component]}" != "$root" ]; then
+        fail "bundled $component libraries come from two installs: ${component_roots[$component]} and $root"
+    fi
+    component_roots[$component]="$root"
+    note=""
+    case "${source##*/}" in
+        libumf*)
+            umf_from="$root"
+            [ "$component" = umf ] || note="; +umf license"
+            ;;
+    esac
+    echo "third-party: ${source##*/} <- $source [$component$note]"
+done
+# Some releases ship UMF inside another component's lib directory; its license
+# is still in the sibling umf component of the same oneAPI prefix.
+if [ -n "$umf_from" ] && [ -z "${component_roots[umf]+present}" ]; then
+    umf_prefix="${umf_from%/*}"
+    umf_prefix="${umf_prefix%/*}"
+    umf_candidates=()
+    if [ -f "$umf_prefix/umf/${umf_from##*/}/share/doc/umf/LICENSE.TXT" ]; then
+        umf_candidates=("$umf_prefix/umf/${umf_from##*/}")
+    else
+        for umf_license in "$umf_prefix"/umf/*/share/doc/umf/LICENSE.TXT; do
+            umf_candidates+=("${umf_license%/share/doc/umf/LICENSE.TXT}")
+        done
+    fi
+    [ "${#umf_candidates[@]}" = 1 ] || fail "UMF is bundled from $umf_from but its license was not found: searched $umf_prefix/umf/${umf_from##*/}/share/doc/umf/LICENSE.TXT and $umf_prefix/umf/*/share/doc/umf/LICENSE.TXT (${#umf_candidates[@]} matches)"
+    component_roots[umf]="${umf_candidates[0]}"
+fi
+# tcm ships only hwloc, whose BSD notice is carried by the OpenMP notice.
+if [ -n "${component_roots[tcm]+present}" ] && [ "$openmp" = 0 ]; then
+    fail "a tcm library (hwloc) is bundled without the OpenMP runtime, whose notice carries hwloc's license"
+fi
+add_oneapi_license() {
+    add_license "${component_roots[$1]}/share/doc/$1/$2" "$3"
+}
+for component in compiler mkl umf tbb; do
+    [ -n "${component_roots[$component]+present}" ] || continue
+    case "$component" in
+        compiler)
+            add_oneapi_license compiler licensing/c/third-party-programs.txt oneapi-compiler-third-party-programs.txt
+            [ "$openmp" = 0 ] || add_oneapi_license compiler licensing/openmp/third-party-programs.txt oneapi-openmp-third-party-programs.txt
+            ;;
+        mkl)
+            # license.txt on Linux, license.rtf on Windows.
+            docs="${component_roots[mkl]}/share/doc/mkl"
+            matches=("$docs"/licensing/license.*)
+            [ "${#matches[@]}" = 1 ] || fail "expected exactly one license text $docs/licensing/license.*, found ${#matches[@]}"
+            add_oneapi_license mkl "licensing/${matches[0]##*/}" "onemkl-${matches[0]##*/}"
+            ;;
+        umf) add_oneapi_license umf LICENSE.TXT umf-LICENSE.txt ;;
+        tbb) add_oneapi_license tbb licensing/license.txt onetbb-license.txt ;;
+    esac
+done
+
 # Each ELF object needs its own origin: DT_RUNPATH is not inherited by
 # transitive dependencies or dlopened adapters. Never mask a patch failure.
 for source in "${sources[@]}"; do
@@ -152,7 +257,12 @@ done
 
 # Exercise the staged executable, not the working build. The clean loader
 # environment must also work for plugin loading performed by --version.
-if ! env -u LD_LIBRARY_PATH -u LD_PRELOAD "$PKG/llama-server" --version > "$PKG/VERSION.txt" 2>&1; then
+# A builder without an Intel GPU cannot run it: the SYCL runtime throws
+# "No device of requested type available" before --version is handled, so CI
+# passes --no-run-check and gets the relocation checks above only.
+if [ "$NO_RUN_CHECK" = 1 ]; then
+    echo "run check skipped (--no-run-check): no staged-server run without a GPU device"
+elif ! env -u LD_LIBRARY_PATH -u LD_PRELOAD "$PKG/llama-server" --version > "$PKG/VERSION.txt" 2>&1; then
     cat "$PKG/VERSION.txt" >&2
     fail "relocated llama-server --version failed"
 fi
