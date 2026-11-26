@@ -2963,6 +2963,23 @@ impl ChatPromptRenderer {
         enable_thinking: bool,
         reasoning_effort: Option<&str>,
     ) -> Result<String, PromptRenderError> {
+        self.render_with_kwargs(messages, tools, enable_thinking, reasoning_effort, None)
+    }
+
+    /// As [`render_with_effort`](Self::render_with_effort) but also passing the
+    /// request's `chat_template_kwargs.preserve_thinking`, for callers that
+    /// render outside the server (an embedded shard backend). `Some(b)` lands in
+    /// the template's `preserve_thinking` variable (Qwen3.6 keeps earlier turns'
+    /// reasoning in the prompt when it is true); `None` leaves it undefined,
+    /// which is exactly `render_with_effort`.
+    pub fn render_with_kwargs(
+        &self,
+        messages: &[ChatMessage],
+        tools: Option<&[Tool]>,
+        enable_thinking: bool,
+        reasoning_effort: Option<&str>,
+        preserve_thinking: Option<bool>,
+    ) -> Result<String, PromptRenderError> {
         render_or_fallback(
             self.env.as_deref(),
             messages,
@@ -2971,6 +2988,7 @@ impl ChatPromptRenderer {
             enable_thinking,
             EffortArgs {
                 mapped: reasoning_effort,
+                preserve_thinking,
                 ..Default::default()
             },
             tools,
@@ -4730,6 +4748,41 @@ mod tests {
         let r1 = ChatPromptRenderer::new(&cfg).render(&msgs).unwrap();
         let want = "<｜begin▁of▁sentence｜><｜User｜>What is 2+2?<｜Assistant｜>4<｜end▁of▁sentence｜><｜User｜>And 3+3?<｜Assistant｜>";
         assert_eq!(r1, want, "R1 render mismatch");
+    }
+
+    /// An embedded caller (one that holds a [`ChatPromptRenderer`], not the
+    /// server's `AppState`) can hand the template `preserve_thinking`: set, the
+    /// template sees that value; unset, it stays undefined and the render is
+    /// [`ChatPromptRenderer::render_with_effort`]'s.
+    #[test]
+    fn renderer_passes_preserve_thinking_to_the_template() {
+        let cfg = ChatTemplateConfig {
+            template: Some(
+                "{% for m in messages %}{{ m.content }}{% endfor %}\
+                 |{% if preserve_thinking is defined %}{{ preserve_thinking }}\
+                 {% else %}undefined{% endif %}"
+                    .into(),
+            ),
+            bos_token: None,
+            eos_token: None,
+        };
+        let r = ChatPromptRenderer::new(&cfg);
+        let msgs = vec![ChatMessage {
+            role: "user".into(),
+            content: "hi".into(),
+            name: None,
+            tool_calls: None,
+            tool_call_id: None,
+            reasoning_content: None,
+        }];
+        let with = |p| r.render_with_kwargs(&msgs, None, true, None, p).unwrap();
+        assert_eq!(with(Some(true)), "hi|true");
+        assert_eq!(with(Some(false)), "hi|false");
+        assert_eq!(with(None), "hi|undefined");
+        assert_eq!(
+            with(None),
+            r.render_with_effort(&msgs, None, true, None).unwrap()
+        );
     }
 
     // Proves the CLI's sparse-moe root-layout path (load_chat_template_config_at,
