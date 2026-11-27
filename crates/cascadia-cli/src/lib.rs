@@ -9,6 +9,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use anyhow::{anyhow, Context, Result};
+use cascadia_api::reasoning::ReasoningFormat;
 use cascadia_engine::Builder;
 use cascadia_engine_llamacpp::{
     probe_stream_weights, resolve_llama_bin, validate_extra_args, ElasticVram, LlamaCppBuilder,
@@ -444,6 +445,12 @@ pub struct WorkerArgs {
     #[arg(long)]
     pub keep_serving_on_engine_failure: bool,
 
+    /// deepseek: return a thinking model's reasoning in reasoning_content;
+    /// none: leave it in content as <think>…</think> (the output before this
+    /// release; kept for one release).
+    #[arg(long, value_name = "deepseek|none", default_value_t = ReasoningFormat::default())]
+    pub reasoning_format: ReasoningFormat,
+
     /// OV performance hint (PERFORMANCE_HINT). LATENCY suits single-user
     /// decode; THROUGHPUT enables NUM_STREAMS auto-tuning. See OpenVINO
     /// high-level-performance-hints docs (2026).
@@ -866,6 +873,12 @@ pub struct RunArgs {
     #[arg(long)]
     pub keep_serving_on_engine_failure: bool,
 
+    /// deepseek: return a thinking model's reasoning in reasoning_content;
+    /// none: leave it in content as <think>…</think> (the output before this
+    /// release; kept for one release).
+    #[arg(long, value_name = "deepseek|none", default_value_t = ReasoningFormat::default())]
+    pub reasoning_format: ReasoningFormat,
+
     /// Expert placement JSON (requires --ep-workers). See worker --help.
     #[arg(long)]
     pub ep_placement: Option<PathBuf>,
@@ -965,6 +978,7 @@ impl WorkerArgs {
         api: String,
         prefix_cache_gb: Option<f64>,
         api_max_body_mb: f64,
+        reasoning_format: ReasoningFormat,
         ep_workers: Vec<String>,
         ep_placement: Option<PathBuf>,
         decision_dump: Option<PathBuf>,
@@ -987,6 +1001,7 @@ impl WorkerArgs {
             decision_dump_max_bytes: None,
             max_decision_requests: cascadia_api::DEFAULT_MAX_CONCURRENT_DECISIONS,
             keep_serving_on_engine_failure: false,
+            reasoning_format,
             ep_workers,
             ep_worker_index: None,
             ep_worker_count: None,
@@ -1291,6 +1306,11 @@ pub async fn run(cli: Cli) -> Result<()> {
 
 async fn cmd_run(args: RunArgs) -> Result<()> {
     info!(model = %args.model, device = %args.device, engine = ?args.engine, "cascadia run (single machine)");
+    cmd_worker(run_worker_args(args)).await
+}
+
+/// The single-stage worker config `cascadia run` hands to `cmd_worker`.
+fn run_worker_args(args: RunArgs) -> WorkerArgs {
     let mut worker = WorkerArgs::single_node(
         args.model,
         args.device,
@@ -1298,6 +1318,7 @@ async fn cmd_run(args: RunArgs) -> Result<()> {
         args.api,
         args.prefix_cache_gb,
         args.api_max_body_mb,
+        args.reasoning_format,
         args.ep_workers,
         args.ep_placement,
         args.decision_dump,
@@ -1319,7 +1340,7 @@ async fn cmd_run(args: RunArgs) -> Result<()> {
     worker.elastic_vram = args.elastic_vram;
     worker.elastic_share = args.elastic_share;
     worker.llama_mtp = args.llama_mtp;
-    cmd_worker(worker).await
+    worker
 }
 
 fn cmd_completions(args: CompletionsArgs) -> Result<()> {
@@ -1655,6 +1676,22 @@ fn ovgenai_chat_template(model: &str) -> cascadia_api::ChatTemplateConfig {
     }
 }
 
+/// Whether the API will render ov-genai's prompts through the model's chat
+/// template, so the engine should skip ov-genai's own apply by default: a
+/// template file is present and builds, by the same build the API runs. Chat
+/// requests also carry their own flag (a render error at request time falls
+/// back to untemplated text); this default covers the rest.
+fn ovgenai_prompt_pretemplated(model: &str) -> bool {
+    cascadia_api::chat_template_builds(&ovgenai_chat_template(model))
+}
+
+/// ov-genai renders with the template inside its tokenizer IR, but the API
+/// reads the template files beside the model to tell whether the prompt
+/// opens `<think>`. With no such file that cannot be told (startup warns).
+fn ovgenai_template_unprobed(template: &cascadia_api::ChatTemplateConfig) -> bool {
+    template.template.is_none()
+}
+
 /// Warn when a performance flag the user explicitly set will be silently
 /// ignored for the chosen engine/device, so an ineffective flag is visible at
 /// runtime instead of vanishing (mirrors the `--ffn-sparsity-capture-dir`
@@ -1862,10 +1899,11 @@ fn build_builder(args: &WorkerArgs, prefix_cache_bytes: usize) -> Result<Box<dyn
             } else if args.prompt_lookup > 0 {
                 b = b.with_prompt_lookup(args.prompt_lookup);
             }
-            // If the model ships a chat template, the API renders it (honoring
-            // enable_thinking) and the engine tells ov-genai to skip its own
-            // internal apply. No template → leave ov-genai's apply on.
-            b = b.with_prompt_pretemplated(ovgenai_chat_template(&args.model).template.is_some());
+            // If the model ships a chat template the API can build, the API
+            // renders it for every request (thinking on or off) and the engine
+            // tells ov-genai to skip its own internal apply. No usable
+            // template → leave ov-genai's apply on.
+            b = b.with_prompt_pretemplated(ovgenai_prompt_pretemplated(&args.model));
             Ok(Box::new(b))
         }
         EngineKind::OvRuntime => {
@@ -2856,10 +2894,22 @@ async fn cmd_worker(args: WorkerArgs) -> Result<()> {
         // to the legacy "role: content" join if the file or fields are
         // missing.
         let chat_template = match args.engine {
-            // ov-genai: render the template API-side so enable_thinking is
-            // honored; the engine sets apply_chat_template=false so ov-genai
-            // doesn't double-wrap (build_builder mirrors via with_prompt_pretemplated).
-            EngineKind::OvGenai => ovgenai_chat_template(&args.model),
+            // ov-genai: render the template API-side for every request so the
+            // system prompt, history, tools and enable_thinking all reach it;
+            // the engine sets apply_chat_template=false so ov-genai doesn't
+            // double-wrap (build_builder mirrors via with_prompt_pretemplated).
+            EngineKind::OvGenai => {
+                let template = ovgenai_chat_template(&args.model);
+                if ovgenai_template_unprobed(&template) {
+                    warn!(
+                        model = %args.model,
+                        "no chat template file next to the model; a template that opens \
+                         <think> in the prompt can't be detected, so such a model's \
+                         reasoning stays in content"
+                    );
+                }
+                template
+            }
             // qwen36 surgery trees keep chat_template.jinja at the model
             // root with no tokenizer_config.json.
             EngineKind::Qwen36Moe => {
@@ -2915,14 +2965,14 @@ async fn cmd_worker(args: WorkerArgs) -> Result<()> {
         // windows admit. Both caps follow one operator-facing knob.
         cfg.max_body_bytes = max_body;
         cfg.max_prompt_bytes = max_body;
-        // ov-genai owns native templating: render the template API-side only for
-        // the thinking-OFF path (engine sets apply_chat_template=false then);
-        // thinking-ON stays on ov-genai's native template, untouched.
-        cfg.defer_template_on_thinking = matches!(args.engine, EngineKind::OvGenai);
         // sycl-llama's child renders the GGUF template itself (the engine
         // forwards the structured turns + tools); the API-side render is
         // only a placeholder so tool requests are not refused here
         cfg.engine_applies_template = matches!(args.engine, EngineKind::SyclLlama);
+        // ov-genai wraps a prompt the API did not template (no template, or
+        // the legacy text after a render error) in the model's own template.
+        cfg.engine_templates_raw_prompts = matches!(args.engine, EngineKind::OvGenai);
+        cfg.reasoning_format = args.reasoning_format;
         // Chat's pool and decision admission, sized and checked before the model load.
         cfg.max_concurrent_requests = max_concurrent_requests;
         cfg.max_concurrent_decisions = args.max_decision_requests;
@@ -3037,6 +3087,9 @@ async fn cmd_worker(args: WorkerArgs) -> Result<()> {
             tenant: String::new(), // H.1b: single-tenant CLI path — LOCAL_NS
             resume_token_ids: None,
             decision: None,
+            reasoning_as_text: false,
+            preserve_thinking: None,
+            prompt_pretemplated: None,
         };
         // `generate_async`, not `generate`: this loop runs on the tokio
         // runtime, and the sync path would block a worker on the engine
@@ -3458,6 +3511,7 @@ mod python_tests {
             ":8000".into(),
             None,
             1.0,
+            ReasoningFormat::default(),
             Vec::new(),
             None,
             None,
@@ -3637,6 +3691,39 @@ mod python_tests {
         a.cb = false;
         a.device = "CPU".to_string();
         assert!(!cb_on_plain_cpu(&a));
+    }
+
+    /// ov-genai with no template file beside the model is flagged: the API
+    /// cannot see whether the template opens `<think>` in the prompt.
+    #[test]
+    fn ovgenai_without_a_template_file_is_flagged() {
+        let dir = tempfile::tempdir().unwrap();
+        let model = dir.path().to_str().unwrap();
+        assert!(ovgenai_template_unprobed(&ovgenai_chat_template(model)));
+        std::fs::write(
+            dir.path().join("chat_template.jinja"),
+            "{% for m in messages %}{{ m.content }}{% endfor %}",
+        )
+        .unwrap();
+        assert!(!ovgenai_template_unprobed(&ovgenai_chat_template(model)));
+    }
+
+    /// ov-genai skips its own template by default only when the API will
+    /// render one: a template file the API cannot parse leaves ov-genai's
+    /// own apply on, as does no file at all.
+    #[test]
+    fn ovgenai_skips_its_template_only_for_one_the_api_can_build() {
+        let dir = tempfile::tempdir().unwrap();
+        let model = dir.path().to_str().unwrap();
+        assert!(!ovgenai_prompt_pretemplated(model), "no template file");
+        std::fs::write(dir.path().join("chat_template.jinja"), "{% for m in %}").unwrap();
+        assert!(!ovgenai_prompt_pretemplated(model), "unparseable template");
+        std::fs::write(
+            dir.path().join("chat_template.jinja"),
+            "{% for m in messages %}{{ m.content }}{% endfor %}",
+        )
+        .unwrap();
+        assert!(ovgenai_prompt_pretemplated(model), "usable template");
     }
 
     /// `--cb` on an NPU device is rejected up front. The docs say paged
@@ -3904,6 +3991,7 @@ mod ov_property_tests {
             "127.0.0.1:8080".into(),
             None,
             1.0,
+            ReasoningFormat::default(),
             Vec::new(),
             None,
             None,
@@ -4431,6 +4519,7 @@ mod engine_failure_tests {
                 ":8000".into(),
                 None,
                 1.0,
+                ReasoningFormat::default(),
                 Vec::new(),
                 None,
                 None,
@@ -4514,6 +4603,7 @@ mod engine_failure_tests {
             ":8000".into(),
             None,
             1.0,
+            ReasoningFormat::default(),
             Vec::new(),
             None,
             None,
@@ -4926,6 +5016,7 @@ mod tests {
             args.api,
             args.prefix_cache_gb,
             args.api_max_body_mb,
+            args.reasoning_format,
             Vec::new(),
             args.ep_placement,
             None,
@@ -4970,6 +5061,7 @@ mod tests {
             args.api,
             args.prefix_cache_gb,
             args.api_max_body_mb,
+            args.reasoning_format,
             Vec::new(),
             args.ep_placement,
             args.decision_dump,
@@ -5023,6 +5115,7 @@ mod tests {
             args.api,
             args.prefix_cache_gb,
             args.api_max_body_mb,
+            args.reasoning_format,
             Vec::new(),
             args.ep_placement,
             args.decision_dump,
@@ -5138,6 +5231,7 @@ mod tests {
             args.api,
             args.prefix_cache_gb,
             args.api_max_body_mb,
+            args.reasoning_format,
             args.ep_workers,
             args.ep_placement,
             None,
@@ -5248,6 +5342,51 @@ mod sycl_llama_flag_tests {
             Command::Worker(args) => args,
             _ => panic!("expected worker subcommand"),
         }
+    }
+
+    /// `run --reasoning-format` reaches the worker args `cmd_worker` reads.
+    #[test]
+    fn run_passes_reasoning_format_to_the_worker() {
+        use cascadia_api::reasoning::ReasoningFormat;
+        let w = run_worker_args(run_args(&[
+            "cascadia",
+            "run",
+            "m",
+            "--reasoning-format",
+            "none",
+        ]));
+        assert_eq!(w.reasoning_format, ReasoningFormat::None);
+        let w = run_worker_args(run_args(&["cascadia", "run", "m"]));
+        assert_eq!(w.reasoning_format, ReasoningFormat::ReasoningContent);
+    }
+
+    #[test]
+    fn reasoning_format_parses_and_defaults_to_reasoning_content() {
+        use cascadia_api::reasoning::ReasoningFormat;
+        let r = run_args(&["cascadia", "run", "m", "--reasoning-format", "none"]);
+        assert_eq!(r.reasoning_format, ReasoningFormat::None);
+        let r = run_args(&["cascadia", "run", "m"]);
+        assert_eq!(r.reasoning_format, ReasoningFormat::ReasoningContent);
+        let w = worker_args(&[
+            "cascadia",
+            "worker",
+            "--rank",
+            "0",
+            "--total",
+            "1",
+            "--model",
+            "m",
+            "--reasoning-format",
+            "none",
+        ]);
+        assert_eq!(w.reasoning_format, ReasoningFormat::None);
+        let w = worker_args(&[
+            "cascadia", "worker", "--rank", "0", "--total", "1", "--model", "m",
+        ]);
+        assert_eq!(w.reasoning_format, ReasoningFormat::ReasoningContent);
+        let bad = Cli::try_parse_from(["cascadia", "run", "m", "--reasoning-format", "raw"]);
+        let err = bad.expect_err("an unknown format is a parse error");
+        assert_eq!(err.kind(), clap::error::ErrorKind::ValueValidation);
     }
 
     #[test]

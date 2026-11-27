@@ -6116,6 +6116,9 @@ mod tests {
             trust_remote_code: false,
             tenant: String::new(),
             resume_token_ids: None,
+            reasoning_as_text: false,
+            preserve_thinking: None,
+            prompt_pretemplated: None,
             decision: Some(cascadia_types::DecisionReadout {
                 prompt_ids: vec![7, 8, 9, 10],
                 head,

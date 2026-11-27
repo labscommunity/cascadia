@@ -19,7 +19,7 @@ use async_trait::async_trait;
 use cascadia_engine::{Builder, Engine, EngineError, EngineResult, LoadStream};
 use cascadia_ov_genai_shim::{
     CbFinish, CbHandle, CbPipeline, CbRead, CbSchedulerConfig, CbStatus, Error as OvError,
-    GenConfig, LlmPipeline, PluginConfig,
+    GenConfig, GenResult, LlmPipeline, PluginConfig,
 };
 use cascadia_types::{
     Chunk, FinishReason, GenerationTask, LoadProgress, PeerLayout, SamplingParams, ShardSpec,
@@ -42,8 +42,9 @@ pub struct OvGenaiBuilder {
     pub draft_device: Option<String>,
     pub speculative_k: u32,
     pub prompt_lookup_ngram: u32,
-    /// True when the API pre-renders the model's chat template (so the engine
-    /// tells ov-genai to skip its internal apply — lets `enable_thinking` work).
+    /// True when the API pre-renders the model's chat template, so the engine
+    /// tells ov-genai to skip its internal apply (thinking on or off). A
+    /// task's own `prompt_pretemplated` overrides it for that request.
     pub prompt_pretemplated: bool,
     /// Continuous batching (#20): serve concurrent requests through one
     /// `ContinuousBatchingPipeline` instead of one-generation-per-`step()`.
@@ -354,7 +355,7 @@ impl Builder for OvGenaiBuilder {
         }
         let pipe = self.pipe.ok_or(EngineError::NotLoaded)?;
         Ok(Box::new(OvGenaiEngine {
-            pipe,
+            pipe: Box::new(pipe),
             speculative_k: self.speculative_k,
             prompt_lookup_ngram: self.prompt_lookup_ngram,
             prompt_pretemplated: self.prompt_pretemplated,
@@ -436,8 +437,25 @@ fn map_ov_err(err: OvError) -> EngineError {
     }
 }
 
+/// What [`OvGenaiEngine`] needs from an `LLMPipeline`, so its step can be
+/// driven by a scripted pipeline in tests (as [`CbPipe`] does for the
+/// continuous-batching engine).
+trait LlmPipe: Send {
+    fn generate(&self, prompt: &str, cfg: &GenConfig) -> Result<GenResult, OvError>;
+    fn count_tokens(&self, text: &str, add_special_tokens: bool) -> Option<u32>;
+}
+
+impl LlmPipe for LlmPipeline {
+    fn generate(&self, prompt: &str, cfg: &GenConfig) -> Result<GenResult, OvError> {
+        LlmPipeline::generate(self, prompt, cfg)
+    }
+    fn count_tokens(&self, text: &str, add_special_tokens: bool) -> Option<u32> {
+        LlmPipeline::count_tokens(self, text, add_special_tokens)
+    }
+}
+
 pub struct OvGenaiEngine {
-    pipe: LlmPipeline,
+    pipe: Box<dyn LlmPipe>,
     speculative_k: u32,
     prompt_lookup_ngram: u32,
     prompt_pretemplated: bool,
@@ -449,9 +467,10 @@ pub struct OvGenaiEngine {
 impl Engine for OvGenaiEngine {
     fn warmup(&mut self) {
         let cfg = self.gen_config(
+            self.prompt_pretemplated,
+            /*prompt_templated*/ false,
             /*max_tokens*/ 4,
             /*temperature*/ 0.0,
-            /*enable_thinking*/ false,
             &SamplingParams::default(),
         );
         match self.pipe.generate("Hi", &cfg) {
@@ -490,7 +509,9 @@ impl Engine for OvGenaiEngine {
             });
         }
         if self.prompt_token_limit > 0 {
-            let n = self.pipe.count_tokens(&task.prompt);
+            let n = self
+                .pipe
+                .count_tokens(&task.prompt, !prompt_templated(&task));
             refuse_over_limit(&task.task_id, n, self.prompt_token_limit)?;
         }
         self.pending.push(task);
@@ -516,10 +537,12 @@ impl Engine for OvGenaiEngine {
         } else {
             self.max_tokens_default
         };
+        let templated = prompt_templated(&task);
         let cfg = self.gen_config(
+            prompt_pretemplated(&task, self.prompt_pretemplated),
+            templated,
             max_new,
             task.temperature,
-            task.enable_thinking,
             &task.sampling,
         );
 
@@ -545,10 +568,11 @@ impl Engine for OvGenaiEngine {
         if let Some(stripped) = text.strip_prefix(&task.prompt) {
             text = stripped.trim_start().to_string();
         }
-        // Prefer tokenizer-based count; fall back to perf_metrics value.
+        // Prefer tokenizer-based count (generated text carries no BOS, so
+        // no special tokens are added); fall back to perf_metrics value.
         let tokens = self
             .pipe
-            .count_tokens(&text)
+            .count_tokens(&text, false)
             .unwrap_or(result.generated_tokens);
         let tok_s = if elapsed > 0.0 {
             tokens as f64 / elapsed
@@ -566,16 +590,26 @@ impl Engine for OvGenaiEngine {
         // Carry the real token counts on the final chunk so the API's
         // `usage` block is populated (issue #55 — previously always 0 for
         // this engine because the whole response lands on one chunk with no
-        // per-token count). `prompt_tokens` is the rendered-prompt token
-        // count; it is exact when the API pre-templated the prompt
-        // (`skip_chat_template`) and a slight undercount when ov-genai
-        // applies its own template internally (the template wrapping isn't
-        // counted). None when the tokenizer is unavailable.
+        // per-token count). `prompt_tokens` is what ov-genai reports it fed
+        // the model (perf metrics), so its own template wrapping is counted
+        // too. Failing that, the tokenizer counts the prompt: exact when the
+        // API's template rendered this prompt (counted without special
+        // tokens, as it was encoded, so its BOS counts once), a slight
+        // undercount when ov-genai wraps a raw prompt in its own template.
+        // None when neither is available.
         // finish_reason: ov-genai's GenResult doesn't report why it stopped,
         // so infer — reaching the token cap is `length`, anything short of it
         // (EOS / stop) is `stop`. Exact for the common case; an EOS landing
         // exactly at the cap reports `length` (OpenAI is also ambiguous here).
-        let finish = if tokens >= max_new {
+        // Judged on the tokens ov-genai generated: re-tokenizing the decoded
+        // text can merge differently and land one short of the cap. The
+        // re-tokenized count only stands in when the pipeline reports none.
+        let generated = if result.generated_tokens > 0 {
+            result.generated_tokens
+        } else {
+            tokens
+        };
+        let finish = if generated >= max_new {
             FinishReason::Length
         } else {
             FinishReason::Stop
@@ -583,7 +617,10 @@ impl Engine for OvGenaiEngine {
         let mut chunk = Chunk::final_marker(task.task_id.clone(), text)
             .with_n_tokens(tokens)
             .with_finish_reason(finish);
-        if let Some(prompt_tokens) = self.pipe.count_tokens(&task.prompt) {
+        let prompt_tokens = result
+            .prompt_tokens
+            .or_else(|| self.pipe.count_tokens(&task.prompt, !templated));
+        if let Some(prompt_tokens) = prompt_tokens {
             chunk = chunk.with_prompt_tokens(prompt_tokens);
         }
         Ok(vec![(task.task_id, chunk)])
@@ -631,7 +668,7 @@ trait CbPipe: Send {
         cfg: &GenConfig,
     ) -> Result<Box<dyn CbReq>, OvError>;
     fn step(&self) -> Result<(), OvError>;
-    fn count_tokens(&self, text: &str) -> Option<u32>;
+    fn count_tokens(&self, text: &str, add_special_tokens: bool) -> Option<u32>;
 }
 
 /// One enrolled request, as the engine sees it.
@@ -654,8 +691,8 @@ impl CbPipe for CbPipeline {
     fn step(&self) -> Result<(), OvError> {
         CbPipeline::step(self)
     }
-    fn count_tokens(&self, text: &str) -> Option<u32> {
-        CbPipeline::count_tokens(self, text)
+    fn count_tokens(&self, text: &str, add_special_tokens: bool) -> Option<u32> {
+        CbPipeline::count_tokens(self, text, add_special_tokens)
     }
 }
 
@@ -713,9 +750,9 @@ impl Engine for OvGenaiCbEngine {
             0,
             0,
             self.prompt_pretemplated,
+            /*prompt_templated*/ false,
             /*max_tokens*/ 4,
             /*temperature*/ 0.0,
-            /*enable_thinking*/ false,
             &SamplingParams::default(),
         );
         // u64::MAX cannot collide with the sequential request-id counter.
@@ -793,7 +830,9 @@ impl Engine for OvGenaiCbEngine {
                 cap: crate::dist_spec::MAX_PENDING_TASKS,
             });
         }
-        let prompt_tokens = self.pipe.count_tokens(&task.prompt);
+        let prompt_tokens = self
+            .pipe
+            .count_tokens(&task.prompt, !prompt_templated(&task));
         refuse_over_limit(&task.task_id, prompt_tokens, self.prompt_token_limit)?;
         let max_tokens = if task.max_tokens > 0 {
             task.max_tokens
@@ -803,10 +842,10 @@ impl Engine for OvGenaiCbEngine {
         let cfg = build_gen_config(
             0,
             0,
-            self.prompt_pretemplated,
+            prompt_pretemplated(&task, self.prompt_pretemplated),
+            prompt_templated(&task),
             max_tokens,
             task.temperature,
-            task.enable_thinking,
             &task.sampling,
         );
         let request_id = self.next_request_id;
@@ -1023,15 +1062,32 @@ impl Engine for OvGenaiCbEngine {
     }
 }
 
+/// Whether `task.prompt` was rendered through the model's chat template, so
+/// ov-genai must not apply its own: the task's own flag when the API set one
+/// (it knows whether this request's render fell back to the legacy text),
+/// else the engine's setting.
+fn prompt_pretemplated(task: &GenerationTask, engine_default: bool) -> bool {
+    task.prompt_pretemplated.unwrap_or(engine_default)
+}
+
+/// Whether the API says it rendered `task.prompt` through the chat template,
+/// so it already carries the template's special tokens (BOS) and must be
+/// encoded, and counted, without adding them. Only an explicit `Some(true)`:
+/// a task without the flag (a raw `/v1/completions` prompt, an embedder)
+/// keeps ov-genai's own encoding, special tokens added.
+fn prompt_templated(task: &GenerationTask) -> bool {
+    task.prompt_pretemplated == Some(true)
+}
+
 /// Shared `GenConfig` assembly for both ov-genai engines (the CB engine
 /// passes 0 for the speculative knobs — the CB scheduler owns batching).
 fn build_gen_config(
     speculative_k: u32,
     prompt_lookup_ngram: u32,
     prompt_pretemplated: bool,
+    prompt_templated: bool,
     max_tokens: u32,
     temperature: f32,
-    enable_thinking: bool,
     sampling: &SamplingParams,
 ) -> GenConfig {
     let do_sample = temperature > 0.0;
@@ -1041,11 +1097,13 @@ fn build_gen_config(
         temperature: if do_sample { temperature } else { 0.0 },
         num_assistant_tokens: 0,
         max_ngram_size: 0,
-        // Hybrid: only when the API rendered the template for us — i.e. a
-        // template loaded AND this request is thinking-OFF — do we tell
-        // ov-genai to skip its own apply. Thinking-ON keeps ov-genai's
-        // native templating (the legacy join the API emitted), untouched.
-        skip_chat_template: prompt_pretemplated && !enable_thinking,
+        // The prompt already went through the model's template (see
+        // `prompt_pretemplated`), so ov-genai's own apply would wrap it
+        // twice. Otherwise it is the raw user text and ov-genai wraps it.
+        skip_chat_template: prompt_pretemplated,
+        // Only a prompt the API's template rendered for this request carries
+        // the template's BOS; anything else keeps ov-genai's own encoding.
+        prompt_templated: prompt_pretemplated && prompt_templated,
         // OpenAI sampling knobs (#14). top_p/top_k take effect in the
         // sampling regime (do_sample, i.e. temperature > 0); penalties and
         // seed are forwarded regardless.
@@ -1092,18 +1150,19 @@ impl OvGenaiEngine {
     /// practice is untested here.
     fn gen_config(
         &self,
+        prompt_pretemplated: bool,
+        prompt_templated: bool,
         max_tokens: u32,
         temperature: f32,
-        enable_thinking: bool,
         sampling: &SamplingParams,
     ) -> GenConfig {
         build_gen_config(
             self.speculative_k,
             self.prompt_lookup_ngram,
-            self.prompt_pretemplated,
+            prompt_pretemplated,
+            prompt_templated,
             max_tokens,
             temperature,
-            enable_thinking,
             sampling,
         )
     }
@@ -1134,6 +1193,12 @@ mod tests {
         prompt_tokens: Option<u32>,
         steps: usize,
         added: Vec<u64>,
+        /// `skip_chat_template` of each added request's config, in order.
+        skips: Vec<bool>,
+        /// `prompt_templated` of each added request's config, in order.
+        templated: Vec<bool>,
+        /// `add_special_tokens` of each token count, in order.
+        counted_with_special: Vec<bool>,
         cancelled: Vec<u64>,
     }
 
@@ -1151,10 +1216,12 @@ mod tests {
             &self,
             request_id: u64,
             _prompt: &str,
-            _cfg: &GenConfig,
+            cfg: &GenConfig,
         ) -> Result<Box<dyn CbReq>, OvError> {
             let mut st = self.st.lock().unwrap();
             st.added.push(request_id);
+            st.skips.push(cfg.skip_chat_template);
+            st.templated.push(cfg.prompt_templated);
             let idx = st.added.len() - 1;
             while st.reads.len() <= idx {
                 st.reads.push(VecDeque::new());
@@ -1174,8 +1241,10 @@ mod tests {
                 Ok(())
             }
         }
-        fn count_tokens(&self, _text: &str) -> Option<u32> {
-            Some(self.st.lock().unwrap().prompt_tokens.unwrap_or(7))
+        fn count_tokens(&self, _text: &str, add_special_tokens: bool) -> Option<u32> {
+            let mut st = self.st.lock().unwrap();
+            st.counted_with_special.push(add_special_tokens);
+            Some(st.prompt_tokens.unwrap_or(7))
         }
     }
 
@@ -1811,6 +1880,197 @@ mod tests {
         let b = Box::new(OvGenaiBuilder::new("/x", "CPU"));
         let res = b.build();
         assert!(matches!(res, Err(EngineError::NotLoaded)));
+    }
+
+    /// A task's own flag decides whether ov-genai applies its template; a
+    /// task without one keeps the engine's setting.
+    #[test]
+    fn cb_skip_chat_template_follows_the_task_over_the_engine() {
+        for engine_pretemplated in [true, false] {
+            let st = Arc::new(Mutex::new(MockState::default()));
+            let mut e = mock_engine(&st);
+            e.prompt_pretemplated = engine_pretemplated;
+            for (i, flag) in [None, Some(false), Some(true)].into_iter().enumerate() {
+                let t = GenerationTask {
+                    prompt_pretemplated: flag,
+                    ..task(&format!("t{i}"), 4)
+                };
+                e.submit(t).unwrap();
+            }
+            assert_eq!(
+                st.lock().unwrap().skips,
+                vec![engine_pretemplated, false, true],
+                "engine setting: {engine_pretemplated}"
+            );
+        }
+    }
+
+    /// Scripted `LLMPipeline`: answers every generate with `result` and every
+    /// count with `count`, recording what it was asked.
+    #[derive(Default)]
+    struct MockLlmState {
+        templated: Vec<bool>,
+        counted_with_special: Vec<bool>,
+    }
+
+    struct MockLlm {
+        st: Arc<Mutex<MockLlmState>>,
+        generated_tokens: u32,
+        count: u32,
+    }
+
+    impl LlmPipe for MockLlm {
+        fn generate(&self, _prompt: &str, cfg: &GenConfig) -> Result<GenResult, OvError> {
+            self.st.lock().unwrap().templated.push(cfg.prompt_templated);
+            Ok(GenResult {
+                text: "an answer".into(),
+                generated_tokens: self.generated_tokens,
+                prompt_tokens: None,
+            })
+        }
+        fn count_tokens(&self, _text: &str, add_special_tokens: bool) -> Option<u32> {
+            self.st
+                .lock()
+                .unwrap()
+                .counted_with_special
+                .push(add_special_tokens);
+            Some(self.count)
+        }
+    }
+
+    fn mock_llm_engine(
+        st: &Arc<Mutex<MockLlmState>>,
+        generated_tokens: u32,
+        count: u32,
+    ) -> OvGenaiEngine {
+        OvGenaiEngine {
+            pipe: Box::new(MockLlm {
+                st: st.clone(),
+                generated_tokens,
+                count,
+            }),
+            speculative_k: 0,
+            prompt_lookup_ngram: 0,
+            prompt_pretemplated: true,
+            prompt_token_limit: 0,
+            pending: Vec::new(),
+            max_tokens_default: 256,
+        }
+    }
+
+    fn final_chunk(e: &mut OvGenaiEngine, t: GenerationTask) -> Chunk {
+        e.submit(t).unwrap();
+        let mut out = e.step().unwrap();
+        assert_eq!(out.len(), 1);
+        out.remove(0).1
+    }
+
+    /// Whether the reply hit the token cap comes from the tokens ov-genai
+    /// generated, not from re-tokenizing the decoded text (which can merge
+    /// differently); the re-tokenized count stays the usage figure.
+    #[test]
+    fn llm_finish_at_the_cap_follows_the_generated_tokens() {
+        let st = Arc::new(Mutex::new(MockLlmState::default()));
+        let mut e = mock_llm_engine(&st, 8, 7);
+        let chunk = final_chunk(&mut e, task("t1", 8));
+        assert_eq!(chunk.finish_reason, Some(FinishReason::Length));
+        assert_eq!(chunk.n_tokens, Some(7));
+
+        // Short of the cap is a stop, whatever the re-tokenized count says.
+        let mut e = mock_llm_engine(&st, 5, 8);
+        let chunk = final_chunk(&mut e, task("t2", 8));
+        assert_eq!(chunk.finish_reason, Some(FinishReason::Stop));
+
+        // No generated count from the pipeline: the re-tokenized one decides.
+        let mut e = mock_llm_engine(&st, 0, 8);
+        let chunk = final_chunk(&mut e, task("t3", 8));
+        assert_eq!(chunk.finish_reason, Some(FinishReason::Length));
+    }
+
+    /// The LLM engine asks for a templated prompt to be encoded without
+    /// special tokens only when the task says the API templated it, and
+    /// counts the prompt the same way; generated text never gets them.
+    #[test]
+    fn llm_a_templated_prompt_is_encoded_and_counted_without_special_tokens() {
+        let st = Arc::new(Mutex::new(MockLlmState::default()));
+        let mut e = mock_llm_engine(&st, 3, 3);
+        for (i, flag) in [None, Some(false), Some(true)].into_iter().enumerate() {
+            let t = GenerationTask {
+                prompt_pretemplated: flag,
+                ..task(&format!("t{i}"), 8)
+            };
+            assert_eq!(final_chunk(&mut e, t).prompt_tokens, Some(3));
+        }
+        let st = st.lock().unwrap();
+        assert_eq!(st.templated, vec![false, false, true]);
+        // Per step: the generated text, then the prompt.
+        assert_eq!(
+            st.counted_with_special,
+            vec![false, true, false, true, false, false]
+        );
+    }
+
+    /// Skipping ov-genai's template and encoding without special tokens are
+    /// separate: a raw prompt the engine does not template (`/v1/completions`)
+    /// still gets its BOS, and a templated flag alone never skips the
+    /// template.
+    #[test]
+    fn prompt_templated_needs_the_template_skipped() {
+        for (skip, templated, want_skip, want_templated) in [
+            (false, false, false, false),
+            (false, true, false, false),
+            (true, false, true, false),
+            (true, true, true, true),
+        ] {
+            let cfg = build_gen_config(0, 0, skip, templated, 16, 0.0, &SamplingParams::default());
+            assert_eq!(
+                (cfg.skip_chat_template, cfg.prompt_templated),
+                (want_skip, want_templated),
+                "skip: {skip}, templated: {templated}"
+            );
+        }
+    }
+
+    /// A prompt the API's template rendered already carries the template's
+    /// BOS: it is encoded, and counted, without adding special tokens again.
+    /// Any other prompt keeps the pipeline's own encoding.
+    #[test]
+    fn cb_a_templated_prompt_is_encoded_without_special_tokens() {
+        let st = Arc::new(Mutex::new(MockState::default()));
+        let mut e = mock_engine(&st);
+        e.prompt_pretemplated = true;
+        for (i, flag) in [None, Some(false), Some(true)].into_iter().enumerate() {
+            let t = GenerationTask {
+                prompt_pretemplated: flag,
+                ..task(&format!("t{i}"), 4)
+            };
+            e.submit(t).unwrap();
+        }
+        let st = st.lock().unwrap();
+        assert_eq!(st.templated, vec![false, false, true]);
+        assert_eq!(st.counted_with_special, vec![true, true, false]);
+    }
+
+    /// ov-genai skips its own template exactly when the API rendered the
+    /// prompt (the config no longer depends on the request's thinking
+    /// switch); otherwise it wraps the raw text itself.
+    #[test]
+    fn skip_chat_template_follows_a_pretemplated_prompt() {
+        for pretemplated in [true, false] {
+            let cfg = build_gen_config(
+                0,
+                0,
+                pretemplated,
+                pretemplated,
+                16,
+                0.0,
+                &SamplingParams::default(),
+            );
+            assert_eq!(
+                cfg.skip_chat_template, pretemplated,
+                "pretemplated: {pretemplated}"
+            );
+        }
     }
 
     #[test]

@@ -23,10 +23,13 @@ use cascadia_runner::Runner;
 use cascadia_types::{ChatTurn, GenerationTask};
 use futures::stream::{self, Stream};
 use futures::StreamExt;
+use reasoning::{ReasoningCounter, ReasoningFormat, ReasoningSplit, Seg};
 use serde::{Deserialize, Serialize};
 use tokio::sync::Semaphore;
 use tracing::{info, warn};
 use uuid::Uuid;
+
+pub mod reasoning;
 
 /// Maximum HTTP request body the chat-completions endpoint accepts. 64
 /// KiB is plenty for any legitimate chat completion (prompt + system +
@@ -132,22 +135,33 @@ pub struct AppState {
     pub chat_env: Option<Arc<minijinja::Environment<'static>>>,
     pub bos_token: Arc<str>,
     pub eos_token: Arc<str>,
-    /// Engines that own their native chat templating (ov-genai): defer to the
-    /// engine for the thinking-ON path and only render here when thinking is
-    /// OFF (to inject the empty `<think></think>`). Keeps the working
-    /// thinking-on path byte-identical to the engine's native render.
-    pub defer_template_on_thinking: bool,
     /// The engine applies the model's chat template itself (sycl-llama: the
     /// llama-server child renders the GGUF template on the structured turns
     /// the task carries). Render here is a placeholder so the empty-prompt
     /// guard stays honest; tools flow through GenerationTask, so the
     /// no-template refusal does not apply.
     pub engine_applies_template: bool,
+    /// The engine wraps a prompt the API did not template in the model's own
+    /// template (ov-genai). After a request-time render error the API sends
+    /// the legacy text, but the model still sees a templated prompt, so the
+    /// load-time probe says whether it opened `<think>` (see [`opens_think`]).
+    pub engine_templates_raw_prompts: bool,
     /// The chat template distinguishes OpenAI's `reasoning_effort` words
     /// (probed at load: "low" and "medium" render differently). When true the
     /// caller's own word reaches the template; when false the GLM high/max
     /// mapping applies. See [`EffortArgs`].
     pub effort_words: bool,
+    /// How a reply carries a thinking model's reasoning (`--reasoning-format`).
+    pub reasoning_format: ReasoningFormat,
+    /// The chat template's generation prompt opens `<think>` with thinking on
+    /// (probed at load, see [`template_opens_think`]). Stands in for the
+    /// prompt when the engine renders it itself (see [`opens_think`]).
+    pub template_opens_think: bool,
+    /// The same, rendered with no `enable_thinking` and no `tools` key (see
+    /// [`template_opens_think_unswitched`]): how an engine that applies the
+    /// template itself without that switch (ov-genai) renders it. Stands in
+    /// after a render-error fallback on such an engine.
+    pub template_opens_think_unswitched: bool,
     /// Special-token message framing to translate back into text delimiters
     /// (Inkling). See [`MarkerDialect`].
     pub marker_dialect: Option<MarkerDialect>,
@@ -295,10 +309,12 @@ pub struct Config {
     pub max_concurrent_decisions: usize,
     pub max_prompt_bytes: usize,
     pub chat_template: ChatTemplateConfig,
-    /// See [`AppState::defer_template_on_thinking`]. Set by the CLI for ov-genai.
-    pub defer_template_on_thinking: bool,
     /// See [`AppState::engine_applies_template`]. Set by the CLI for sycl-llama.
     pub engine_applies_template: bool,
+    /// See [`AppState::engine_templates_raw_prompts`]. Set by the CLI for ov-genai.
+    pub engine_templates_raw_prompts: bool,
+    /// See [`AppState::reasoning_format`]. Set by the CLI's `--reasoning-format`.
+    pub reasoning_format: ReasoningFormat,
     /// See [`MarkerDialect`]; the CLI loads it with [`MarkerDialect::load`].
     pub marker_dialect: Option<MarkerDialect>,
     /// See [`AppState::decisions`]; the CLI loads it with [`decisions::DecisionService::load`].
@@ -318,8 +334,9 @@ impl Default for Config {
             max_concurrent_decisions: DEFAULT_MAX_CONCURRENT_DECISIONS,
             max_prompt_bytes: DEFAULT_MAX_PROMPT_BYTES,
             chat_template: ChatTemplateConfig::default(),
-            defer_template_on_thinking: false,
             engine_applies_template: false,
+            engine_templates_raw_prompts: false,
+            reasoning_format: ReasoningFormat::default(),
             marker_dialect: None,
             decisions: None,
             decision_dump: None,
@@ -707,9 +724,12 @@ fn make_router_inner(
             }),
         bos_token: Arc::from(cfg.chat_template.bos_token.clone().unwrap_or_default()),
         eos_token: Arc::from(cfg.chat_template.eos_token.clone().unwrap_or_default()),
-        defer_template_on_thinking: cfg.defer_template_on_thinking,
         engine_applies_template: cfg.engine_applies_template,
+        engine_templates_raw_prompts: cfg.engine_templates_raw_prompts,
         effort_words: false,
+        reasoning_format: cfg.reasoning_format,
+        template_opens_think: false,
+        template_opens_think_unswitched: false,
         marker_dialect: cfg.marker_dialect.clone(),
         ready: Arc::new(std::sync::atomic::AtomicBool::new(true)),
         decisions: cfg.decisions.clone(),
@@ -721,6 +741,13 @@ fn make_router_inner(
             .as_deref()
             .map(|env| template_speaks_effort_words(env, &state.bos_token, &state.eos_token))
             .unwrap_or(false),
+        template_opens_think: state
+            .chat_env
+            .as_deref()
+            .is_some_and(|env| template_opens_think(env, &state.bos_token, &state.eos_token)),
+        template_opens_think_unswitched: state.chat_env.as_deref().is_some_and(|env| {
+            template_opens_think_unswitched(env, &state.bos_token, &state.eos_token)
+        }),
         ..state
     };
     if state.effort_words {
@@ -874,16 +901,58 @@ async fn list_models(State(state): State<AppState>) -> Json<ModelsResponse> {
 }
 
 #[derive(Deserialize, Debug, Clone)]
+#[serde(from = "RawChatMessage")]
 pub struct ChatMessage {
     pub role: String,
-    #[serde(default, deserialize_with = "de_null_content")]
     pub content: String,
-    #[serde(default)]
     pub name: Option<String>,
-    #[serde(default)]
     pub tool_calls: Option<Vec<ToolCall>>,
-    #[serde(default)]
     pub tool_call_id: Option<String>,
+    /// Reasoning a client replays from an earlier assistant turn, read from
+    /// `reasoning_content`, else from `reasoning` when that is a string.
+    /// Templates (Qwen3, GLM) render it in place of splitting `content`.
+    pub reasoning_content: Option<String>,
+}
+
+/// Wire form of [`ChatMessage`]. Both reasoning keys are read loosely so an
+/// odd shape (OpenRouter's `reasoning` object, a null) is ignored rather
+/// than rejected.
+#[derive(Deserialize)]
+#[serde(rename = "ChatMessage", expecting = "struct ChatMessage")]
+struct RawChatMessage {
+    role: String,
+    #[serde(default, deserialize_with = "de_null_content")]
+    content: String,
+    #[serde(default)]
+    name: Option<String>,
+    #[serde(default)]
+    tool_calls: Option<Vec<ToolCall>>,
+    #[serde(default)]
+    tool_call_id: Option<String>,
+    #[serde(default)]
+    reasoning_content: Option<serde_json::Value>,
+    #[serde(default)]
+    reasoning: Option<serde_json::Value>,
+}
+
+impl From<RawChatMessage> for ChatMessage {
+    fn from(raw: RawChatMessage) -> Self {
+        fn text(v: Option<serde_json::Value>) -> Option<String> {
+            match v {
+                Some(serde_json::Value::String(s)) if !s.trim().is_empty() => Some(s),
+                _ => None,
+            }
+        }
+        let reasoning_content = text(raw.reasoning_content).or_else(|| text(raw.reasoning));
+        Self {
+            role: raw.role,
+            content: raw.content,
+            name: raw.name,
+            tool_calls: raw.tool_calls,
+            tool_call_id: raw.tool_call_id,
+            reasoning_content,
+        }
+    }
 }
 
 /// OpenAI tool spec (request input). `function` is opaque JSON (name,
@@ -983,10 +1052,22 @@ pub struct ChatCompletionRequest {
     /// `enable_thinking` and the `reasoning_effort: "none"` off-switch — see
     /// [`ChatCompletionRequest::effective_enable_thinking`] for the full
     /// precedence chain. The map is free-form in the ecosystem; members other
-    /// than `enable_thinking` are accepted and ignored, never forwarded to
-    /// the template.
+    /// than `enable_thinking` and `preserve_thinking` are accepted and
+    /// ignored, never forwarded to the template.
     #[serde(default)]
     pub chat_template_kwargs: Option<ChatTemplateKwargs>,
+    /// The `reasoning` object other vendors' clients send (OpenRouter shape):
+    /// `{"effort": "...", "enabled": bool, "exclude": bool}`. `effort` stands
+    /// in for a missing top-level `reasoning_effort`; `enabled` is an on/off
+    /// switch; `exclude` and anything else are accepted and ignored. Kept as
+    /// raw JSON so an odd shape is ignored rather than rejected.
+    #[serde(default)]
+    pub reasoning: Option<serde_json::Value>,
+    /// The `thinking` object Anthropic-shaped clients send:
+    /// `{"type": "enabled" | "disabled", "budget_tokens": N}`. Only `type`
+    /// is read; other values and members are accepted and ignored.
+    #[serde(default)]
+    pub thinking: Option<serde_json::Value>,
     #[serde(default)]
     pub tools: Option<Vec<Tool>>,
     #[serde(default)]
@@ -994,15 +1075,36 @@ pub struct ChatCompletionRequest {
 }
 
 /// `chat_template_kwargs` as sent by vLLM/SGLang-shaped clients. Only
-/// `enable_thinking` is consumed; unknown members deserialize to nothing and
-/// are silently dropped rather than erroring.
+/// `enable_thinking` and `preserve_thinking` are consumed; unknown members
+/// deserialize to nothing and are silently dropped rather than erroring.
 #[derive(Deserialize, Debug, Default)]
 pub struct ChatTemplateKwargs {
     #[serde(default)]
     pub enable_thinking: Option<bool>,
+    /// Passed to the template as `preserve_thinking` when sent (Qwen3.6's
+    /// template keeps replayed reasoning on earlier turns when it is set).
+    /// Read leniently: a JSON bool is used, any other shape is ignored
+    /// rather than rejecting the request.
+    #[serde(default, deserialize_with = "lenient_bool")]
+    pub preserve_thinking: Option<bool>,
+}
+
+/// `Some(b)` for a JSON bool, `None` for any other value.
+fn lenient_bool<'de, D>(deserializer: D) -> Result<Option<bool>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    Ok(serde_json::Value::deserialize(deserializer)?.as_bool())
 }
 
 impl ChatCompletionRequest {
+    /// `chat_template_kwargs.preserve_thinking`, when sent.
+    fn preserve_thinking(&self) -> Option<bool> {
+        self.chat_template_kwargs
+            .as_ref()
+            .and_then(|k| k.preserve_thinking)
+    }
+
     /// Build the engine-facing `SamplingParams`, applying OpenAI defaults
     /// (top_p=1.0, penalties=0.0) when a field is omitted.
     fn sampling_params(&self) -> cascadia_types::SamplingParams {
@@ -1071,19 +1173,57 @@ impl ChatCompletionRequest {
         }
     }
 
-    /// Resolves `enable_thinking`, highest precedence first:
-    /// `chat_template_kwargs.enable_thinking` (the vLLM/SGLang convention),
-    /// then the legacy top-level `enable_thinking`, then `reasoning_effort:
-    /// "none"` turning thinking off; omission of all three means on. Both
-    /// explicit toggles must beat `"none"` for the same reason: `"none"`
-    /// exists to give clients *without* a toggle an off-switch, and must
-    /// never override a client that used one.
-    fn effective_enable_thinking(&self) -> bool {
+    /// The caller's effort word: top-level `reasoning_effort`, else
+    /// `reasoning.effort` when it is a string. The top-level field is
+    /// OpenAI's own, so it wins when a client sends both.
+    fn requested_effort(&self) -> Option<&str> {
+        self.reasoning_effort.as_deref().or_else(|| {
+            self.reasoning
+                .as_ref()
+                .and_then(|r| r.get("effort"))
+                .and_then(|e| e.as_str())
+        })
+    }
+
+    /// The first explicit on/off switch the caller sent, highest precedence
+    /// first: `chat_template_kwargs.enable_thinking` (the vLLM/SGLang
+    /// convention), the legacy top-level `enable_thinking`, `thinking.type`
+    /// (`"enabled"`/`"disabled"`; any other value is ignored), then
+    /// `reasoning.enabled` (a bool). `None` when the caller sent none.
+    fn thinking_switch(&self) -> Option<bool> {
+        let thinking_type = || match self
+            .thinking
+            .as_ref()
+            .and_then(|t| t.get("type"))
+            .and_then(|t| t.as_str())
+        {
+            Some("enabled") => Some(true),
+            Some("disabled") => Some(false),
+            _ => None,
+        };
+        let reasoning_enabled = || {
+            self.reasoning
+                .as_ref()
+                .and_then(|r| r.get("enabled"))
+                .and_then(|e| e.as_bool())
+        };
         self.chat_template_kwargs
             .as_ref()
             .and_then(|k| k.enable_thinking)
             .or(self.enable_thinking)
-            .unwrap_or_else(|| self.reasoning_effort.as_deref() != Some("none"))
+            .or_else(thinking_type)
+            .or_else(reasoning_enabled)
+    }
+
+    /// Resolves `enable_thinking`: an explicit switch
+    /// ([`thinking_switch`](Self::thinking_switch)) wins, then an effort of
+    /// `"none"` ([`requested_effort`](Self::requested_effort)) turns thinking
+    /// off; omission of all of them means on. Every explicit switch must beat
+    /// `"none"`: `"none"` exists to give clients *without* a toggle an
+    /// off-switch, and must never override a client that used one.
+    fn effective_enable_thinking(&self) -> bool {
+        self.thinking_switch()
+            .unwrap_or_else(|| self.requested_effort() != Some("none"))
     }
 
     /// Maps the OpenAI effort vocabulary onto what GLM-5's template can
@@ -1112,7 +1252,7 @@ impl ChatCompletionRequest {
     /// make "caller chose max" indistinguishable from "caller said nothing"
     /// at the Rust type level.
     fn effective_reasoning_effort(&self) -> &'static str {
-        match self.reasoning_effort.as_deref() {
+        match self.requested_effort() {
             Some("xhigh") | Some("max") => "max",
             _ => "high",
         }
@@ -1128,6 +1268,10 @@ struct ChatChoiceMessage {
     role: &'static str,
     /// `Option` so a tool-call turn emits `content: null` (OpenAI shape).
     content: Option<String>,
+    /// The model's reasoning (the text inside `<think>…</think>`), split
+    /// out of `content`. Omitted when there is none.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    reasoning_content: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     tool_calls: Option<Vec<ToolCall>>,
 }
@@ -1154,6 +1298,16 @@ struct Usage {
     prompt_tokens: u32,
     completion_tokens: u32,
     total_tokens: u32,
+    /// Present only when the reasoning split was armed (thinking on).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    completion_tokens_details: Option<CompletionTokensDetails>,
+}
+
+/// OpenAI `usage.completion_tokens_details`.
+#[derive(Serialize, Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CompletionTokensDetails {
+    /// Completion tokens spent inside `<think>…</think>`.
+    pub reasoning_tokens: u32,
 }
 
 #[derive(Serialize)]
@@ -1541,6 +1695,7 @@ fn chat_template_smoke_failures(
             name: None,
             tool_calls: None,
             tool_call_id: None,
+            reasoning_content: None,
         }
     }
     let tools = [Tool {
@@ -1597,6 +1752,16 @@ fn chat_template_smoke_failures(
             }
         })
         .collect()
+}
+
+/// Whether the API will render prompts through this chat template: one is
+/// present and builds. The same build [`make_router_with_config`] runs, so an
+/// engine that can apply the template itself (ov-genai) can be told up front
+/// whether the API will have done it.
+pub fn chat_template_builds(cfg: &ChatTemplateConfig) -> bool {
+    cfg.template
+        .as_deref()
+        .is_some_and(|src| build_chat_env(src).is_ok())
 }
 
 fn build_chat_env(template_src: &str) -> Result<minijinja::Environment<'static>, String> {
@@ -1706,6 +1871,62 @@ fn render_with_chat_env(
     reasoning_effort: Option<&str>,
     tools: Option<&[Tool]>,
 ) -> Result<String, PromptRenderError> {
+    render_with_chat_env_kwargs(
+        env,
+        messages,
+        bos_token,
+        eos_token,
+        Some(enable_thinking),
+        reasoning_effort,
+        None,
+        tools,
+    )
+}
+
+/// [`render_with_chat_env`] with the caller's `preserve_thinking`, which the
+/// template sees only when set. `enable_thinking` likewise reaches the
+/// template only when set (`None`: undefined, as an engine that applies the
+/// template without that switch renders it).
+#[allow(clippy::too_many_arguments)]
+fn render_with_chat_env_kwargs(
+    env: &minijinja::Environment<'static>,
+    messages: &[ChatMessage],
+    bos_token: &str,
+    eos_token: &str,
+    enable_thinking: Option<bool>,
+    reasoning_effort: Option<&str>,
+    preserve_thinking: Option<bool>,
+    tools: Option<&[Tool]>,
+) -> Result<String, PromptRenderError> {
+    render_chat_context(
+        env,
+        messages,
+        bos_token,
+        eos_token,
+        enable_thinking,
+        reasoning_effort,
+        preserve_thinking,
+        tools,
+        true,
+    )
+}
+
+/// [`render_with_chat_env_kwargs`], with `define_tools` saying whether the
+/// template sees a `tools` key at all. The API always sets it (`none` without
+/// tools); `false` leaves it undefined, as OpenVINO GenAI does when a request
+/// sends no tools.
+#[allow(clippy::too_many_arguments)]
+fn render_chat_context(
+    env: &minijinja::Environment<'static>,
+    messages: &[ChatMessage],
+    bos_token: &str,
+    eos_token: &str,
+    enable_thinking: Option<bool>,
+    reasoning_effort: Option<&str>,
+    preserve_thinking: Option<bool>,
+    tools: Option<&[Tool]>,
+    define_tools: bool,
+) -> Result<String, PromptRenderError> {
     use minijinja::context;
     use minijinja::value::Value;
     let tmpl = env
@@ -1742,6 +1963,15 @@ fn render_with_chat_env(
             if let Some(name) = &m.name {
                 obj["name"] = serde_json::json!(name);
             }
+            // Replayed reasoning on assistant turns only, as `chat_turns`
+            // forwards it to an engine's own template.
+            if let Some(r) = m
+                .reasoning_content
+                .as_ref()
+                .filter(|_| m.role == "assistant")
+            {
+                obj["reasoning_content"] = serde_json::json!(r);
+            }
             Value::from_serialize(obj)
         })
         .collect();
@@ -1750,10 +1980,17 @@ fn render_with_chat_env(
     let ctx = context! {
         messages => messages_value,
         add_generation_prompt => true,
-        enable_thinking => enable_thinking,
         bos_token => bos_token,
         eos_token => eos_token,
-        tools => tools_value,
+    };
+    let ctx = if define_tools {
+        context! { tools => tools_value, ..ctx }
+    } else {
+        ctx
+    };
+    let ctx = match enable_thinking {
+        Some(on) => context! { enable_thinking => on, ..ctx },
+        None => ctx,
     };
     // `reasoning_effort` is added only when Some: a `None` value renders as
     // Jinja `none`, which `is defined` / `default()` treat as a caller's choice.
@@ -1761,6 +1998,11 @@ fn render_with_chat_env(
     // undefined to 'max'; Qwen3.8 to 'xhigh').
     let ctx = match reasoning_effort {
         Some(effort) => context! { reasoning_effort => effort, ..ctx },
+        None => ctx,
+    };
+    // Likewise only when sent, so the template's own default applies.
+    let ctx = match preserve_thinking {
+        Some(preserve) => context! { preserve_thinking => preserve, ..ctx },
         None => ctx,
     };
     tmpl.render(ctx).map_err(|e| classify_render_error(&e))
@@ -1831,12 +2073,18 @@ pub struct EffortArgs<'a> {
     pub mapped: Option<&'a str>,
     /// The caller's own word, verbatim.
     pub raw: Option<&'a str>,
-    /// The caller set `enable_thinking` explicitly (a toggle beats an effort
-    /// word that would switch thinking off).
+    /// The caller sent an explicit thinking switch (`enable_thinking`,
+    /// `chat_template_kwargs.enable_thinking`, `thinking.type` or
+    /// `reasoning.enabled`); a switch beats an effort word that would turn
+    /// thinking off.
     pub explicit_thinking: bool,
     /// The template distinguishes the OpenAI words (see
     /// [`template_speaks_effort_words`]).
     pub template_words: bool,
+    /// The caller's `chat_template_kwargs.preserve_thinking`, rendered as the
+    /// template's `preserve_thinking` when set. Rides with the effort, the
+    /// other per-request template input.
+    pub preserve_thinking: Option<bool>,
 }
 
 /// Does `env` treat OpenAI's `reasoning_effort` words as distinct levels?
@@ -1856,6 +2104,7 @@ pub fn template_speaks_effort_words(
         name: None,
         tool_calls: None,
         tool_call_id: None,
+        reasoning_content: None,
     }];
     let render =
         |w: &str| render_with_chat_env(env, &msgs, bos_token, eos_token, true, Some(w), None);
@@ -1877,6 +2126,109 @@ pub fn template_speaks_effort_words(
     }
 }
 
+/// Does `env`'s generation prompt open `<think>` with thinking on? Probed once
+/// at load by rendering one user message (no tools): R1-distill and
+/// Qwen3.5-style templates end the prompt in `<think>\n`, so the model's reply
+/// starts inside reasoning. A render error is a `false` with a warning, like
+/// the effort probe.
+pub fn template_opens_think(env: &minijinja::Environment<'static>, bos: &str, eos: &str) -> bool {
+    probe_opens_think(env, bos, eos, Some(true))
+}
+
+/// The `<think>` probe both [`template_opens_think`] and
+/// [`template_opens_think_unswitched`] run. With `enable_thinking` set it
+/// renders the API's own context (`tools` set to `none`); with it `None` it
+/// renders the context GenAI gives a raw prompt: no `enable_thinking` and no
+/// `tools` key.
+fn probe_opens_think(
+    env: &minijinja::Environment<'static>,
+    bos: &str,
+    eos: &str,
+    enable_thinking: Option<bool>,
+) -> bool {
+    let msgs = [ChatMessage {
+        role: "user".into(),
+        content: "probe".into(),
+        name: None,
+        tool_calls: None,
+        tool_call_id: None,
+        reasoning_content: None,
+    }];
+    let define_tools = enable_thinking.is_some();
+    match render_chat_context(
+        env,
+        &msgs,
+        bos,
+        eos,
+        enable_thinking,
+        None,
+        None,
+        None,
+        define_tools,
+    ) {
+        Ok(prompt) => prompt.trim_end().ends_with("<think>"),
+        Err(e) => {
+            warn!(
+                error = %e,
+                enable_thinking = ?enable_thinking,
+                "<think> probe could not render the chat template; assuming the generation prompt does not open reasoning"
+            );
+            false
+        }
+    }
+}
+
+/// [`template_opens_think`] rendered as ov-genai renders the template itself
+/// for a raw prompt: no `enable_thinking` key (it passes no such switch) and
+/// no `tools` key (it sets `tools` only when a request sends some). A
+/// template that opens `<think>` only when the switch is set does not open it
+/// here; an R1-style one that always opens it does.
+pub fn template_opens_think_unswitched(
+    env: &minijinja::Environment<'static>,
+    bos: &str,
+    eos: &str,
+) -> bool {
+    probe_opens_think(env, bos, eos, None)
+}
+
+/// Did this request's generation prompt open `<think>`? When the API's chat
+/// template rendered the prompt (`templated`) it is read off `task.prompt`
+/// (per request, so a template whose generation prompt depends on the effort
+/// word is right); when the engine renders it (sycl-llama) `task.prompt` is a
+/// placeholder and the load-time `probe` stands in. With no template, or after
+/// a render error fell back to the legacy formatter, the prompt is the user's
+/// own text, which may end in `<think>` without opening anything: not opened.
+/// Unless the engine wraps that text in the model's own template
+/// (`engine_templates_raw_prompts`, ov-genai): then `unswitched_probe` stands
+/// in, the template probed with `enable_thinking` undefined as that engine
+/// renders it (false when no template loaded).
+///
+/// Always false when `task.reasoning_as_text` is set: the engine folds its
+/// separate reasoning back in as `<think>…</think>` text and sends its own
+/// `<think>` first, so starting inside reasoning would put a literal `<think>`
+/// into the returned reasoning. That fold, not the probe, is what splits
+/// sycl-llama's reasoning: its API side loads no chat template (the GGUF one
+/// is rendered by llama-server), so its probe is always false.
+pub(crate) fn opens_think(
+    engine_applies_template: bool,
+    engine_templates_raw_prompts: bool,
+    probe: bool,
+    unswitched_probe: bool,
+    templated: bool,
+    task: &GenerationTask,
+) -> bool {
+    if task.reasoning_as_text {
+        return false;
+    }
+    if engine_applies_template {
+        probe
+    } else if !templated && engine_templates_raw_prompts {
+        unswitched_probe
+    } else {
+        templated && task.prompt.trim_end().ends_with("<think>")
+    }
+}
+
 fn render_or_fallback(
     env: Option<&minijinja::Environment<'static>>,
     messages: &[ChatMessage],
@@ -1886,6 +2238,30 @@ fn render_or_fallback(
     effort: EffortArgs<'_>,
     tools: Option<&[Tool]>,
 ) -> Result<String, PromptRenderError> {
+    render_or_fallback_templated(
+        env,
+        messages,
+        bos_token,
+        eos_token,
+        enable_thinking,
+        effort,
+        tools,
+    )
+    .map(|(prompt, _)| prompt)
+}
+
+/// [`render_or_fallback`], also telling whether the chat template rendered
+/// the prompt (`false`: no template, or the legacy fallback after a render
+/// error, so the prompt is the user's own text).
+fn render_or_fallback_templated(
+    env: Option<&minijinja::Environment<'static>>,
+    messages: &[ChatMessage],
+    bos_token: &str,
+    eos_token: &str,
+    enable_thinking: bool,
+    effort: EffortArgs<'_>,
+    tools: Option<&[Tool]>,
+) -> Result<(String, bool), PromptRenderError> {
     let has_tools = tools.is_some_and(|t| !t.is_empty());
     let Some(env) = env else {
         if has_tools {
@@ -1895,7 +2271,7 @@ fn render_or_fallback(
                 "this model has no chat template, so tool definitions cannot be rendered".into(),
             ));
         }
-        return Ok(render_prompt_legacy(messages));
+        return Ok((render_prompt_legacy(messages), false));
     };
     // Which `reasoning_effort` the template sees, in order of preference.
     //
@@ -1933,6 +2309,7 @@ fn render_or_fallback(
         raw,
         explicit_thinking,
         template_words,
+        preserve_thinking,
     } = effort;
     fn push<'a>(order: &mut Vec<Option<&'a str>>, w: Option<&'a str>) {
         if !order.contains(&w) {
@@ -1959,13 +2336,14 @@ fn render_or_fallback(
     let callers = raw.filter(|r| Some(*r) != mapped);
     let mut first = Err(PromptRenderError::Failed("no render attempted".into()));
     for (i, candidate) in order.iter().enumerate() {
-        first = render_with_chat_env(
+        first = render_with_chat_env_kwargs(
             env,
             messages,
             bos_token,
             eos_token,
-            enable_thinking,
+            Some(enable_thinking),
             *candidate,
+            preserve_thinking,
             tools,
         );
         if !rejects_effort(&first) {
@@ -1984,7 +2362,7 @@ fn render_or_fallback(
         }
     }
     match first {
-        Ok(s) => Ok(s),
+        Ok(s) => Ok((s, true)),
         // A raise_exception is the template validating its own input; other
         // engines surface it rather than papering over it.
         Err(e @ PromptRenderError::Rejected(_)) => Err(e),
@@ -1994,38 +2372,30 @@ fn render_or_fallback(
                 error = %e,
                 "chat_template render failed; falling back to legacy formatter — prompt will lack role markers"
             );
-            Ok(render_prompt_legacy(messages))
+            Ok((render_prompt_legacy(messages), false))
         }
     }
 }
 
+/// The prompt, and whether the API's chat template rendered it (see
+/// [`opens_think`]).
 fn render_prompt(
     state: &AppState,
     messages: &[ChatMessage],
     enable_thinking: bool,
     effort: EffortArgs<'_>,
     tools: Option<&[Tool]>,
-) -> Result<String, PromptRenderError> {
-    // ov-genai applies the model's own template, so the engine gets raw text.
-    // Tools would be dropped on the floor here, so refuse rather than pretend.
-    // `reasoning_effort` (the caller's parameter above) is also dropped on
-    // this branch, intentionally: ov-genai applies its own template with the
-    // effort undefined, so there is nowhere for the mapped value to go.
+) -> Result<(String, bool), PromptRenderError> {
     if state.engine_applies_template {
         // the child renders the GGUF chat template on the forwarded turns;
         // the prompt is a fallback and must simply be non-empty
-        return Ok(render_prompt_legacy(messages));
+        return Ok((render_prompt_legacy(messages), false));
     }
-    if state.defer_template_on_thinking && enable_thinking {
-        if tools.is_some_and(|t| !t.is_empty()) {
-            return Err(PromptRenderError::Failed(
-                "engine-side templating is active for thinking requests; tools cannot be forwarded"
-                    .into(),
-            ));
-        }
-        return Ok(render_prompt_legacy(messages));
-    }
-    render_or_fallback(
+    // Every other engine, ov-genai included, gets the prompt rendered here
+    // through the model's template, thinking on or off; ov-genai then skips
+    // its own apply. With no template loaded this is the legacy last-user
+    // text, which ov-genai wraps in its own template.
+    render_or_fallback_templated(
         state.chat_env.as_deref(),
         messages,
         &state.bos_token,
@@ -2055,6 +2425,7 @@ fn build_choice(
                 ChatChoiceMessage {
                     role: "assistant",
                     content: None,
+                    reasoning_content: None,
                     tool_calls: Some(calls),
                 },
                 "tool_calls",
@@ -2065,6 +2436,7 @@ fn build_choice(
         ChatChoiceMessage {
             role: "assistant",
             content: Some(buf),
+            reasoning_content: None,
             tool_calls: None,
         },
         "stop",
@@ -2591,6 +2963,23 @@ impl ChatPromptRenderer {
         enable_thinking: bool,
         reasoning_effort: Option<&str>,
     ) -> Result<String, PromptRenderError> {
+        self.render_with_kwargs(messages, tools, enable_thinking, reasoning_effort, None)
+    }
+
+    /// As [`render_with_effort`](Self::render_with_effort) but also passing the
+    /// request's `chat_template_kwargs.preserve_thinking`, for callers that
+    /// render outside the server (an embedded shard backend). `Some(b)` lands in
+    /// the template's `preserve_thinking` variable (Qwen3.6 keeps earlier turns'
+    /// reasoning in the prompt when it is true); `None` leaves it undefined,
+    /// which is exactly `render_with_effort`.
+    pub fn render_with_kwargs(
+        &self,
+        messages: &[ChatMessage],
+        tools: Option<&[Tool]>,
+        enable_thinking: bool,
+        reasoning_effort: Option<&str>,
+        preserve_thinking: Option<bool>,
+    ) -> Result<String, PromptRenderError> {
         render_or_fallback(
             self.env.as_deref(),
             messages,
@@ -2599,6 +2988,7 @@ impl ChatPromptRenderer {
             enable_thinking,
             EffortArgs {
                 mapped: reasoning_effort,
+                preserve_thinking,
                 ..Default::default()
             },
             tools,
@@ -2640,6 +3030,13 @@ fn chat_turns(req: &ChatCompletionRequest) -> Vec<ChatTurn> {
                 .and_then(|cs| serde_json::to_value(cs).ok()),
             tool_call_id: m.tool_call_id.clone(),
             name: m.name.clone(),
+            // Templates read replayed reasoning on assistant turns only; an
+            // engine that applies its own template need not accept it elsewhere.
+            reasoning_content: if m.role == "assistant" {
+                m.reasoning_content.clone()
+            } else {
+                None
+            },
         })
         .collect()
 }
@@ -2672,15 +3069,16 @@ async fn chat_completions(
     // client's "low" reaches such a template unescalated — or, when the caller
     // sent nothing of their own, with the effort undefined (the template's
     // default). A caller word the template also rejects is a 400.
-    let prompt = match render_prompt(
+    let (prompt, templated) = match render_prompt(
         &state,
         &req.messages,
         enable_thinking,
         EffortArgs {
             mapped: Some(req.effective_reasoning_effort()),
-            raw: req.reasoning_effort.as_deref(),
-            explicit_thinking: req.enable_thinking.is_some(),
+            raw: req.requested_effort(),
+            explicit_thinking: req.thinking_switch().is_some(),
             template_words: state.effort_words,
+            preserve_thinking: req.preserve_thinking(),
         },
         req.tools.as_deref(),
     ) {
@@ -2751,6 +3149,7 @@ async fn chat_completions(
                     .map_or(0, |cs| serde_json::to_string(cs).map_or(0, |s| s.len()))
                 + m.tool_call_id.as_ref().map_or(0, String::len)
                 + m.name.as_ref().map_or(0, String::len)
+                + m.reasoning_content.as_ref().map_or(0, String::len)
         })
         .sum();
     if messages_bytes > state.max_prompt_bytes {
@@ -2759,7 +3158,8 @@ async fn chat_completions(
             StatusCode::PAYLOAD_TOO_LARGE,
             Json(serde_json::json!({
                 "error": format!(
-                    "messages are {messages_bytes} bytes (content + tool fields); \
+                    "messages are {messages_bytes} bytes (content, tool fields and \
+                     replayed reasoning); \
                      max allowed is {} (max_prompt_bytes)",
                     state.max_prompt_bytes,
                 )
@@ -2793,6 +3193,18 @@ async fn chat_completions(
         // rescue path sets it, engine-side of this API.
         resume_token_ids: None,
         decision: None,
+        // An engine that renders the template itself (sycl-llama) gets the
+        // model's reasoning back on a separate channel; with thinking on it
+        // returns it as `<think>…</think>` text for the reasoning split (or,
+        // under `--reasoning-format none`, for the client to read in content).
+        reasoning_as_text: enable_thinking && state.engine_applies_template,
+        // For an engine that renders the template itself (llama-server's
+        // `chat_template_kwargs`).
+        preserve_thinking: req.preserve_thinking(),
+        // Whether the chat template rendered this prompt: false for the
+        // legacy text (no template, one that failed to build, or a render
+        // error), so an engine that can apply the template (ov-genai) does.
+        prompt_pretemplated: Some(templated),
     };
 
     // Acquire a request slot before touching the engine. Contended streams
@@ -2822,6 +3234,17 @@ async fn chat_completions(
     state.stats.requests_total.fetch_add(1, Ordering::Relaxed);
     let inflight = InFlightGuard::new(state.stats.clone());
 
+    // Does the reply start inside reasoning? Streamed or not, the split
+    // starts from the same answer.
+    let opened = opens_think(
+        state.engine_applies_template,
+        state.engine_templates_raw_prompts,
+        state.template_opens_think,
+        state.template_opens_think_unswitched,
+        templated,
+        &task,
+    );
+
     if req.stream {
         let include_usage = req
             .stream_options
@@ -2834,6 +3257,7 @@ async fn chat_completions(
             state,
             req.model,
             task,
+            opened,
             permit,
             inflight,
             include_usage,
@@ -2848,6 +3272,9 @@ async fn chat_completions(
     // until the task completes; drop frees the slot.
     let _permit = permit;
     let _inflight = inflight;
+    // Counts the tokens spent on reasoning; the returned text is split again
+    // below, after stop-string trimming.
+    let mut counter = ReasoningCounter::new(enable_thinking, opened);
     let mut chunk_stream = match state.runner.generate_async(task.clone()).await {
         Ok(s) => s,
         Err(err) => return engine_error_response(err),
@@ -2876,15 +3303,21 @@ async fn chat_completions(
         }
         // Count every chunk, but replace the running sum when the final
         // carries authoritative usage (including hidden thinking/tools).
-        match marker.as_mut() {
+        let piece = match marker.as_mut() {
             Some(f) => {
-                buf.push_str(&f.feed(&chunk));
+                let mut piece = f.feed(&chunk);
                 if chunk.is_final {
-                    buf.push_str(&f.finish());
+                    piece.push_str(&f.finish());
                 }
+                piece
             }
-            None => buf.push_str(&chunk.text),
+            None => chunk.text.clone(),
+        };
+        counter.feed(&piece, chunk.token_count());
+        if chunk.is_final {
+            counter.finish();
         }
+        buf.push_str(&piece);
         chunk.accumulate_tokens(&mut completion_tokens);
         if let Some(lp) = &chunk.logprobs {
             logprobs_content.push(lp.clone());
@@ -2918,12 +3351,38 @@ async fn chat_completions(
         }
     }
 
-    let (message, choice_finish) = build_choice(
-        buf,
-        &req.tool_choice,
-        req.tools.as_ref().is_some_and(|t| !t.is_empty()),
-        enable_thinking,
-    );
+    let tools_present = req.tools.as_ref().is_some_and(|t| !t.is_empty());
+    let (message, choice_finish) =
+        if counter.armed() && state.reasoning_format == ReasoningFormat::ReasoningContent {
+            // Split the trimmed text (a stop cut inside reasoning is honoured)
+            // and scan only the answer for tool calls, so a call drafted while
+            // reasoning is never executed.
+            let mut split = ReasoningSplit::new(true, opened);
+            let (mut reasoning, mut answer) = (String::new(), String::new());
+            for seg in split.feed(&buf).into_iter().chain(split.finish()) {
+                match seg {
+                    Seg::Reasoning(t) => reasoning.push_str(&t),
+                    Seg::Answer(t) => answer.push_str(&t),
+                }
+            }
+            // Once the split consumed a `</think>`, the answer holds no reasoning.
+            // When it never did (no `<think>` opened, e.g. a bare `</think>` from
+            // a template that opened the block unseen), keep the scan's own rule
+            // of reading only past the first `</think>`.
+            let (mut message, finish) = build_choice(
+                answer,
+                &req.tool_choice,
+                tools_present,
+                !split.consumed_close(),
+            );
+            message.reasoning_content = (!reasoning.is_empty()).then_some(reasoning);
+            (message, finish)
+        } else {
+            build_choice(buf, &req.tool_choice, tools_present, enable_thinking)
+        };
+    let completion_tokens_details = counter.saw_reasoning().then(|| CompletionTokensDetails {
+        reasoning_tokens: counter.reasoning_tokens(completion_tokens),
+    });
     // A parsed tool call overrides the streamed length/stop detection;
     // otherwise keep `finish_reason` (e.g. "length" when max_tokens hit).
     if choice_finish == "tool_calls" {
@@ -2952,6 +3411,7 @@ async fn chat_completions(
             prompt_tokens,
             completion_tokens,
             total_tokens: prompt_tokens + completion_tokens,
+            completion_tokens_details,
         },
     })
     .into_response()
@@ -3021,6 +3481,10 @@ async fn completions(
         // Never client-settable; see the chat endpoint's note.
         resume_token_ids: None,
         decision: None,
+        reasoning_as_text: false,
+        preserve_thinking: None,
+        // A raw prompt: the engine keeps its own setting.
+        prompt_pretemplated: None,
     };
 
     let permit = match state.permits.clone().try_acquire_owned() {
@@ -3147,6 +3611,7 @@ async fn completions(
             prompt_tokens,
             completion_tokens,
             total_tokens: prompt_tokens + completion_tokens,
+            completion_tokens_details: None,
         },
     })
     .into_response()
@@ -3282,12 +3747,14 @@ async fn stream_text_completion(
 }
 
 // Streaming carries the usage handles (inflight/include_usage) and the tool
-// gate (tool_choice/tools_present) alongside the task plumbing.
+// gate (tool_choice/tools_present) alongside the task plumbing. `opened`: the
+// prompt opened `<think>` (see `opens_think`).
 #[allow(clippy::too_many_arguments)]
 async fn stream_completion(
     state: AppState,
     model: String,
     task: GenerationTask,
+    opened: bool,
     permit: tokio::sync::OwnedSemaphorePermit,
     inflight: InFlightGuard,
     include_usage: bool,
@@ -3299,6 +3766,10 @@ async fn stream_completion(
     // scan the same way the non-streaming path does (see `tool_call_scan_text`).
     let enable_thinking = task.enable_thinking;
     let _ = SystemTime::now();
+    // Reasoning split, as on the non-streaming path: counted whenever thinking
+    // is on, sent as `reasoning_content` unless `--reasoning-format none`.
+    let counter = ReasoningCounter::new(enable_thinking, opened);
+    let split_out = enable_thinking && state.reasoning_format == ReasoningFormat::ReasoningContent;
 
     let chunk_stream = match state.runner.generate_async(task).await {
         Ok(s) => s,
@@ -3320,7 +3791,10 @@ async fn stream_completion(
                 _inflight: inflight,
             },
             marker: state.marker_dialect.clone().map(MarkerFilter::new),
-            splitter: ToolStreamSplitter::new(enable_thinking),
+            // Split: built at the first answer text (see `next_frame`).
+            splitter: (!split_out).then(|| ToolStreamSplitter::new(enable_thinking)),
+            counter,
+            split_out,
             stats: state.stats.clone(),
             completion: std::sync::atomic::AtomicU32::new(0),
             held_tokens: 0,
@@ -3380,9 +3854,13 @@ async fn stream_completion(
     // Hyper writes immediately (combined with TCP_NODELAY set on the
     // accepted connection in cascadia-cli's serve loop, this lands the
     // per-token chunk on the wire as a separate ~220 B packet).
-    let marker: Arc<std::sync::Mutex<Option<MarkerFilter>>> = Arc::new(std::sync::Mutex::new(
-        state.marker_dialect.clone().map(MarkerFilter::new),
-    ));
+    let text_state = Arc::new(std::sync::Mutex::new(StreamText {
+        marker: state.marker_dialect.clone().map(MarkerFilter::new),
+        counter,
+        settled: false,
+        held_tokens: 0,
+    }));
+    let final_text_state = text_state.clone();
     let body_stream = permit_carrier
         .then(move |chunk| {
             let model = model.clone();
@@ -3391,7 +3869,7 @@ async fn stream_completion(
             let usage_completion = usage_completion.clone();
             let usage_prompt = usage_prompt.clone();
             let usage_finished = usage_finished.clone();
-            let marker = marker.clone();
+            let text_state = text_state.clone();
             async move {
                 // Publish real per-chunk counts live; authoritative-only
                 // engines reconcile their full model count at completion.
@@ -3413,6 +3891,8 @@ async fn stream_completion(
                 // SSE error event instead of a silent empty delta + [DONE].
                 if let Some(reason) = &chunk.error {
                     warn!(task = %task_id, reason = %reason, "engine failed task mid-stream; emitting SSE error");
+                    // Nothing held is sent after the error event.
+                    text_state.lock().unwrap().settled = true;
                     let payload = serde_json::json!({
                         "id": task_id,
                         "object": "error",
@@ -3429,40 +3909,32 @@ async fn stream_completion(
                 // Special-token framing (Inkling) → textual delimiters, same
                 // translation as the non-streaming path; withheld text (a
                 // tool call's name/JSON) surfaces on the closing marker.
-                let text = {
-                    let mut guard = marker.lock().unwrap();
-                    match guard.as_mut() {
-                        Some(f) => {
-                            let mut t = f.feed(&chunk);
-                            if chunk.is_final {
-                                t.push_str(&f.finish());
-                            }
-                            t
-                        }
-                        None => chunk.text.clone(),
+                let (reasoning, text, n_tokens) = {
+                    let mut text_state = text_state.lock().unwrap();
+                    let (reasoning, text) = text_state.route(&chunk, split_out);
+                    // While the split holds text back (a partial tag), a
+                    // step that releases nothing sends no frame: an empty
+                    // `content` frame would sit in the middle of the
+                    // reasoning. Its tokens ride the next frame.
+                    text_state.held_tokens += chunk.token_count();
+                    if split_out && !chunk.is_final && reasoning.is_empty() && text.is_empty() {
+                        return Ok::<Bytes, std::convert::Infallible>(Bytes::new());
                     }
+                    let n_tokens = std::mem::take(&mut text_state.held_tokens);
+                    (reasoning, text, n_tokens)
                 };
-                let payload = serde_json::json!({
-                    "id": task_id,
-                    "object": "chat.completion.chunk",
-                    "created": now_unix(),
-                    "model": model,
-                    "n_tokens": chunk.token_count(),
-                    "completion_tokens": chunk.completion_tokens,
-                    "choices": [{
-                        "index": 0,
-                        "delta": {
-                            "role": "assistant",
-                            "content": text,
-                        },
-                        "finish_reason": if chunk.is_final {
-                            Some(chunk.finish_reason.map(|f| f.as_openai_str()).unwrap_or("stop"))
-                        } else {
-                            None
-                        },
-                    }],
-                });
-                let line = format!("data: {payload}\n\n");
+                let finish_reason = chunk
+                    .is_final
+                    .then(|| chunk.finish_reason.map(|f| f.as_openai_str()).unwrap_or("stop"));
+                let line = content_frame(
+                    &task_id,
+                    &model,
+                    &reasoning,
+                    &text,
+                    n_tokens,
+                    chunk.completion_tokens,
+                    finish_reason,
+                );
                 // Yield between chunks so the body-sink task can drain
                 // this frame to TCP. cascadia_runner::ChunkStream::poll_next
                 // calls engine.step() inside a parking_lot::Mutex, which
@@ -3484,10 +3956,28 @@ async fn stream_completion(
             // Combined into a single HTTP frame with [DONE] (SSE events are
             // delimited by \n\n regardless of HTTP chunk boundaries).
             let mut out = String::new();
+            // Ended without a final chunk (cancelled): send what the split
+            // still holds instead of dropping it, as the tool stream does.
+            let (reasoning, text, n_tokens) = {
+                let mut text_state = final_text_state.lock().unwrap();
+                let (reasoning, text) = text_state.settle(split_out);
+                (reasoning, text, std::mem::take(&mut text_state.held_tokens))
+            };
+            if !reasoning.is_empty() || !text.is_empty() {
+                out.push_str(&content_frame(
+                    &usage_task_id,
+                    &usage_model,
+                    &reasoning,
+                    &text,
+                    n_tokens,
+                    None,
+                    None,
+                ));
+            }
             if include_usage && final_finished.load(Ordering::Relaxed) {
                 let prompt = final_prompt.load(Ordering::Relaxed);
                 let completion = final_completion.load(Ordering::Relaxed);
-                let usage = serde_json::json!({
+                let mut usage = serde_json::json!({
                     "id": usage_task_id,
                     "object": "chat.completion.chunk",
                     "created": now_unix(),
@@ -3499,6 +3989,11 @@ async fn stream_completion(
                         "total_tokens": prompt + completion,
                     },
                 });
+                add_reasoning_details(
+                    &mut usage["usage"],
+                    &final_text_state.lock().unwrap().counter,
+                    completion,
+                );
                 out.push_str(&format!("data: {usage}\n\n"));
             }
             out.push_str("data: [DONE]\n\n");
@@ -3541,7 +4036,14 @@ impl Stream for StreamWithPermit {
 struct ToolStream {
     chunks: StreamWithPermit,
     marker: Option<MarkerFilter>,
-    splitter: ToolStreamSplitter,
+    /// Fed the answer text only. With the reasoning split it is built at the
+    /// first answer text, once the split knows whether it consumed a
+    /// `</think>` (same scan rule as the non-streaming path).
+    splitter: Option<ToolStreamSplitter>,
+    counter: ReasoningCounter,
+    /// Reasoning goes out as `reasoning_content` (thinking on, format not
+    /// `none`); otherwise the counter only counts.
+    split_out: bool,
     stats: Arc<ApiStats>,
     completion: std::sync::atomic::AtomicU32,
     /// Model tokens not yet reported in a frame's `n_tokens` (their text is
@@ -3579,7 +4081,8 @@ impl ToolStream {
                 // Ended without a final chunk (cancelled): settle what is
                 // held instead of dropping it.
                 self.phase = ToolStreamPhase::Tail;
-                return Some(self.close_choice("", None, "stop"));
+                let (reasoning, answer) = self.route("", 0, true);
+                return Some(self.close_choice(&reasoning, &answer, None, "stop"));
             };
             // Progress chunks carry nothing to send or count.
             if chunk.is_progress() {
@@ -3608,6 +4111,7 @@ impl ToolStream {
                 t
             });
             let text = translated.as_deref().unwrap_or(&chunk.text);
+            let (reasoning, answer) = self.route(text, chunk.token_count(), chunk.is_final);
             let frame = if chunk.is_final {
                 self.prompt_tokens = chunk.prompt_tokens.unwrap_or(0);
                 self.finished =
@@ -3617,16 +4121,24 @@ impl ToolStream {
                     .finish_reason
                     .map(|f| f.as_openai_str())
                     .unwrap_or("stop");
-                Some(self.close_choice(text, chunk.completion_tokens, reason))
+                Some(self.close_choice(&reasoning, &answer, chunk.completion_tokens, reason))
             } else {
-                let content = self.splitter.feed(text);
-                if content.is_empty() {
+                let content = if answer.is_empty() {
+                    ""
+                } else {
+                    let thinking = !self.counter.consumed_close();
+                    self.splitter
+                        .get_or_insert_with(|| ToolStreamSplitter::new(thinking))
+                        .feed(&answer)
+                };
+                if content.is_empty() && reasoning.is_empty() {
                     None
                 } else {
                     let n_tokens = std::mem::take(&mut self.held_tokens);
                     Some(Bytes::from(content_frame(
                         &self.task_id,
                         &self.model,
+                        &reasoning,
                         content,
                         n_tokens,
                         chunk.completion_tokens,
@@ -3643,21 +4155,44 @@ impl ToolStream {
         }
     }
 
+    /// Route one chunk's text: `(reasoning, answer)`, or with no split to
+    /// send, no reasoning and the whole text. `last` settles the split.
+    fn route(&mut self, text: &str, tokens: u32, last: bool) -> (String, String) {
+        let (mut reasoning, mut answer) = self.counter.feed(text, tokens);
+        if last {
+            let (r, a) = self.counter.finish();
+            reasoning.push_str(&r);
+            answer.push_str(&a);
+        }
+        if self.split_out {
+            (reasoning, answer)
+        } else {
+            (String::new(), text.to_owned())
+        }
+    }
+
     /// Close the choice: the rest as content with the engine's
     /// finish_reason, or the still-releasable content, one indexed
-    /// tool_calls delta, and a `tool_calls` finish.
+    /// tool_calls delta, and a `tool_calls` finish. `reasoning` (the split's
+    /// last reasoning text) rides the first frame.
     fn close_choice(
         &mut self,
+        reasoning: &str,
         text: &str,
         completion_tokens: Option<u32>,
         finish_reason: &str,
     ) -> Bytes {
         let n_tokens = std::mem::take(&mut self.held_tokens);
         let (task_id, model) = (&self.task_id, &self.model);
-        let out = match self.splitter.finish(text) {
+        let thinking = !self.counter.consumed_close();
+        let splitter = self
+            .splitter
+            .get_or_insert_with(|| ToolStreamSplitter::new(thinking));
+        let out = match splitter.finish(text) {
             ToolStreamEnd::Content(content) => content_frame(
                 task_id,
                 model,
+                reasoning,
                 content,
                 n_tokens,
                 completion_tokens,
@@ -3667,8 +4202,10 @@ impl ToolStream {
                 // The held tokens are the call's: they ride the tool_calls
                 // delta, so each model token is counted in exactly one frame.
                 let mut out = String::new();
-                if !content.is_empty() {
-                    out.push_str(&content_frame(task_id, model, content, 0, None, None));
+                if !content.is_empty() || !reasoning.is_empty() {
+                    out.push_str(&content_frame(
+                        task_id, model, reasoning, content, 0, None, None,
+                    ));
                 }
                 let tool_calls: Vec<serde_json::Value> = calls
                     .into_iter()
@@ -3705,7 +4242,7 @@ impl ToolStream {
         let mut out = String::new();
         if self.include_usage && self.finished {
             let completion = self.completion.load(Ordering::Relaxed);
-            let usage = serde_json::json!({
+            let mut usage = serde_json::json!({
                 "id": self.task_id, "object": "chat.completion.chunk",
                 "created": now_unix(), "model": self.model, "choices": [],
                 "usage": {
@@ -3714,6 +4251,7 @@ impl ToolStream {
                     "total_tokens": self.prompt_tokens + completion,
                 },
             });
+            add_reasoning_details(&mut usage["usage"], &self.counter, completion);
             out.push_str(&format!("data: {usage}\n\n"));
         }
         out.push_str("data: [DONE]\n\n");
@@ -3721,15 +4259,133 @@ impl ToolStream {
     }
 }
 
-/// One `chat.completion.chunk` content delta, in the plain stream's shape.
+/// Text state of a plain chat stream: the marker translation and the
+/// reasoning split, shared by the per-chunk formatter and the usage frame.
+struct StreamText {
+    marker: Option<MarkerFilter>,
+    counter: ReasoningCounter,
+    /// A final chunk (or an error) arrived: nothing is held any more.
+    settled: bool,
+    /// Model tokens of skipped steps, not yet reported in a frame's
+    /// `n_tokens`.
+    held_tokens: u32,
+}
+
+impl StreamText {
+    /// One chunk's `(reasoning, content)`: split when `split_out`, else no
+    /// reasoning and the whole translated text (still counted).
+    fn route(&mut self, chunk: &cascadia_types::Chunk, split_out: bool) -> (String, String) {
+        self.settled |= chunk.is_final;
+        let text = match self.marker.as_mut() {
+            Some(f) => {
+                let mut t = f.feed(chunk);
+                if chunk.is_final {
+                    t.push_str(&f.finish());
+                }
+                t
+            }
+            None => chunk.text.clone(),
+        };
+        let (mut reasoning, mut answer) = self.counter.feed(&text, chunk.token_count());
+        if chunk.is_final {
+            let (r, a) = self.counter.finish();
+            reasoning.push_str(&r);
+            answer.push_str(&a);
+        }
+        if split_out {
+            (reasoning, answer)
+        } else {
+            (String::new(), text)
+        }
+    }
+
+    /// The text still held when the stream ended without a final chunk,
+    /// routed like [`StreamText::route`]; empty once settled.
+    fn settle(&mut self, split_out: bool) -> (String, String) {
+        if std::mem::replace(&mut self.settled, true) {
+            return (String::new(), String::new());
+        }
+        let text = self
+            .marker
+            .as_mut()
+            .map(MarkerFilter::finish)
+            .unwrap_or_default();
+        let (mut reasoning, mut answer) = self.counter.feed(&text, 0);
+        let (r, a) = self.counter.finish();
+        reasoning.push_str(&r);
+        answer.push_str(&a);
+        if split_out {
+            (reasoning, answer)
+        } else {
+            (String::new(), text)
+        }
+    }
+}
+
+/// A stream frame's delta: `reasoning_content` only when there is some,
+/// `content` when there is some or no reasoning (so a frame without
+/// reasoning keeps its shape, empty `content` included).
+fn stream_delta(reasoning: &str, content: &str) -> serde_json::Value {
+    let mut delta = serde_json::json!({ "role": "assistant" });
+    if !reasoning.is_empty() {
+        delta["reasoning_content"] = reasoning.into();
+    }
+    if !content.is_empty() || reasoning.is_empty() {
+        delta["content"] = content.into();
+    }
+    delta
+}
+
+/// Add `completion_tokens_details` to a stream's usage object when the
+/// reply had a reasoning block.
+fn add_reasoning_details(
+    usage: &mut serde_json::Value,
+    counter: &ReasoningCounter,
+    completion: u32,
+) {
+    if counter.saw_reasoning() {
+        usage["completion_tokens_details"] = serde_json::json!(CompletionTokensDetails {
+            reasoning_tokens: counter.reasoning_tokens(completion),
+        });
+    }
+}
+
+/// One chunk's `chat.completion.chunk` frames, in the plain stream's shape.
+///
+/// Reasoning and content never share a delta: some clients (AnythingLLM)
+/// drop a frame's content once they see `reasoning_content`, and close
+/// their reasoning block only on a frame with content and no reasoning.
+/// With both, a reasoning-only frame (`n_tokens` 0, no finish) goes first
+/// and the content frame carries the tokens and the finish, so per-frame
+/// token sums are unchanged.
+///
+/// A reasoning frame never carries `finish_reason` either: AnythingLLM
+/// skips every reasoning frame before its finish check, so a stream that
+/// finished on one would never complete. Reasoning with a finish and no
+/// content goes out as a reasoning-only frame, then an empty-content
+/// closing frame with the tokens and the finish.
 fn content_frame(
     task_id: &str,
     model: &str,
+    reasoning: &str,
     content: &str,
     n_tokens: u32,
     completion_tokens: Option<u32>,
     finish_reason: Option<&str>,
 ) -> String {
+    if !reasoning.is_empty() && (!content.is_empty() || finish_reason.is_some()) {
+        let mut out = content_frame(task_id, model, reasoning, "", 0, None, None);
+        out.push_str(&content_frame(
+            task_id,
+            model,
+            "",
+            content,
+            n_tokens,
+            completion_tokens,
+            finish_reason,
+        ));
+        return out;
+    }
     let payload = serde_json::json!({
         "id": task_id,
         "object": "chat.completion.chunk",
@@ -3739,7 +4395,7 @@ fn content_frame(
         "completion_tokens": completion_tokens,
         "choices": [{
             "index": 0,
-            "delta": { "role": "assistant", "content": content },
+            "delta": stream_delta(reasoning, content),
             "finish_reason": finish_reason,
         }],
     });
@@ -3979,8 +4635,26 @@ mod tests {
             name: None,
             tool_calls: None,
             tool_call_id: None,
+            reasoning_content: None,
         }
     }
+
+    fn msg_with_reasoning(role: &str, content: &str, reasoning: &str) -> ChatMessage {
+        ChatMessage {
+            reasoning_content: Some(reasoning.into()),
+            ..msg(role, content)
+        }
+    }
+
+    /// Render `msgs` through `tpl` with the production chat env, surfacing any
+    /// render error instead of falling back to the legacy formatter.
+    fn render_test_template(tpl: &str, msgs: &[ChatMessage]) -> String {
+        let env = build_chat_env(tpl).expect("template parses");
+        render_with_chat_env(&env, msgs, "", "", true, None, None).expect("template renders")
+    }
+
+    /// Qwen3-8B's chat template, as shipped in its `tokenizer_config.json`.
+    const QWEN3_TEMPLATE: &str = include_str!("../tests/fixtures/qwen3-8b-chat-template.jinja");
 
     // Qwen3.x templates group consecutive tool results into one user turn with
     // `loop.previtem` / `loop.nextitem`. Without minijinja's
@@ -4074,6 +4748,41 @@ mod tests {
         let r1 = ChatPromptRenderer::new(&cfg).render(&msgs).unwrap();
         let want = "<｜begin▁of▁sentence｜><｜User｜>What is 2+2?<｜Assistant｜>4<｜end▁of▁sentence｜><｜User｜>And 3+3?<｜Assistant｜>";
         assert_eq!(r1, want, "R1 render mismatch");
+    }
+
+    /// An embedded caller (one that holds a [`ChatPromptRenderer`], not the
+    /// server's `AppState`) can hand the template `preserve_thinking`: set, the
+    /// template sees that value; unset, it stays undefined and the render is
+    /// [`ChatPromptRenderer::render_with_effort`]'s.
+    #[test]
+    fn renderer_passes_preserve_thinking_to_the_template() {
+        let cfg = ChatTemplateConfig {
+            template: Some(
+                "{% for m in messages %}{{ m.content }}{% endfor %}\
+                 |{% if preserve_thinking is defined %}{{ preserve_thinking }}\
+                 {% else %}undefined{% endif %}"
+                    .into(),
+            ),
+            bos_token: None,
+            eos_token: None,
+        };
+        let r = ChatPromptRenderer::new(&cfg);
+        let msgs = vec![ChatMessage {
+            role: "user".into(),
+            content: "hi".into(),
+            name: None,
+            tool_calls: None,
+            tool_call_id: None,
+            reasoning_content: None,
+        }];
+        let with = |p| r.render_with_kwargs(&msgs, None, true, None, p).unwrap();
+        assert_eq!(with(Some(true)), "hi|true");
+        assert_eq!(with(Some(false)), "hi|false");
+        assert_eq!(with(None), "hi|undefined");
+        assert_eq!(
+            with(None),
+            r.render_with_effort(&msgs, None, true, None).unwrap()
+        );
     }
 
     // Proves the CLI's sparse-moe root-layout path (load_chat_template_config_at,
@@ -6839,6 +7548,9 @@ mod tests {
                 request["prompt"] = serde_json::json!("hi");
             } else {
                 request["messages"] = serde_json::json!([{"role":"user","content":"hi"}]);
+                // A reply that reasons adds `completion_tokens_details`; this test is
+                // about the totals.
+                request["enable_thinking"] = serde_json::json!(false);
             }
             if tool {
                 request["tools"] =
@@ -7545,6 +8257,7 @@ mod tests {
             name: None,
             tool_calls: None,
             tool_call_id: None,
+            reasoning_content: None,
         }];
         let env = build_chat_env(MACRO_TEMPLATE).expect("macro-based template must parse");
         let out = render_with_chat_env(&env, &msgs, "<bos>", "<eos>", true, None, None)
@@ -7574,6 +8287,7 @@ mod tests {
             name: None,
             tool_calls: None,
             tool_call_id: None,
+            reasoning_content: None,
         }];
         let on = renderer.render_with_tools(&msgs, None).unwrap();
         assert!(on.ends_with("<think>"), "thinking-on render: {on}");
@@ -7607,6 +8321,7 @@ mod tests {
                 },
             }]),
             tool_call_id: None,
+            reasoning_content: None,
         }];
         let env = build_chat_env(T).expect("template parses");
         let out = render_with_chat_env(&env, &msgs, "<bos>", "<eos>", true, None, None)
@@ -7623,6 +8338,7 @@ mod tests {
             name: None,
             tool_calls: None,
             tool_call_id: None,
+            reasoning_content: None,
         }];
 
         // Template present: renders through the parsed env (parsed once in `new`).
@@ -7716,6 +8432,7 @@ mod tests {
         let msg = ChatChoiceMessage {
             role: "assistant",
             content: Some("hi".into()),
+            reasoning_content: None,
             tool_calls: None,
         };
         let v = serde_json::to_value(&msg).unwrap();
@@ -8117,6 +8834,7 @@ mod tests {
             name: None,
             tool_calls: None,
             tool_call_id: None,
+            reasoning_content: None,
         }];
         let tools = vec![Tool {
             r#type: "function".into(),
@@ -8142,6 +8860,7 @@ mod tests {
             name: None,
             tool_calls: None,
             tool_call_id: None,
+            reasoning_content: None,
         }];
         let tools = vec![Tool {
             r#type: "function".into(),
@@ -8298,6 +9017,7 @@ mod tests {
             name: None,
             tool_calls: None,
             tool_call_id: None,
+            reasoning_content: None,
         }];
         let tools = vec![Tool {
             r#type: "function".into(),
@@ -8364,6 +9084,7 @@ mod tests {
             name: None,
             tool_calls: None,
             tool_call_id: None,
+            reasoning_content: None,
         }];
         let tools = vec![Tool {
             r#type: "function".into(),
@@ -8427,6 +9148,7 @@ mod tests {
             name: None,
             tool_calls: None,
             tool_call_id: None,
+            reasoning_content: None,
         }];
 
         let unset = render_with_chat_env(&env, &msgs, "", "", true, None, None).unwrap();
@@ -8450,6 +9172,86 @@ mod tests {
             .unwrap()
             .extend(extra.as_object().unwrap().clone());
         serde_json::from_value(v).unwrap()
+    }
+
+    /// A one-user-message request with `extra` merged into its body.
+    fn with_extra(extra: serde_json::Value) -> ChatCompletionRequest {
+        let mut v = serde_json::json!({ "messages": [{"role": "user", "content": "hi"}] });
+        v.as_object_mut()
+            .unwrap()
+            .extend(extra.as_object().unwrap().clone());
+        chat_request(v)
+    }
+
+    #[test]
+    fn vendor_switches_turn_thinking_off_and_on() {
+        use serde_json::json;
+        let off = [
+            json!({"thinking": {"type": "disabled"}}),
+            json!({"reasoning": {"enabled": false}}),
+            json!({"reasoning": {"effort": "none"}}),
+        ];
+        for extra in off {
+            assert!(
+                !with_extra(extra.clone()).effective_enable_thinking(),
+                "{extra}"
+            );
+        }
+        let on = [
+            json!({"thinking": {"type": "enabled"}, "reasoning_effort": "none"}),
+            json!({"reasoning": {"enabled": true, "effort": "none"}}),
+        ];
+        for extra in on {
+            assert!(
+                with_extra(extra.clone()).effective_enable_thinking(),
+                "{extra}"
+            );
+        }
+    }
+
+    #[test]
+    fn explicit_toggles_outrank_vendor_switches() {
+        use serde_json::json;
+        assert!(
+            with_extra(json!({"enable_thinking": true, "thinking": {"type": "disabled"}}))
+                .effective_enable_thinking()
+        );
+        assert!(!with_extra(json!({
+            "chat_template_kwargs": {"enable_thinking": false},
+            "reasoning": {"enabled": true}
+        }))
+        .effective_enable_thinking());
+    }
+
+    #[test]
+    fn reasoning_effort_object_reaches_the_effort_mapping_and_top_level_wins() {
+        use serde_json::json;
+        assert_eq!(
+            with_extra(json!({"reasoning": {"effort": "max"}})).effective_reasoning_effort(),
+            "max"
+        );
+        assert_eq!(
+            with_extra(json!({"reasoning_effort": "low", "reasoning": {"effort": "max"}}))
+                .effective_reasoning_effort(),
+            "high"
+        );
+    }
+
+    #[test]
+    fn odd_vendor_shapes_are_ignored_not_rejected() {
+        use serde_json::json;
+        for extra in [
+            json!({"reasoning": "high"}),
+            json!({"thinking": true}),
+            json!({"thinking": {"type": "adaptive"}}),
+            json!({"reasoning": {"effort": 7}}),
+            json!({"reasoning": {"exclude": true}, "thinking": {"type": "enabled", "budget_tokens": 1024}}),
+        ] {
+            assert!(
+                with_extra(extra.clone()).effective_enable_thinking(),
+                "{extra}"
+            );
+        }
     }
 
     #[test]
@@ -8481,6 +9283,256 @@ mod tests {
         let tools = chat_tools(&req).expect("tools forwarded");
         assert_eq!(tools[0]["type"], "function");
         assert_eq!(tools[0]["function"]["name"], "get_weather");
+    }
+
+    #[test]
+    fn replayed_reasoning_is_accepted_under_both_names() {
+        let r = chat_request(
+            serde_json::json!({"messages":[{"role":"user","content":"q"},
+            {"role":"assistant","content":"a","reasoning_content":"r1"},
+            {"role":"assistant","content":"b","reasoning":"r2"},
+            {"role":"assistant","content":"c","reasoning_content":"r3","reasoning":"other"},
+            {"role":"assistant","content":"d","reasoning":{"summary":[]}}]}),
+        );
+        let got: Vec<_> = r
+            .messages
+            .iter()
+            .map(|m| m.reasoning_content.clone())
+            .collect();
+        assert_eq!(
+            got,
+            vec![
+                None,
+                Some("r1".into()),
+                Some("r2".into()),
+                Some("r3".into()),
+                None
+            ]
+        );
+    }
+
+    #[test]
+    fn null_or_blank_replayed_reasoning_is_none() {
+        let r = chat_request(serde_json::json!({"messages":[
+            {"role":"assistant","content":"a","reasoning_content":null},
+            {"role":"assistant","content":"b","reasoning_content":""},
+            {"role":"assistant","content":"c","reasoning_content":"  \n"},
+            {"role":"assistant","content":"d","reasoning":null},
+            {"role":"assistant","content":"e","reasoning":""},
+            {"role":"assistant","content":"f","reasoning_content":42},
+            {"role":"assistant","content":"g","reasoning_content":"","reasoning":"fallback"}]}));
+        let got: Vec<_> = r
+            .messages
+            .iter()
+            .map(|m| m.reasoning_content.clone())
+            .collect();
+        assert_eq!(
+            got,
+            vec![None, None, None, None, None, None, Some("fallback".into())]
+        );
+    }
+
+    #[test]
+    fn template_sees_reasoning_content_on_assistant_turns() {
+        // Qwen3's history branch: `{% if message.reasoning_content is string %}` renders it.
+        let tpl = "{% for m in messages %}{% if m.reasoning_content is string %}<think>{{ m.reasoning_content }}</think>{% endif %}{{ m.content }}|{% endfor %}";
+        let out = render_test_template(
+            tpl,
+            &[
+                msg("user", "q"),
+                msg_with_reasoning("assistant", "a", "why"),
+            ],
+        );
+        assert_eq!(out, "q|<think>why</think>a|");
+    }
+
+    #[test]
+    fn absent_reasoning_content_is_undefined_to_the_template() {
+        let tpl = "{% for m in messages %}{{ m.reasoning_content is defined }}|{% endfor %}";
+        let out = render_test_template(tpl, &[msg("assistant", "a")]);
+        assert_eq!(out, "false|");
+    }
+
+    #[test]
+    fn qwen3_renders_replayed_reasoning_inside_the_current_tool_loop() {
+        let call = ToolCall {
+            id: "call_1".into(),
+            r#type: "function".into(),
+            function: FunctionCall {
+                name: "get_weather".into(),
+                arguments: "{\"city\":\"Paris\"}".into(),
+            },
+        };
+        let assistant = |reasoning: Option<&str>| ChatMessage {
+            tool_calls: Some(vec![call.clone()]),
+            reasoning_content: reasoning.map(str::to_owned),
+            ..msg("assistant", "")
+        };
+        let tool = ChatMessage {
+            tool_call_id: Some("call_1".into()),
+            ..msg("tool", "18C")
+        };
+        let with = render_test_template(
+            QWEN3_TEMPLATE,
+            &[
+                msg("user", "weather in Paris?"),
+                assistant(Some("I should call the tool.")),
+                tool.clone(),
+            ],
+        );
+        assert!(
+            with.contains(
+                "<|im_start|>assistant\n<think>\nI should call the tool.\n</think>\n\n\
+                 <tool_call>\n{\"name\": \"get_weather\""
+            ),
+            "replayed reasoning missing from the tool loop: {with}"
+        );
+        let without = render_test_template(
+            QWEN3_TEMPLATE,
+            &[msg("user", "weather in Paris?"), assistant(None), tool],
+        );
+        assert!(
+            !without.contains("<think>"),
+            "no reasoning sent, none rendered: {without}"
+        );
+    }
+
+    /// A malformed message names the public type, as before the loose
+    /// reasoning reader was added.
+    #[test]
+    fn malformed_message_error_names_chat_message() {
+        let err = serde_json::from_value::<ChatMessage>(serde_json::json!(5)).unwrap_err();
+        assert!(err.to_string().contains("struct ChatMessage"), "{err}");
+    }
+
+    /// The other half of the template's rule: reasoning replayed on an
+    /// assistant turn before the last user message is dropped from the prompt.
+    #[test]
+    fn qwen3_drops_replayed_reasoning_before_the_last_user_message() {
+        let earlier = ChatMessage {
+            reasoning_content: Some("OLD-REASONING".into()),
+            ..msg("assistant", "4")
+        };
+        let out = render_test_template(
+            QWEN3_TEMPLATE,
+            &[msg("user", "2+2?"), earlier, msg("user", "and 3+3?")],
+        );
+        assert!(!out.contains("OLD-REASONING"), "{out}");
+        assert!(out.contains("<|im_start|>assistant\n4<|im_end|>"), "{out}");
+    }
+
+    #[test]
+    fn reasoning_on_a_user_turn_leaves_its_render_unchanged() {
+        let plain = render_test_template(QWEN3_TEMPLATE, &[msg("user", "q")]);
+        let with = render_test_template(QWEN3_TEMPLATE, &[msg_with_reasoning("user", "q", "r")]);
+        assert_eq!(plain, with);
+    }
+
+    /// Replayed reasoning reaches the template on assistant turns only, as
+    /// it reaches an engine's own template (`chat_turns`).
+    #[test]
+    fn template_sees_replayed_reasoning_on_assistant_turns_only() {
+        let t = "{% for m in messages %}{{ m.role }}={% if m.reasoning_content is defined %}\
+                 {{ m.reasoning_content }}{% else %}-{% endif %};{% endfor %}";
+        let out = render_test_template(
+            t,
+            &[
+                msg_with_reasoning("system", "s", "rs"),
+                msg_with_reasoning("user", "q", "ru"),
+                msg_with_reasoning("assistant", "a", "ra"),
+                msg_with_reasoning("tool", "t", "rt"),
+            ],
+        );
+        assert_eq!(out, "system=-;user=-;assistant=ra;tool=-;");
+    }
+
+    #[tokio::test]
+    async fn reasoning_on_a_user_turn_is_accepted() {
+        let runner = Runner::new(Box::new(MockBuilder::new()));
+        runner
+            .start(
+                PeerLayout::single_stage(),
+                ShardSpec::single_stage("mock-model", "CPU"),
+            )
+            .await
+            .unwrap();
+        let cfg = Config {
+            chat_template: ChatTemplateConfig {
+                template: Some(QWEN3_TEMPLATE.into()),
+                bos_token: None,
+                eos_token: None,
+            },
+            ..Config::default()
+        };
+        let app = make_router_with_config(Arc::new(runner), "mock-model", cfg);
+        let payload = serde_json::json!({
+            "model": "mock-model",
+            "max_tokens": 4,
+            "messages": [{"role":"user","content":"hi","reasoning_content":"stray"}],
+        });
+        let (status, body) = post_chat(app, payload).await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+    }
+
+    #[test]
+    fn chat_turns_forward_replayed_reasoning() {
+        let req = chat_request(serde_json::json!({"messages":[
+            {"role":"user","content":"q"},
+            {"role":"assistant","content":"a","reasoning_content":"why"}]}));
+        let turns = chat_turns(&req);
+        assert_eq!(turns[0].reasoning_content, None);
+        assert_eq!(turns[1].reasoning_content.as_deref(), Some("why"));
+    }
+
+    /// Only an assistant turn's reasoning reaches an engine that applies its
+    /// own template (llama-server): templates read it on assistant turns only,
+    /// and a server need not accept it anywhere else.
+    #[test]
+    fn chat_turns_forward_replayed_reasoning_on_assistant_turns_only() {
+        let req = chat_request(serde_json::json!({"messages":[
+            {"role":"system","content":"s","reasoning_content":"r0"},
+            {"role":"user","content":"q","reasoning_content":"r1"},
+            {"role":"assistant","content":"a","reasoning_content":"r2"},
+            {"role":"tool","tool_call_id":"c","content":"t","reasoning_content":"r3"}]}));
+        let got: Vec<_> = chat_turns(&req)
+            .into_iter()
+            .map(|t| t.reasoning_content)
+            .collect();
+        assert_eq!(got, vec![None, None, Some("r2".into()), None]);
+    }
+
+    #[tokio::test]
+    async fn replayed_reasoning_counts_toward_the_prompt_byte_limit() {
+        // Roles-only template keeps the rendered prompt tiny; only the
+        // replayed reasoning pushes the messages over the limit.
+        let runner = Runner::new(Box::new(MockBuilder::new()));
+        runner
+            .start(
+                PeerLayout::single_stage(),
+                ShardSpec::single_stage("mock-model", "CPU"),
+            )
+            .await
+            .unwrap();
+        let cfg = Config {
+            max_prompt_bytes: 128,
+            chat_template: ChatTemplateConfig {
+                template: Some("{% for m in messages %}{{ m.role }}\n{% endfor %}".into()),
+                bos_token: None,
+                eos_token: None,
+            },
+            ..Config::default()
+        };
+        let app = make_router_with_config(Arc::new(runner), "mock-model", cfg);
+        let payload = serde_json::json!({
+            "model": "mock-model",
+            "messages": [
+                {"role":"user","content":"hi"},
+                {"role":"assistant","content":"a","reasoning_content": "x".repeat(4096)},
+                {"role":"user","content":"more"},
+            ],
+        });
+        let (status, body) = post_chat(app, payload).await;
+        assert_eq!(status, StatusCode::PAYLOAD_TOO_LARGE, "{body}");
     }
 
     #[tokio::test]
@@ -8675,6 +9727,91 @@ mod tests {
         );
     }
 
+    /// End to end over HTTP: the `reasoning` and `thinking` objects other
+    /// vendors' clients send reach the template — `reasoning.effort` as the
+    /// caller's word, `thinking.type: "disabled"` as thinking off. The mock
+    /// engine echoes the prompt, so the completion text is the rendered prompt.
+    #[tokio::test]
+    async fn http_vendor_reasoning_and_thinking_objects_reach_the_template() {
+        const T: &str = "effort={{ reasoning_effort | default('unset') }} \
+{%- if enable_thinking %} thinking=on{% else %} thinking=off{% endif %}";
+        let runner = Runner::new(Box::new(MockBuilder::new()));
+        runner
+            .start(
+                PeerLayout::single_stage(),
+                ShardSpec::single_stage("mock-model", "CPU"),
+            )
+            .await
+            .unwrap();
+        let cfg = Config {
+            chat_template: ChatTemplateConfig {
+                template: Some(T.to_string()),
+                bos_token: None,
+                eos_token: None,
+            },
+            ..Config::default()
+        };
+        let app = make_router_with_config(Arc::new(runner), "mock-model", cfg);
+
+        let (status, v) = post_chat(
+            app.clone(),
+            serde_json::json!({
+                "model": "mock-model",
+                "messages": [{"role": "user", "content": "hi"}],
+                "reasoning": {"effort": "max", "exclude": true},
+                "stream": false,
+            }),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "body: {v}");
+        let content = v["choices"][0]["message"]["content"].as_str().unwrap();
+        assert_eq!(content.trim(), "effort=max thinking=on");
+
+        let (status, v) = post_chat(
+            app.clone(),
+            serde_json::json!({
+                "model": "mock-model",
+                "messages": [{"role": "user", "content": "hi"}],
+                "thinking": {"type": "disabled", "budget_tokens": 1024},
+                "stream": false,
+            }),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "body: {v}");
+        let content = v["choices"][0]["message"]["content"].as_str().unwrap();
+        assert!(
+            content.trim().ends_with("thinking=off"),
+            "thinking.type disabled must render the thinking-off branch: {content}"
+        );
+
+        // An explicit on-switch of any kind beats "none" on a template that
+        // speaks effort words: thinking stays on and the template gets the
+        // mapped word, not the off word.
+        for switch in [
+            serde_json::json!({"thinking": {"type": "enabled"}}),
+            serde_json::json!({"chat_template_kwargs": {"enable_thinking": true}}),
+            serde_json::json!({"reasoning": {"enabled": true}}),
+        ] {
+            let mut body = serde_json::json!({
+                "model": "mock-model",
+                "messages": [{"role": "user", "content": "hi"}],
+                "reasoning_effort": "none",
+                "stream": false,
+            });
+            body.as_object_mut()
+                .unwrap()
+                .extend(switch.as_object().unwrap().clone());
+            let (status, v) = post_chat(app.clone(), body).await;
+            assert_eq!(status, StatusCode::OK, "body: {v}");
+            let content = v["choices"][0]["message"]["content"].as_str().unwrap();
+            assert_eq!(
+                content.trim(),
+                "effort=high thinking=on",
+                "switch: {switch}"
+            );
+        }
+    }
+
     /// The rejection match is a substring test against the template's own
     /// prose. A template that spells the parameter `reasoning_effort` must
     /// trigger the same retry, not the blanket 400 this ladder exists to fix.
@@ -8759,6 +9896,7 @@ level={{ effort_map[eff] }}";
                 raw,
                 explicit_thinking: explicit,
                 template_words: true,
+                ..Default::default()
             };
             render_or_fallback(Some(&env), &msgs, "", "", thinking, effort, None)
         };
@@ -8788,6 +9926,429 @@ level={{ effort_map[eff] }}";
         ));
     }
 
+    /// A template whose generation prompt ends in `<think>\n` (R1-distill,
+    /// Qwen3.5-style) starts the reply inside reasoning: the probe says so.
+    #[test]
+    fn think_probe_sees_a_generation_prompt_that_opens_think() {
+        const T: &str = "{% for m in messages %}<|im_start|>{{ m.role }}\n{{ m.content }}<|im_end|>\n{% endfor %}\
+{% if add_generation_prompt %}<|im_start|>assistant\n<think>\n{% endif %}";
+        let env = build_chat_env(T).unwrap();
+        assert!(template_opens_think(&env, "", ""));
+    }
+
+    /// Probed without `enable_thinking`, an R1-style template still opens
+    /// `<think>`; one that opens it only on the switch does not.
+    #[test]
+    fn unswitched_think_probe_follows_the_template_default() {
+        let always = build_chat_env(OPENS_THINK_TEMPLATE).unwrap();
+        assert!(template_opens_think(&always, "", ""));
+        assert!(template_opens_think_unswitched(&always, "", ""));
+        let switched = build_chat_env(SWITCHED_THINK_TEMPLATE).unwrap();
+        assert!(template_opens_think(&switched, "", ""));
+        assert!(!template_opens_think_unswitched(&switched, "", ""));
+        let qwen3 = build_chat_env(QWEN3_TEMPLATE).unwrap();
+        assert!(!template_opens_think_unswitched(&qwen3, "", ""));
+    }
+
+    /// The unswitched probe leaves `tools` undefined, as GenAI renders a raw
+    /// prompt (it sets `tools` only when a request sends some), so a template
+    /// that opens `<think>` only when `tools is defined` does not open it
+    /// there. The switched probe keeps the API's own context, where `tools`
+    /// is always set (`none` without tools).
+    #[test]
+    fn unswitched_think_probe_leaves_tools_undefined() {
+        let env = build_chat_env(
+            "{% for m in messages %}{{ m.content }}{% endfor %}\
+             {% if add_generation_prompt %}{% if tools is defined %}<think>\n{% endif %}{% endif %}",
+        )
+        .unwrap();
+        assert!(!template_opens_think_unswitched(&env, "", ""));
+        assert!(template_opens_think(&env, "", ""));
+    }
+
+    /// Qwen3-8B's generation prompt stops at `<|im_start|>assistant\n`: the
+    /// model writes `<think>` itself, so the probe says no.
+    #[test]
+    fn think_probe_is_false_when_the_model_opens_the_tag() {
+        let env = build_chat_env(QWEN3_TEMPLATE).unwrap();
+        assert!(!template_opens_think(&env, "", ""));
+    }
+
+    /// Where the opened `<think>` is read from: the API's own render, or the
+    /// load-time probe when the engine renders the prompt itself; never when
+    /// the engine sends its reasoning as `<think>…</think>` text.
+    #[test]
+    fn opens_think_reads_the_prompt_or_the_probe() {
+        let opened = GenerationTask::new("t", "<|im_start|>assistant\n<think>\n");
+        let closed = GenerationTask::new("t", "<|im_start|>assistant\n");
+        // API rendered the prompt (ov-genai included, thinking on or off):
+        // read it, ignore the probe.
+        assert!(opens_think(false, false, false, false, true, &opened));
+        assert!(!opens_think(false, false, true, true, true, &closed));
+        // The engine renders (sycl-llama): the probe stands in.
+        assert!(opens_think(true, false, true, true, true, &closed));
+        assert!(!opens_think(true, false, false, false, true, &opened));
+        // ...the probe rendered with thinking on, never the unswitched one,
+        // even when the engine would also wrap a raw prompt.
+        assert!(opens_think(true, false, true, false, false, &closed));
+        assert!(!opens_think(true, false, false, true, false, &opened));
+        assert!(opens_think(true, true, true, false, false, &closed));
+        assert!(!opens_think(true, true, false, true, false, &opened));
+        // Reasoning folded in as text: the engine sends its own `<think>`.
+        let folded = |prompt: &str| GenerationTask {
+            reasoning_as_text: true,
+            ..GenerationTask::new("t", prompt)
+        };
+        assert!(!opens_think(
+            true,
+            false,
+            true,
+            true,
+            true,
+            &folded("<think>\n")
+        ));
+        assert!(!opens_think(
+            false,
+            false,
+            true,
+            true,
+            true,
+            &folded("<think>\n")
+        ));
+        // No template rendered the prompt (none loaded, or the legacy
+        // fallback after a render error): the user's own text, never opened.
+        assert!(!opens_think(false, false, false, false, false, &opened));
+        assert!(!opens_think(false, false, true, true, false, &opened));
+        // The engine wraps untemplated text in the model's template
+        // (ov-genai): the probe without the thinking switch decides; a
+        // templated prompt is still read.
+        assert!(opens_think(false, true, false, true, false, &closed));
+        assert!(!opens_think(false, true, true, false, false, &opened));
+        assert!(opens_think(false, true, true, true, false, &closed));
+        assert!(!opens_think(false, true, false, false, false, &opened));
+        assert!(!opens_think(false, true, true, true, true, &closed));
+        assert!(opens_think(false, true, false, false, true, &opened));
+        // The engine renders: the probe still decides.
+        assert!(opens_think(true, false, true, true, false, &closed));
+    }
+
+    /// Records every task it is handed and answers each with a bare final.
+    struct TaskCaptureEngine {
+        seen: Arc<std::sync::Mutex<Vec<GenerationTask>>>,
+        pending: Option<cascadia_types::TaskId>,
+    }
+
+    impl cascadia_engine::Engine for TaskCaptureEngine {
+        fn warmup(&mut self) {}
+        fn submit(&mut self, task: GenerationTask) -> cascadia_engine::EngineResult<()> {
+            self.pending = Some(task.task_id.clone());
+            self.seen.lock().unwrap().push(task);
+            Ok(())
+        }
+        fn step(&mut self) -> cascadia_engine::EngineResult<Vec<(cascadia_types::TaskId, Chunk)>> {
+            let Some(id) = self.pending.take() else {
+                return Ok(Vec::new());
+            };
+            Ok(vec![(
+                id.clone(),
+                Chunk::final_marker(&id, "").with_finish_reason(cascadia_types::FinishReason::Stop),
+            )])
+        }
+    }
+
+    struct TaskCaptureBuilder(Arc<std::sync::Mutex<Vec<GenerationTask>>>);
+
+    #[::async_trait::async_trait]
+    impl cascadia_engine::Builder for TaskCaptureBuilder {
+        async fn connect(&mut self, _peers: PeerLayout) -> cascadia_engine::EngineResult<()> {
+            Ok(())
+        }
+        async fn load(
+            &mut self,
+            _shard: ShardSpec,
+        ) -> cascadia_engine::EngineResult<cascadia_engine::LoadStream> {
+            Ok(Box::pin(stream::empty()))
+        }
+        fn build(
+            self: Box<Self>,
+        ) -> cascadia_engine::EngineResult<Box<dyn cascadia_engine::Engine>> {
+            Ok(Box::new(TaskCaptureEngine {
+                seen: self.0,
+                pending: None,
+            }))
+        }
+    }
+
+    /// A chat request asks the engine for its reasoning as `<think>` text
+    /// only when thinking is on and the engine renders the template itself
+    /// (sycl-llama, whose llama-server returns reasoning on its own channel).
+    #[tokio::test]
+    async fn chat_task_asks_for_reasoning_as_text_only_with_thinking_on_an_engine_template() {
+        for (engine_applies_template, thinking, want) in [
+            (true, true, true),
+            (true, false, false),
+            (false, true, false),
+            (false, false, false),
+        ] {
+            let seen = Arc::new(std::sync::Mutex::new(Vec::new()));
+            let runner = Runner::new(Box::new(TaskCaptureBuilder(seen.clone())));
+            runner
+                .start(
+                    PeerLayout::single_stage(),
+                    ShardSpec::single_stage("mock-model", "CPU"),
+                )
+                .await
+                .unwrap();
+            let cfg = Config {
+                engine_applies_template,
+                ..Config::default()
+            };
+            let app = make_router_with_config(Arc::new(runner), "mock-model", cfg);
+            let request = serde_json::json!({
+                "model": "mock-model",
+                "messages": [{"role": "user", "content": "hi"}],
+                "chat_template_kwargs": {"enable_thinking": thinking},
+            });
+            let response = app
+                .oneshot(
+                    Request::builder()
+                        .method("POST")
+                        .uri("/v1/chat/completions")
+                        .header("content-type", "application/json")
+                        .body(Body::from(request.to_string()))
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::OK);
+            let seen = seen.lock().unwrap();
+            assert_eq!(seen.len(), 1);
+            assert_eq!(seen[0].enable_thinking, thinking);
+            assert_eq!(
+                seen[0].reasoning_as_text, want,
+                "engine_applies_template: {engine_applies_template}, thinking: {thinking}"
+            );
+        }
+    }
+
+    /// `chat_template_kwargs.preserve_thinking` rides the task to an engine
+    /// that renders the template itself.
+    #[tokio::test]
+    async fn chat_task_carries_preserve_thinking() {
+        for (kwargs, want) in [
+            (serde_json::json!({"preserve_thinking": true}), Some(true)),
+            (serde_json::json!({"preserve_thinking": false}), Some(false)),
+            (serde_json::json!({"other": 1}), None),
+        ] {
+            let seen = Arc::new(std::sync::Mutex::new(Vec::new()));
+            let runner = Runner::new(Box::new(TaskCaptureBuilder(seen.clone())));
+            runner
+                .start(
+                    PeerLayout::single_stage(),
+                    ShardSpec::single_stage("mock-model", "CPU"),
+                )
+                .await
+                .unwrap();
+            let cfg = Config {
+                engine_applies_template: true,
+                ..Config::default()
+            };
+            let app = make_router_with_config(Arc::new(runner), "mock-model", cfg);
+            let (status, body) = post_chat(
+                app,
+                serde_json::json!({"model":"mock-model","messages":[{"role":"user","content":"hi"}],
+                       "chat_template_kwargs": kwargs}),
+            )
+            .await;
+            assert_eq!(status, StatusCode::OK, "{body}");
+            let seen = seen.lock().unwrap();
+            assert_eq!(seen[0].preserve_thinking, want, "{kwargs}");
+        }
+    }
+
+    /// The prompt the engine is handed for `payload`, with the reply status.
+    async fn submitted_prompt(
+        cfg: Config,
+        payload: serde_json::Value,
+    ) -> (StatusCode, Value, String) {
+        let (status, body, task) = submitted_task(cfg, payload).await;
+        (status, body, task.map(|t| t.prompt).unwrap_or_default())
+    }
+
+    /// The task the engine is handed for `payload`, with the reply status.
+    async fn submitted_task(
+        cfg: Config,
+        payload: serde_json::Value,
+    ) -> (StatusCode, Value, Option<GenerationTask>) {
+        let seen = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let runner = Runner::new(Box::new(TaskCaptureBuilder(seen.clone())));
+        runner
+            .start(
+                PeerLayout::single_stage(),
+                ShardSpec::single_stage("mock-model", "CPU"),
+            )
+            .await
+            .unwrap();
+        let app = make_router_with_config(Arc::new(runner), "mock-model", cfg);
+        let (status, body) = post_chat(app, payload).await;
+        let task = seen.lock().unwrap().first().cloned();
+        (status, body, task)
+    }
+
+    /// The API config the CLI builds for ov-genai: the model's chat template
+    /// when one sits beside the model, nothing engine-specific otherwise.
+    fn ov_genai_config(template: Option<&str>) -> Config {
+        Config {
+            chat_template: ChatTemplateConfig {
+                template: template.map(str::to_owned),
+                bos_token: None,
+                eos_token: None,
+            },
+            engine_templates_raw_prompts: true,
+            ..Config::default()
+        }
+    }
+
+    /// A Qwen3 tool loop with a system prompt and an earlier exchange.
+    fn qwen3_tool_loop_messages() -> serde_json::Value {
+        serde_json::json!([
+            {"role":"system","content":"You are terse."},
+            {"role":"user","content":"EARLIER-QUESTION"},
+            {"role":"assistant","content":"EARLIER-ANSWER"},
+            {"role":"user","content":"weather in Paris?"},
+            {"role":"assistant","content":"","reasoning_content":"I should call the tool.",
+             "tool_calls":[{"id":"call_1","type":"function",
+                "function":{"name":"get_weather","arguments":"{\"city\":\"Paris\"}"}}]},
+            {"role":"tool","tool_call_id":"call_1","content":"18C"}
+        ])
+    }
+
+    /// With the model's template loaded and thinking on (the default), the
+    /// system prompt, the history and the reasoning replayed inside the
+    /// current tool loop all reach the prompt ov-genai is handed.
+    #[tokio::test]
+    async fn ov_genai_thinking_on_renders_system_history_and_replayed_reasoning() {
+        let (status, body, prompt) = submitted_prompt(
+            ov_genai_config(Some(QWEN3_TEMPLATE)),
+            serde_json::json!({"model":"mock-model","messages": qwen3_tool_loop_messages()}),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert!(
+            prompt.starts_with("<|im_start|>system\nYou are terse.<|im_end|>"),
+            "{prompt}"
+        );
+        assert!(
+            prompt.contains("<|im_start|>user\nEARLIER-QUESTION<|im_end|>"),
+            "{prompt}"
+        );
+        assert!(
+            prompt.contains("<|im_start|>assistant\nEARLIER-ANSWER<|im_end|>"),
+            "{prompt}"
+        );
+        assert!(
+            prompt.contains(
+                "<|im_start|>assistant\n<think>\nI should call the tool.\n</think>\n\n<tool_call>"
+            ),
+            "{prompt}"
+        );
+        assert!(prompt.ends_with("<|im_start|>assistant\n"), "{prompt}");
+    }
+
+    /// Tools reach the template with thinking on, instead of a 500.
+    #[tokio::test]
+    async fn ov_genai_thinking_on_renders_tools() {
+        let (status, body, prompt) = submitted_prompt(
+            ov_genai_config(Some(QWEN3_TEMPLATE)),
+            serde_json::json!({"model":"mock-model",
+                "messages":[{"role":"user","content":"weather in Paris?"}],
+                "tools":[{"type":"function","function":{"name":"get_weather",
+                    "parameters":{"type":"object","properties":{"city":{"type":"string"}}}}}]}),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert!(prompt.contains("<tools>"), "{prompt}");
+        assert!(prompt.contains("\"get_weather\""), "{prompt}");
+    }
+
+    /// Thinking off renders as before: the template, with its empty think block.
+    #[tokio::test]
+    async fn ov_genai_thinking_off_render_is_unchanged() {
+        let messages = qwen3_tool_loop_messages();
+        let (status, body, prompt) = submitted_prompt(
+            ov_genai_config(Some(QWEN3_TEMPLATE)),
+            serde_json::json!({"model":"mock-model","messages": messages,
+                "chat_template_kwargs":{"enable_thinking":false}}),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        let msgs: Vec<ChatMessage> = serde_json::from_value(messages).unwrap();
+        let env = build_chat_env(QWEN3_TEMPLATE).unwrap();
+        let want = render_with_chat_env(&env, &msgs, "", "", false, None, None).unwrap();
+        assert_eq!(prompt, want);
+        assert!(prompt.ends_with("<think>\n\n</think>\n\n"), "{prompt}");
+    }
+
+    /// No template beside the model: the last user message, as before, for
+    /// ov-genai to wrap in its own template (thinking on or off).
+    #[tokio::test]
+    async fn ov_genai_without_a_template_sends_the_last_user_message() {
+        for thinking in [true, false] {
+            let (status, body, prompt) = submitted_prompt(
+                ov_genai_config(None),
+                serde_json::json!({"model":"mock-model","messages": qwen3_tool_loop_messages(),
+                    "chat_template_kwargs":{"enable_thinking": thinking}}),
+            )
+            .await;
+            assert_eq!(status, StatusCode::OK, "{body}");
+            assert_eq!(prompt, "weather in Paris?", "thinking: {thinking}");
+        }
+    }
+
+    /// A prompt the model's template rendered is flagged as such, so
+    /// ov-genai skips its own apply for it.
+    #[tokio::test]
+    async fn a_template_rendered_prompt_is_flagged_pretemplated() {
+        for thinking in [true, false] {
+            let (status, body, task) = submitted_task(
+                ov_genai_config(Some(QWEN3_TEMPLATE)),
+                serde_json::json!({"model":"mock-model","messages": qwen3_tool_loop_messages(),
+                    "chat_template_kwargs":{"enable_thinking": thinking}}),
+            )
+            .await;
+            assert_eq!(status, StatusCode::OK, "{body}");
+            let task = task.unwrap();
+            assert!(
+                task.prompt.starts_with("<|im_start|>system"),
+                "{}",
+                task.prompt
+            );
+            assert_eq!(task.prompt_pretemplated, Some(true), "thinking: {thinking}");
+        }
+    }
+
+    /// The legacy last-user text is flagged as not templated: with no
+    /// template, with one that fails to parse at startup, and after a render
+    /// error at request time, so ov-genai applies its own template to it.
+    #[tokio::test]
+    async fn legacy_text_is_flagged_not_pretemplated() {
+        for (case, template) in [
+            ("no template", None),
+            ("fails to parse", Some("{% for m in %}")),
+            ("fails to render", Some("{{ nope.missing.deeper }}")),
+        ] {
+            let (status, body, task) = submitted_task(
+                ov_genai_config(template),
+                serde_json::json!({"model":"mock-model","messages": qwen3_tool_loop_messages()}),
+            )
+            .await;
+            assert_eq!(status, StatusCode::OK, "{case}: {body}");
+            let task = task.unwrap();
+            assert_eq!(task.prompt, "weather in Paris?", "{case}");
+            assert_eq!(task.prompt_pretemplated, Some(false), "{case}");
+        }
+    }
+
     /// GLM-5's template never rejects: anything but the literal "high" is
     /// Max. The probe must classify it as NOT word-speaking so the mapping
     /// keeps "low"/"none"/"medium" at High (the regression the review caught).
@@ -8809,6 +10370,7 @@ level={{ effort_map[eff] }}";
                 raw,
                 explicit_thinking: false,
                 template_words: false,
+                ..Default::default()
             };
             assert_eq!(
                 render_or_fallback(Some(&env), &msgs, "", "", true, effort, None).unwrap(),
@@ -9017,6 +10579,7 @@ level={{ effort_map[eff] }}";
             name: None,
             tool_calls: None,
             tool_call_id: None,
+            reasoning_content: None,
         }];
         let tools = vec![Tool {
             r#type: "function".into(),
@@ -9070,6 +10633,7 @@ level={{ effort_map[eff] }}";
             name: None,
             tool_calls: None,
             tool_call_id: None,
+            reasoning_content: None,
         }];
         match render_or_fallback(
             Some(&env),
@@ -9176,6 +10740,7 @@ level={{ effort_map[eff] }}";
             name: None,
             tool_calls: None,
             tool_call_id: None,
+            reasoning_content: None,
         }];
         let out = render_with_chat_env(&env, &msgs, "", "", true, None, Some(&tools)).unwrap();
         assert_eq!(out, r#"{"description": "a", "name": "b"}"#);
@@ -9193,6 +10758,7 @@ level={{ effort_map[eff] }}";
             name: None,
             tool_calls: None,
             tool_call_id: None,
+            reasoning_content: None,
         }];
         let out = render_with_chat_env(&env, &msgs, "", "", true, None, None).unwrap();
         assert_eq!(out.len(), 4, "expected a 4-digit year, got {out:?}");
@@ -9227,6 +10793,7 @@ level={{ effort_map[eff] }}";
                     },
                 }]),
                 tool_call_id: None,
+                reasoning_content: None,
             },
             ChatMessage {
                 role: "tool".into(),
@@ -9234,6 +10801,7 @@ level={{ effort_map[eff] }}";
                 name: Some("get_weather".into()),
                 tool_calls: None,
                 tool_call_id: Some("call_1".into()),
+                reasoning_content: None,
             },
         ];
         let out = render_with_chat_env(&env, &msgs, "", "", true, None, None).unwrap();
@@ -9612,6 +11180,8 @@ level={{ effort_map[eff] }}";
         parts: Vec<String>,
         release: Arc<std::sync::atomic::AtomicBool>,
         fail: bool,
+        /// The last part rides on the final chunk instead of its own token.
+        last_on_final: bool,
         pending: Option<(cascadia_types::TaskId, usize)>,
     }
 
@@ -9629,7 +11199,8 @@ level={{ effort_map[eff] }}";
                 self.pending = Some((id, i));
                 return Ok(Vec::new());
             }
-            if let Some(part) = self.parts.get(i) {
+            let held_back = usize::from(self.last_on_final && !self.fail);
+            if let Some(part) = self.parts[..self.parts.len() - held_back].get(i) {
                 let chunk = Chunk::token(&id, i as i64, part.clone());
                 self.pending = Some((id.clone(), i + 1));
                 return Ok(vec![(id, chunk)]);
@@ -9637,7 +11208,12 @@ level={{ effort_map[eff] }}";
             let last = if self.fail {
                 Chunk::error(&id, "gated engine failure")
             } else {
-                Chunk::final_marker(&id, "")
+                let text = if held_back == 1 {
+                    self.parts.last().cloned().unwrap_or_default()
+                } else {
+                    String::new()
+                };
+                Chunk::final_marker(&id, text)
                     .with_finish_reason(cascadia_types::FinishReason::Stop)
                     .with_prompt_tokens(5)
                     .with_completion_tokens(self.parts.len() as u32)
@@ -9669,13 +11245,46 @@ level={{ effort_map[eff] }}";
     /// Router over a [`GatedEngine`] with a template that renders tools, so
     /// tool requests are accepted. Returns the gate.
     async fn gated_app(parts: &[&str], fail: bool) -> (Router, Arc<std::sync::atomic::AtomicBool>) {
+        gated_app_with_config(
+            parts,
+            fail,
+            Config {
+                chat_template: ChatTemplateConfig {
+                    template: Some("{% for m in messages %}{{ m.content }}{% endfor %}".into()),
+                    bos_token: None,
+                    eos_token: None,
+                },
+                ..Config::default()
+            },
+        )
+        .await
+    }
+
+    /// [`gated_app`] with the caller's config (its template, reasoning format).
+    async fn gated_app_with_config(
+        parts: &[&str],
+        fail: bool,
+        cfg: Config,
+    ) -> (Router, Arc<std::sync::atomic::AtomicBool>) {
+        let (app, release, _) = start_gated(parts, fail, false, cfg).await;
+        (app, release)
+    }
+
+    /// Router, gate and runner over a [`GatedEngine`].
+    async fn start_gated(
+        parts: &[&str],
+        fail: bool,
+        last_on_final: bool,
+        cfg: Config,
+    ) -> (Router, Arc<std::sync::atomic::AtomicBool>, Arc<Runner>) {
         let release = Arc::new(std::sync::atomic::AtomicBool::new(false));
-        let runner = Runner::new(Box::new(GatedBuilder(GatedEngine {
+        let runner = Arc::new(Runner::new(Box::new(GatedBuilder(GatedEngine {
             parts: parts.iter().map(|p| (*p).to_owned()).collect(),
             release: release.clone(),
             fail,
+            last_on_final,
             pending: None,
-        })));
+        }))));
         runner
             .start(
                 PeerLayout::single_stage(),
@@ -9683,17 +11292,10 @@ level={{ effort_map[eff] }}";
             )
             .await
             .unwrap();
-        let cfg = Config {
-            chat_template: ChatTemplateConfig {
-                template: Some("{% for m in messages %}{{ m.content }}{% endfor %}".into()),
-                bos_token: None,
-                eos_token: None,
-            },
-            ..Config::default()
-        };
         (
-            make_router_with_config(Arc::new(runner), "mock-model", cfg),
+            make_router_with_config(runner.clone(), "mock-model", cfg),
             release,
+            runner,
         )
     }
 
@@ -9780,6 +11382,7 @@ level={{ effort_map[eff] }}";
         assert_eq!(finishes, ["tool_calls"], "{rest}");
         let usage = events.last().unwrap();
         assert!(usage["choices"].as_array().unwrap().is_empty(), "{rest}");
+        // Thinking is on by default, but the reply never reasoned: no details.
         assert_eq!(
             usage["usage"],
             serde_json::json!({"prompt_tokens":5,"completion_tokens":3,"total_tokens":8})
@@ -10212,5 +11815,1313 @@ level={{ effort_map[eff] }}";
             text.contains("cascadia_api_rejected_total{reason=\"empty_prompt\"}"),
             "{text}"
         );
+    }
+
+    // --- Reasoning split on non-streamed chat replies ----------------------
+
+    /// A router over the mock engine with `--reasoning-format none`.
+    async fn make_app_reasoning_none() -> Router {
+        let runner = Runner::new(Box::new(MockBuilder::new()));
+        runner
+            .start(
+                PeerLayout::single_stage(),
+                ShardSpec::single_stage("mock-model", "CPU"),
+            )
+            .await
+            .unwrap();
+        let cfg = Config {
+            reasoning_format: ReasoningFormat::None,
+            ..Config::default()
+        };
+        make_router_with_config(Arc::new(runner), "mock-model", cfg)
+    }
+
+    /// `chat_template_kwargs.preserve_thinking` reaches the template as
+    /// `preserve_thinking` when sent, stays undefined otherwise, and reaches
+    /// the engine's task.
+    #[tokio::test]
+    async fn chat_template_kwargs_preserve_thinking_reaches_the_template() {
+        for (kwargs, want) in [
+            (serde_json::json!({"preserve_thinking": true}), "|true|true"),
+            (
+                serde_json::json!({"preserve_thinking": false}),
+                "|false|true",
+            ),
+            (serde_json::json!({}), "|undefined|false"),
+            // A non-boolean value is ignored, never rejected.
+            (
+                serde_json::json!({"preserve_thinking": "true"}),
+                "|undefined|false",
+            ),
+            (
+                serde_json::json!({"preserve_thinking": 1}),
+                "|undefined|false",
+            ),
+            (
+                serde_json::json!({"preserve_thinking": {"on": true}}),
+                "|undefined|false",
+            ),
+            (
+                serde_json::json!({"preserve_thinking": null}),
+                "|undefined|false",
+            ),
+        ] {
+            let runner = Runner::new(Box::new(MockBuilder::new()));
+            runner
+                .start(
+                    PeerLayout::single_stage(),
+                    ShardSpec::single_stage("mock-model", "CPU"),
+                )
+                .await
+                .unwrap();
+            let cfg = Config {
+                chat_template: ChatTemplateConfig {
+                    template: Some(
+                        "{% for m in messages %}{{ m.content }}{% endfor %}\
+                         |{% if preserve_thinking is defined %}{{ preserve_thinking }}\
+                         {% else %}undefined{% endif %}|{{ preserve_thinking is defined }}"
+                            .into(),
+                    ),
+                    bos_token: None,
+                    eos_token: None,
+                },
+                ..Config::default()
+            };
+            let app = make_router_with_config(Arc::new(runner), "mock-model", cfg);
+            let (status, body) = post_chat(
+                app,
+                serde_json::json!({"model":"mock-model","messages":[{"role":"user","content":"hi"}],
+                       "enable_thinking": false, "chat_template_kwargs": kwargs}),
+            )
+            .await;
+            assert_eq!(status, StatusCode::OK, "{body}");
+            let content = body["choices"][0]["message"]["content"].as_str().unwrap();
+            assert!(
+                content.trim_end().ends_with(want),
+                "{content:?} for {kwargs}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn thinking_reply_returns_reasoning_content_and_reasoning_tokens() {
+        let (status, body) = post_chat(
+            make_app().await,
+            serde_json::json!({"model":"mock-model","messages":[{"role":"user","content":"<think> plan </think> answer"}]}),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        let m = &body["choices"][0]["message"];
+        // The mock appends a space per word.
+        assert_eq!(m["content"], "answer ");
+        // The bytes between the tags, verbatim.
+        assert_eq!(m["reasoning_content"], " plan ");
+        // "<think> ", "plan ", "</think> "
+        assert_eq!(
+            body["usage"]["completion_tokens_details"]["reasoning_tokens"],
+            3
+        );
+    }
+
+    #[tokio::test]
+    async fn thinking_off_reply_is_unchanged_and_has_no_details() {
+        let (status, body) = post_chat(
+            make_app().await,
+            serde_json::json!({"model":"mock-model","messages":[{"role":"user","content":"<think> plan </think> answer"}],
+                   "enable_thinking": false}),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        let m = &body["choices"][0]["message"];
+        assert_eq!(m["content"], "<think> plan </think> answer ");
+        assert!(m.get("reasoning_content").is_none(), "{body}");
+        assert!(
+            body["usage"].get("completion_tokens_details").is_none(),
+            "{body}"
+        );
+    }
+
+    #[tokio::test]
+    async fn reasoning_format_none_keeps_think_in_content_but_counts() {
+        let (status, body) = post_chat(
+            make_app_reasoning_none().await,
+            serde_json::json!({"model":"mock-model","messages":[{"role":"user","content":"<think> plan </think> answer"}]}),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        let m = &body["choices"][0]["message"];
+        assert_eq!(m["content"], "<think> plan </think> answer ");
+        assert!(m.get("reasoning_content").is_none(), "{body}");
+        assert_eq!(
+            body["usage"]["completion_tokens_details"]["reasoning_tokens"],
+            3
+        );
+    }
+
+    #[tokio::test]
+    async fn tool_call_after_reasoning_is_parsed_and_draft_inside_reasoning_is_not() {
+        let draft = r#"<tool_call>{"name":"draft","arguments":{}}</tool_call>"#;
+        let (app, release) =
+            gated_app(&["<think>plan ", draft, "</think>", WEATHER_CALL], false).await;
+        release.store(true, Ordering::SeqCst);
+        let (status, body) = post_chat(
+            app,
+            serde_json::json!({"model":"mock-model","messages":[{"role":"user","content":"hi"}],
+                   "tools":[{"type":"function","function":{"name":"get_weather"}}]}),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        let choice = &body["choices"][0];
+        assert_eq!(choice["finish_reason"], "tool_calls", "{body}");
+        let calls = choice["message"]["tool_calls"].as_array().unwrap();
+        assert_eq!(calls.len(), 1, "{body}");
+        assert_eq!(calls[0]["function"]["name"], "get_weather");
+        assert!(choice["message"]["content"].is_null(), "{body}");
+        assert_eq!(
+            choice["message"]["reasoning_content"],
+            format!("plan {draft}")
+        );
+        assert_eq!(
+            body["usage"]["completion_tokens_details"]["reasoning_tokens"],
+            3
+        );
+    }
+
+    /// A reply with a bare `</think>` (the block was opened where the API
+    /// could not see it) is not split, and a call drafted before that close
+    /// still never runs: the scan reads only past the first `</think>`, as it
+    /// did before reasoning was split out.
+    #[tokio::test]
+    async fn bare_close_tag_keeps_a_drafted_call_out_of_tool_calls() {
+        let draft = r#"<tool_call>{"name":"draft","arguments":{}}</tool_call>"#;
+        let (app, release) = gated_app(&["plan ", draft, "</think>", WEATHER_CALL], false).await;
+        release.store(true, Ordering::SeqCst);
+        let (status, body) = post_chat(
+            app,
+            serde_json::json!({"model":"mock-model","messages":[{"role":"user","content":"hi"}],
+                   "tools":[{"type":"function","function":{"name":"get_weather"}}]}),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        let calls = body["choices"][0]["message"]["tool_calls"]
+            .as_array()
+            .unwrap();
+        assert_eq!(calls.len(), 1, "{body}");
+        assert_eq!(calls[0]["function"]["name"], "get_weather", "{body}");
+    }
+
+    /// A stop string that matches inside the reasoning cuts the reply there:
+    /// the answer is empty and the reasoning ends at the cut.
+    #[tokio::test]
+    async fn stop_cut_inside_reasoning_ends_the_reasoning_there() {
+        let (status, body) = post_chat(
+            make_app().await,
+            serde_json::json!({"model":"mock-model","messages":[{"role":"user","content":"<think> plan more </think> answer"}],
+                   "stop": ["more"]}),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        let message = &body["choices"][0]["message"];
+        assert_eq!(message["content"], "", "{body}");
+        assert_eq!(message["reasoning_content"], " plan ", "{body}");
+        assert_eq!(body["choices"][0]["finish_reason"], "stop", "{body}");
+    }
+
+    #[tokio::test]
+    async fn length_cut_inside_reasoning_returns_reasoning_and_empty_content() {
+        let (status, body) = post_chat(
+            make_app().await,
+            serde_json::json!({"model":"mock-model","messages":[{"role":"user","content":"<think> a b c d </think> answer"}],
+                   "max_tokens": 3}),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        let choice = &body["choices"][0];
+        assert_eq!(choice["finish_reason"], "length", "{body}");
+        assert_eq!(choice["message"]["content"], "");
+        assert_eq!(choice["message"]["reasoning_content"], " a b ");
+        assert_eq!(
+            body["usage"]["completion_tokens_details"]["reasoning_tokens"],
+            3
+        );
+    }
+
+    #[tokio::test]
+    async fn template_opened_think_starts_the_reply_inside_reasoning() {
+        let cfg = Config {
+            chat_template: ChatTemplateConfig {
+                template: Some(
+                    "{% for m in messages %}{{ m.content }}{% endfor %}\
+                     {% if add_generation_prompt %}<think>\n{% endif %}"
+                        .into(),
+                ),
+                bos_token: None,
+                eos_token: None,
+            },
+            ..Config::default()
+        };
+        let (app, release) = gated_app_with_config(&["plan</think>", "answer"], false, cfg).await;
+        release.store(true, Ordering::SeqCst);
+        let (status, body) = post_chat(
+            app,
+            serde_json::json!({"model":"mock-model","messages":[{"role":"user","content":"hi"}]}),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        let m = &body["choices"][0]["message"];
+        assert_eq!(m["reasoning_content"], "plan");
+        assert_eq!(m["content"], "answer");
+        assert_eq!(
+            body["usage"]["completion_tokens_details"]["reasoning_tokens"],
+            1
+        );
+    }
+
+    /// An R1-style template whose generation prompt opens `<think>`; a
+    /// message containing `BOOM` makes it fail at request time.
+    const OPENS_THINK_TEMPLATE: &str = "{% for m in messages %}\
+        {% if 'BOOM' in m.content %}{{ nope.missing.deeper }}{% endif %}\
+        {{ m.content }}{% endfor %}{% if add_generation_prompt %}<think>\n{% endif %}";
+
+    /// On ov-genai with thinking on, a template that opens `<think>` starts
+    /// the reply inside reasoning: the split arms and the reasoning reaches
+    /// `reasoning_content`.
+    #[tokio::test]
+    async fn ov_genai_thinking_on_template_opened_think_splits_reasoning() {
+        let cfg = ov_genai_config(Some(OPENS_THINK_TEMPLATE));
+        let (app, release) = gated_app_with_config(&["plan</think>", "answer"], false, cfg).await;
+        release.store(true, Ordering::SeqCst);
+        let (status, body) = post_chat(
+            app,
+            serde_json::json!({"model":"mock-model","messages":[{"role":"user","content":"hi"}]}),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        let m = &body["choices"][0]["message"];
+        assert_eq!(m["reasoning_content"], "plan", "{body}");
+        assert_eq!(m["content"], "answer", "{body}");
+    }
+
+    /// A request-time render error sends ov-genai the legacy text, which it
+    /// wraps in the model's own template: one that opens `<think>` still
+    /// starts the reply inside reasoning, so the load-time probe decides. An
+    /// engine that sends the legacy text as is does not.
+    #[tokio::test]
+    async fn render_error_on_ov_genai_falls_back_to_the_probe() {
+        let request = serde_json::json!({"model":"mock-model",
+            "messages":[{"role":"user","content":"BOOM"}]});
+        let cfg = ov_genai_config(Some(OPENS_THINK_TEMPLATE));
+        let (app, release) = gated_app_with_config(&["plan</think>", "answer"], false, cfg).await;
+        release.store(true, Ordering::SeqCst);
+        let (status, body) = post_chat(app, request.clone()).await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        let m = &body["choices"][0]["message"];
+        assert_eq!(m["reasoning_content"], "plan", "ov-genai: {body}");
+        assert_eq!(m["content"], "answer", "ov-genai: {body}");
+
+        let cfg = Config {
+            engine_templates_raw_prompts: false,
+            ..ov_genai_config(Some(OPENS_THINK_TEMPLATE))
+        };
+        let (app, release) = gated_app_with_config(&["plan</think>", "answer"], false, cfg).await;
+        release.store(true, Ordering::SeqCst);
+        let (status, body) = post_chat(app, request).await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        let m = &body["choices"][0]["message"];
+        assert!(m.get("reasoning_content").is_none(), "raw engine: {body}");
+    }
+
+    /// A template that opens `<think>` only when `enable_thinking` is set; a
+    /// message containing `BOOM` makes it fail at request time.
+    const SWITCHED_THINK_TEMPLATE: &str = "{% for m in messages %}\
+        {% if 'BOOM' in m.content %}{{ nope.missing.deeper }}{% endif %}\
+        {{ m.content }}{% endfor %}\
+        {% if add_generation_prompt and enable_thinking %}<think>\n{% endif %}";
+
+    /// ov-genai applies its own template with `enable_thinking` undefined, so
+    /// after a render-error fallback a template that opens `<think>` only on
+    /// that switch does not open it: the reply is all answer, not reasoning.
+    #[tokio::test]
+    async fn render_error_on_ov_genai_probes_without_the_thinking_switch() {
+        let cfg = ov_genai_config(Some(SWITCHED_THINK_TEMPLATE));
+        let (app, release) = gated_app_with_config(&["plan</think>", "answer"], false, cfg).await;
+        release.store(true, Ordering::SeqCst);
+        let (status, body) = post_chat(
+            app,
+            serde_json::json!({"model":"mock-model",
+                "messages":[{"role":"user","content":"BOOM"}]}),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        let m = &body["choices"][0]["message"];
+        assert!(m.get("reasoning_content").is_none(), "{body}");
+
+        // Rendered by the API with thinking on, the same template opens it.
+        let cfg = ov_genai_config(Some(SWITCHED_THINK_TEMPLATE));
+        let (app, release) = gated_app_with_config(&["plan</think>", "answer"], false, cfg).await;
+        release.store(true, Ordering::SeqCst);
+        let (status, body) = post_chat(
+            app,
+            serde_json::json!({"model":"mock-model","messages":[{"role":"user","content":"hi"}]}),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(
+            body["choices"][0]["message"]["reasoning_content"], "plan",
+            "{body}"
+        );
+    }
+
+    /// `/v1/completions` sends a raw prompt: it leaves the task's
+    /// pretemplated flag unset, so the engine keeps its own setting.
+    #[tokio::test]
+    async fn completions_leave_prompt_pretemplated_unset() {
+        let seen = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let runner = Runner::new(Box::new(TaskCaptureBuilder(seen.clone())));
+        runner
+            .start(
+                PeerLayout::single_stage(),
+                ShardSpec::single_stage("mock-model", "CPU"),
+            )
+            .await
+            .unwrap();
+        let app = make_router_with_config(
+            Arc::new(runner),
+            "mock-model",
+            ov_genai_config(Some(QWEN3_TEMPLATE)),
+        );
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/v1/completions")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        serde_json::json!({"model":"mock-model","prompt":"hello"}).to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let seen = seen.lock().unwrap();
+        assert_eq!(seen[0].prompt, "hello");
+        assert_eq!(seen[0].prompt_pretemplated, None);
+    }
+
+    /// A template that opened `<think>`, and a model that writes it again:
+    /// the repeated tag is not reasoning text, streamed or not.
+    #[tokio::test]
+    async fn repeated_start_tag_after_a_template_opened_think_is_skipped() {
+        let cfg = || Config {
+            chat_template: ChatTemplateConfig {
+                template: Some(
+                    "{% for m in messages %}{{ m.content }}{% endfor %}\
+                     {% if add_generation_prompt %}<think>\n{% endif %}"
+                        .into(),
+                ),
+                bos_token: None,
+                eos_token: None,
+            },
+            ..Config::default()
+        };
+        for parts in [
+            &["<think>\n", "plan", "</think>", "answer"][..],
+            &["<thi", "nk>\n", "plan", "</think>", "answer"][..],
+        ] {
+            let (app, release) = gated_app_with_config(parts, false, cfg()).await;
+            release.store(true, Ordering::SeqCst);
+            let (status, body) = post_chat(
+                app,
+                serde_json::json!({"model":"mock-model","messages":[{"role":"user","content":"hi"}]}),
+            )
+            .await;
+            assert_eq!(status, StatusCode::OK, "{body}");
+            let m = &body["choices"][0]["message"];
+            assert_eq!(m["reasoning_content"], "\nplan", "{parts:?}");
+            assert_eq!(m["content"], "answer", "{parts:?}");
+
+            let (app, release) = gated_app_with_config(parts, false, cfg()).await;
+            release.store(true, Ordering::SeqCst);
+            let body = post_stream(app, plain_stream_body(None, false)).await;
+            let events = sse_events(&body);
+            assert_eq!(streamed_reasoning(&events), "\nplan", "{body}");
+            assert_eq!(streamed_content(&events), "answer", "{body}");
+            assert_eq!(frame_tokens(&events), parts.len() as u64, "{body}");
+        }
+    }
+
+    #[tokio::test]
+    async fn thinking_on_reply_without_think_has_no_details() {
+        for app in [make_app().await, make_app_reasoning_none().await] {
+            let (status, body) = post_chat(
+                app,
+                serde_json::json!({"model":"mock-model","messages":[{"role":"user","content":"hello world"}]}),
+            )
+            .await;
+            assert_eq!(status, StatusCode::OK, "{body}");
+            let m = &body["choices"][0]["message"];
+            assert_eq!(m["content"], "hello world ");
+            assert!(m.get("reasoning_content").is_none(), "{body}");
+            assert!(
+                body["usage"].get("completion_tokens_details").is_none(),
+                "{body}"
+            );
+        }
+    }
+
+    /// A streamed reply that never reasoned carries no details either, in
+    /// both formats.
+    #[tokio::test]
+    async fn thinking_on_stream_without_think_has_no_details() {
+        for app in [
+            gated_app_released(&["hello ", "world"]).await,
+            gated_app_reasoning_none(&["hello ", "world"]).await,
+        ] {
+            let body = post_stream(app, plain_stream_body(None, true)).await;
+            let events = sse_events(&body);
+            let usage = &events.last().unwrap()["usage"];
+            assert!(usage["completion_tokens"].as_u64().is_some(), "{body}");
+            assert!(usage.get("completion_tokens_details").is_none(), "{body}");
+        }
+    }
+
+    /// With no template (or one that fails to render), the prompt is the
+    /// user's own text: a message ending in `<think>` must not start the
+    /// reply inside reasoning.
+    #[tokio::test]
+    async fn untemplated_prompt_ending_in_think_is_not_an_opened_block() {
+        let broken = || {
+            let cfg = Config {
+                chat_template: ChatTemplateConfig {
+                    template: Some("{{ nope.missing.deeper }}".into()),
+                    bos_token: None,
+                    eos_token: None,
+                },
+                ..Config::default()
+            };
+            async move {
+                let runner = Runner::new(Box::new(MockBuilder::new()));
+                runner
+                    .start(
+                        PeerLayout::single_stage(),
+                        ShardSpec::single_stage("mock-model", "CPU"),
+                    )
+                    .await
+                    .unwrap();
+                make_router_with_config(Arc::new(runner), "mock-model", cfg)
+            }
+        };
+        let request = serde_json::json!({"model":"mock-model",
+            "messages":[{"role":"user","content":"What does the tag <think>"}]});
+        for app in [make_app().await, broken().await] {
+            let (status, body) = post_chat(app, request.clone()).await;
+            assert_eq!(status, StatusCode::OK, "{body}");
+            let m = &body["choices"][0]["message"];
+            assert_eq!(m["content"], "What does the tag <think> ", "{body}");
+            assert!(m.get("reasoning_content").is_none(), "{body}");
+        }
+        for app in [make_app().await, broken().await] {
+            let mut payload = request.clone();
+            payload["stream"] = true.into();
+            let body = post_stream(app, payload).await;
+            let events = sse_events(&body);
+            assert_eq!(
+                streamed_content(&events),
+                "What does the tag <think> ",
+                "{body}"
+            );
+            assert_eq!(streamed_reasoning(&events), "", "{body}");
+        }
+    }
+
+    /// Inkling's special-token thinking framing reaches the split as
+    /// `<think>…</think>` text and separates like any other model's.
+    #[test]
+    fn marker_filter_thinking_splits_into_reasoning_and_answer() {
+        let d = MarkerDialect {
+            message_model: 200001,
+            content_text: 200004,
+            content_thinking: 200008,
+            end_message: 200010,
+            invoke_tool_json: 200049,
+        };
+        let tok = |id: i64, text: &str| {
+            let mut c = Chunk::token(String::from("t"), id, text.to_string());
+            c.token_ids = vec![id];
+            c
+        };
+        let mut f = MarkerFilter::new(d);
+        let mut counter = reasoning::ReasoningCounter::new(true, false);
+        let (mut reasoning, mut answer) = (String::new(), String::new());
+        for c in [
+            tok(200001, ""),
+            tok(200008, ""),
+            tok(7, "plan"),
+            tok(8, " more"),
+            tok(200010, ""),
+            tok(200001, ""),
+            tok(200004, ""),
+            tok(9, "Paris"),
+            tok(200010, ""),
+        ] {
+            let (r, a) = counter.feed(&f.feed(&c), 1);
+            reasoning.push_str(&r);
+            answer.push_str(&a);
+        }
+        let (r, a) = counter.feed(&f.finish(), 0);
+        reasoning.push_str(&r);
+        answer.push_str(&a);
+        let (r, a) = counter.finish();
+        reasoning.push_str(&r);
+        answer.push_str(&a);
+        assert_eq!(reasoning, "plan more");
+        assert_eq!(answer, "Paris");
+        assert!(counter.consumed_close());
+        // Reasoning: the two marker tokens that open it (released with
+        // `<think>`), "plan", " more" and the closing marker = 5 of 9; the
+        // answer's two opening markers ride with "Paris", the last marker
+        // ends on the answer side.
+        assert_eq!(counter.reasoning_tokens(9), 5);
+    }
+
+    // --- Reasoning split on streamed chat replies ---------------------------
+
+    /// Engine chunks that split `<think>` and `</think>` across chunks.
+    const SPLIT_TAG_PARTS: [&str; 5] = ["<thi", "nk>pl", "an</th", "ink>\n\nans", "wer"];
+
+    /// A gated router (released) with `--reasoning-format none`.
+    async fn gated_app_reasoning_none(parts: &[&str]) -> Router {
+        let (app, release) = gated_app_with_config(
+            parts,
+            false,
+            Config {
+                chat_template: ChatTemplateConfig {
+                    template: Some("{% for m in messages %}{{ m.content }}{% endfor %}".into()),
+                    bos_token: None,
+                    eos_token: None,
+                },
+                reasoning_format: ReasoningFormat::None,
+                ..Config::default()
+            },
+        )
+        .await;
+        release.store(true, Ordering::SeqCst);
+        app
+    }
+
+    /// A released gated router with the default reasoning format.
+    async fn gated_app_released(parts: &[&str]) -> Router {
+        let (app, release) = gated_app(parts, false).await;
+        release.store(true, Ordering::SeqCst);
+        app
+    }
+
+    /// POST a streamed chat request; the raw SSE body.
+    async fn post_stream(app: Router, payload: Value) -> String {
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/v1/chat/completions")
+                    .header("content-type", "application/json")
+                    .body(Body::from(payload.to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        String::from_utf8(to_bytes(resp.into_body(), 1 << 20).await.unwrap().to_vec()).unwrap()
+    }
+
+    /// SSE events without the per-request `id`, `created` and tool call ids.
+    fn pinned_events(body: &str) -> Vec<Value> {
+        assert!(body.ends_with("data: [DONE]\n\n"), "{body}");
+        let mut events = sse_events(body);
+        for e in &mut events {
+            let obj = e.as_object_mut().unwrap();
+            obj.remove("id");
+            obj.remove("created");
+            if let Some(calls) = e
+                .pointer_mut("/choices/0/delta/tool_calls")
+                .and_then(Value::as_array_mut)
+            {
+                for c in calls {
+                    c.as_object_mut().unwrap().remove("id");
+                }
+            }
+        }
+        events
+    }
+
+    fn plain_stream_body(thinking: Option<bool>, include_usage: bool) -> Value {
+        let mut body = serde_json::json!({"model":"mock-model",
+            "messages":[{"role":"user","content":"hi"}],
+            "stream":true,"stream_options":{"include_usage":include_usage}});
+        if let Some(t) = thinking {
+            body["enable_thinking"] = t.into();
+        }
+        body
+    }
+
+    fn tool_stream_body(thinking: Option<bool>, include_usage: bool) -> Value {
+        let mut body = plain_stream_body(thinking, include_usage);
+        body["tools"] = serde_json::json!([{"type":"function","function":{"name":"get_weather"}}]);
+        body
+    }
+
+    const DRAFT_CALL: &str = r#"<tool_call>{"name":"draft","arguments":{}}</tool_call>"#;
+
+    fn draft_then_call_parts() -> [&'static str; 4] {
+        ["<think>plan ", DRAFT_CALL, "</think>", WEATHER_CALL]
+    }
+
+    /// One frame per non-blank line.
+    fn expected_frames(lines: &str) -> Vec<Value> {
+        lines
+            .lines()
+            .map(str::trim)
+            .filter(|l| !l.is_empty())
+            .map(|l| serde_json::from_str(l).unwrap())
+            .collect()
+    }
+
+    /// Thinking off: the frames carry the text as it was generated, tags
+    /// included, with no reasoning field and no usage details.
+    #[tokio::test]
+    async fn thinking_off_stream_frames_are_unchanged() {
+        let body = post_stream(
+            gated_app_released(&SPLIT_TAG_PARTS).await,
+            plain_stream_body(Some(false), true),
+        )
+        .await;
+        let expected = expected_frames(
+            r##"
+            {"choices":[{"delta":{"content":"<thi","role":"assistant"},"finish_reason":null,"index":0}],"completion_tokens":null,"model":"mock-model","n_tokens":1,"object":"chat.completion.chunk"}
+            {"choices":[{"delta":{"content":"nk>pl","role":"assistant"},"finish_reason":null,"index":0}],"completion_tokens":null,"model":"mock-model","n_tokens":1,"object":"chat.completion.chunk"}
+            {"choices":[{"delta":{"content":"an</th","role":"assistant"},"finish_reason":null,"index":0}],"completion_tokens":null,"model":"mock-model","n_tokens":1,"object":"chat.completion.chunk"}
+            {"choices":[{"delta":{"content":"ink>\n\nans","role":"assistant"},"finish_reason":null,"index":0}],"completion_tokens":null,"model":"mock-model","n_tokens":1,"object":"chat.completion.chunk"}
+            {"choices":[{"delta":{"content":"wer","role":"assistant"},"finish_reason":null,"index":0}],"completion_tokens":null,"model":"mock-model","n_tokens":1,"object":"chat.completion.chunk"}
+            {"choices":[{"delta":{"content":"","role":"assistant"},"finish_reason":"stop","index":0}],"completion_tokens":5,"model":"mock-model","n_tokens":0,"object":"chat.completion.chunk"}
+            {"choices":[],"model":"mock-model","object":"chat.completion.chunk","usage":{"completion_tokens":5,"prompt_tokens":5,"total_tokens":10}}
+            "##,
+        );
+        assert_eq!(pinned_events(&body), expected, "{body}");
+    }
+
+    /// `--reasoning-format none`: the frames carry `<think>` in content, as
+    /// they did before reasoning was split out.
+    #[tokio::test]
+    async fn reasoning_format_none_stream_frames_are_unchanged() {
+        let body = post_stream(
+            gated_app_reasoning_none(&SPLIT_TAG_PARTS).await,
+            plain_stream_body(None, false),
+        )
+        .await;
+        let expected = expected_frames(
+            r##"
+            {"choices":[{"delta":{"content":"<thi","role":"assistant"},"finish_reason":null,"index":0}],"completion_tokens":null,"model":"mock-model","n_tokens":1,"object":"chat.completion.chunk"}
+            {"choices":[{"delta":{"content":"nk>pl","role":"assistant"},"finish_reason":null,"index":0}],"completion_tokens":null,"model":"mock-model","n_tokens":1,"object":"chat.completion.chunk"}
+            {"choices":[{"delta":{"content":"an</th","role":"assistant"},"finish_reason":null,"index":0}],"completion_tokens":null,"model":"mock-model","n_tokens":1,"object":"chat.completion.chunk"}
+            {"choices":[{"delta":{"content":"ink>\n\nans","role":"assistant"},"finish_reason":null,"index":0}],"completion_tokens":null,"model":"mock-model","n_tokens":1,"object":"chat.completion.chunk"}
+            {"choices":[{"delta":{"content":"wer","role":"assistant"},"finish_reason":null,"index":0}],"completion_tokens":null,"model":"mock-model","n_tokens":1,"object":"chat.completion.chunk"}
+            {"choices":[{"delta":{"content":"","role":"assistant"},"finish_reason":"stop","index":0}],"completion_tokens":5,"model":"mock-model","n_tokens":0,"object":"chat.completion.chunk"}
+            "##,
+        );
+        assert_eq!(pinned_events(&body), expected, "{body}");
+    }
+
+    /// Thinking off with tools: no scratchpad, so every call in the text is
+    /// returned, the drafted one included.
+    #[tokio::test]
+    async fn thinking_off_tool_stream_frames_are_unchanged() {
+        let body = post_stream(
+            gated_app_released(&draft_then_call_parts()).await,
+            tool_stream_body(Some(false), true),
+        )
+        .await;
+        let expected = expected_frames(
+            r##"
+            {"choices":[{"delta":{"content":"<think>plan ","role":"assistant"},"finish_reason":null,"index":0}],"completion_tokens":null,"model":"mock-model","n_tokens":1,"object":"chat.completion.chunk"}
+            {"choices":[{"delta":{"role":"assistant","tool_calls":[{"function":{"arguments":"{}","name":"draft"},"index":0,"type":"function"},{"function":{"arguments":"{\"city\":\"Paris\"}","name":"get_weather"},"index":1,"type":"function"}]},"finish_reason":null,"index":0}],"completion_tokens":4,"model":"mock-model","n_tokens":3,"object":"chat.completion.chunk"}
+            {"choices":[{"delta":{},"finish_reason":"tool_calls","index":0}],"model":"mock-model","object":"chat.completion.chunk"}
+            {"choices":[],"model":"mock-model","object":"chat.completion.chunk","usage":{"completion_tokens":4,"prompt_tokens":5,"total_tokens":9}}
+            "##,
+        );
+        assert_eq!(pinned_events(&body), expected, "{body}");
+    }
+
+    /// `--reasoning-format none` with tools: the reasoning streams as content
+    /// and only the call after `</think>` is returned.
+    #[tokio::test]
+    async fn reasoning_format_none_tool_stream_frames_are_unchanged() {
+        let body = post_stream(
+            gated_app_reasoning_none(&draft_then_call_parts()).await,
+            tool_stream_body(None, false),
+        )
+        .await;
+        let expected = expected_frames(
+            r##"
+            {"choices":[{"delta":{"content":"<think>plan ","role":"assistant"},"finish_reason":null,"index":0}],"completion_tokens":null,"model":"mock-model","n_tokens":1,"object":"chat.completion.chunk"}
+            {"choices":[{"delta":{"content":"<tool_call>{\"name\":\"draft\",\"arguments\":{}}</tool_call></think>","role":"assistant"},"finish_reason":null,"index":0}],"completion_tokens":null,"model":"mock-model","n_tokens":2,"object":"chat.completion.chunk"}
+            {"choices":[{"delta":{"role":"assistant","tool_calls":[{"function":{"arguments":"{\"city\":\"Paris\"}","name":"get_weather"},"index":0,"type":"function"}]},"finish_reason":null,"index":0}],"completion_tokens":4,"model":"mock-model","n_tokens":1,"object":"chat.completion.chunk"}
+            {"choices":[{"delta":{},"finish_reason":"tool_calls","index":0}],"model":"mock-model","object":"chat.completion.chunk"}
+            "##,
+        );
+        assert_eq!(pinned_events(&body), expected, "{body}");
+    }
+
+    fn streamed_reasoning(events: &[Value]) -> String {
+        events
+            .iter()
+            .filter_map(|e| e["choices"][0]["delta"]["reasoning_content"].as_str())
+            .collect()
+    }
+
+    /// The `tool_calls` deltas of a stream.
+    fn streamed_tool_calls(events: &[Value]) -> Vec<Value> {
+        events
+            .iter()
+            .filter_map(|e| e.pointer("/choices/0/delta/tool_calls"))
+            .cloned()
+            .collect()
+    }
+
+    fn finish_reasons(events: &[Value]) -> Vec<String> {
+        events
+            .iter()
+            .filter_map(|e| e.pointer("/choices/0/finish_reason")?.as_str())
+            .map(str::to_owned)
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn stream_splits_tags_across_chunks_into_reasoning_content() {
+        let body = post_stream(
+            gated_app_released(&SPLIT_TAG_PARTS).await,
+            plain_stream_body(None, false),
+        )
+        .await;
+        let events = sse_events(&body);
+        assert_eq!(streamed_reasoning(&events), "plan", "{body}");
+        // The answer's leading whitespace after `</think>` is dropped.
+        assert_eq!(streamed_content(&events), "answer", "{body}");
+        let last_reasoning = events
+            .iter()
+            .rposition(|e| e["choices"][0]["delta"].get("reasoning_content").is_some())
+            .expect("a reasoning frame");
+        for e in &events[..=last_reasoning] {
+            let content = e["choices"][0]["delta"]["content"].as_str().unwrap_or("");
+            assert!(content.is_empty(), "content inside reasoning: {body}");
+        }
+        // A frame carries `reasoning_content` only when it has some.
+        for e in &events {
+            if let Some(r) = e["choices"][0]["delta"].get("reasoning_content") {
+                assert!(!r.as_str().unwrap().is_empty(), "{body}");
+            }
+        }
+        assert!(body.ends_with("data: [DONE]\n\n"), "{body}");
+    }
+
+    /// No frame carries both `reasoning_content` and `finish_reason`
+    /// (AnythingLLM skips any reasoning frame before its finish check, so it
+    /// would never finish); the last choice frame carries `finish`.
+    fn assert_finish_not_on_reasoning(body: &str, finish: &str) {
+        let events = sse_events(body);
+        for e in &events {
+            let choice = &e["choices"][0];
+            assert!(
+                choice["delta"].get("reasoning_content").is_none()
+                    || choice["finish_reason"].is_null(),
+                "reasoning frame with a finish: {body}"
+            );
+        }
+        let last = events
+            .iter()
+            .rev()
+            .find(|e| !e["choices"].as_array().unwrap().is_empty())
+            .unwrap();
+        assert_eq!(last["choices"][0]["finish_reason"], finish, "{body}");
+        assert_eq!(finish_reasons(&events), [finish], "{body}");
+    }
+
+    /// A stream cut by `max_tokens` inside the reasoning ends on a closing
+    /// frame, and `n_tokens` still sums to the reply's tokens.
+    #[tokio::test]
+    async fn length_cut_inside_reasoning_never_finishes_on_a_reasoning_frame() {
+        let mut payload = plain_stream_body(None, false);
+        payload["messages"] =
+            serde_json::json!([{"role":"user","content":"<think> a b c d </think> answer"}]);
+        payload["max_tokens"] = 3.into();
+        let body = post_stream(make_app().await, payload).await;
+        assert_finish_not_on_reasoning(&body, "length");
+        let events = sse_events(&body);
+        assert_eq!(streamed_reasoning(&events), " a b ", "{body}");
+        assert_eq!(frame_tokens(&events), 3, "{body}");
+    }
+
+    /// A stream whose final chunk carries reasoning text closes the same
+    /// way, plain and with tools.
+    #[tokio::test]
+    async fn final_chunk_inside_reasoning_never_finishes_on_a_reasoning_frame() {
+        for tools in [false, true] {
+            let (app, release, _) = start_gated(
+                &["<think>a ", "b"],
+                false,
+                true,
+                Config {
+                    chat_template: ChatTemplateConfig {
+                        template: Some("{% for m in messages %}{{ m.content }}{% endfor %}".into()),
+                        bos_token: None,
+                        eos_token: None,
+                    },
+                    ..Config::default()
+                },
+            )
+            .await;
+            release.store(true, Ordering::SeqCst);
+            let payload = if tools {
+                tool_stream_body(None, false)
+            } else {
+                plain_stream_body(None, false)
+            };
+            let body = post_stream(app, payload).await;
+            assert_finish_not_on_reasoning(&body, "stop");
+            let events = sse_events(&body);
+            assert_eq!(streamed_reasoning(&events), "a b", "{body}");
+            // one per part, the last on the final chunk
+            assert_eq!(frame_tokens(&events), 2, "{body}");
+        }
+    }
+
+    /// A chunk that releases nothing while reasoning (the split holds a
+    /// partial `</think>`) sends no empty frame; its tokens ride the next one.
+    #[tokio::test]
+    async fn held_chunk_inside_reasoning_sends_no_empty_frame() {
+        let body = post_stream(
+            gated_app_released(&["<think>a", "<", "/think>b"]).await,
+            plain_stream_body(None, false),
+        )
+        .await;
+        let events = sse_events(&body);
+        let answer = events
+            .iter()
+            .position(|e| e["choices"][0]["delta"]["content"] == "b")
+            .unwrap_or_else(|| panic!("no answer frame: {body}"));
+        for e in &events[..answer] {
+            let delta = &e["choices"][0]["delta"];
+            assert!(
+                delta.get("reasoning_content").is_some(),
+                "frame without reasoning inside the reasoning: {body}"
+            );
+        }
+        assert_eq!(streamed_reasoning(&events), "a", "{body}");
+        assert_eq!(streamed_content(&events), "b", "{body}");
+        assert_eq!(frame_tokens(&events), 3, "{body}");
+    }
+
+    #[tokio::test]
+    async fn stream_usage_chunk_counts_reasoning_tokens_before_done() {
+        let body = post_stream(
+            gated_app_released(&SPLIT_TAG_PARTS).await,
+            plain_stream_body(None, true),
+        )
+        .await;
+        let events = sse_events(&body);
+        let usage = &events.last().unwrap()["usage"];
+        let completion = usage["completion_tokens"].as_u64().unwrap();
+        let reasoning = usage["completion_tokens_details"]["reasoning_tokens"]
+            .as_u64()
+            .unwrap_or_else(|| panic!("no reasoning_tokens: {body}"));
+        assert!(reasoning > 0 && reasoning <= completion, "{body}");
+        let usage_line = body
+            .lines()
+            .filter(|l| l.starts_with("data: "))
+            .rev()
+            .nth(1)
+            .unwrap();
+        assert!(usage_line.contains("\"usage\""), "{body}");
+        assert!(body.ends_with("data: [DONE]\n\n"), "{body}");
+    }
+
+    /// `--reasoning-format none` leaves the frames alone but still counts
+    /// the reasoning tokens in the usage chunk.
+    #[tokio::test]
+    async fn reasoning_format_none_stream_usage_counts_reasoning_tokens() {
+        let body = post_stream(
+            gated_app_reasoning_none(&SPLIT_TAG_PARTS).await,
+            plain_stream_body(None, true),
+        )
+        .await;
+        let events = sse_events(&body);
+        assert_eq!(
+            streamed_content(&events),
+            SPLIT_TAG_PARTS.concat(),
+            "{body}"
+        );
+        assert_eq!(streamed_reasoning(&events), "", "{body}");
+        let usage = &events.last().unwrap()["usage"];
+        let reasoning = usage["completion_tokens_details"]["reasoning_tokens"]
+            .as_u64()
+            .unwrap_or_else(|| panic!("no reasoning_tokens: {body}"));
+        assert!(reasoning > 0, "{body}");
+    }
+
+    #[tokio::test]
+    async fn tool_stream_sends_reasoning_and_only_the_answers_call() {
+        let body = post_stream(
+            gated_app_released(&draft_then_call_parts()).await,
+            tool_stream_body(None, true),
+        )
+        .await;
+        let events = sse_events(&body);
+        assert_eq!(
+            streamed_reasoning(&events),
+            format!("plan {DRAFT_CALL}"),
+            "{body}"
+        );
+        assert_eq!(streamed_content(&events), "", "{body}");
+        let calls = streamed_tool_calls(&events);
+        assert_eq!(calls.len(), 1, "{body}");
+        let calls = calls[0].as_array().unwrap();
+        assert_eq!(calls.len(), 1, "{body}");
+        assert_eq!(calls[0]["function"]["name"], "get_weather", "{body}");
+        assert_eq!(finish_reasons(&events), ["tool_calls"], "{body}");
+        let usage = &events.last().unwrap()["usage"];
+        assert!(
+            usage["completion_tokens_details"]["reasoning_tokens"].as_u64() > Some(0),
+            "{body}"
+        );
+
+        // The same chunks, not streamed, return the same call.
+        let (status, reply) = post_chat(
+            gated_app_released(&draft_then_call_parts()).await,
+            serde_json::json!({"model":"mock-model","messages":[{"role":"user","content":"hi"}],
+                   "tools":[{"type":"function","function":{"name":"get_weather"}}]}),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{reply}");
+        let replied = reply["choices"][0]["message"]["tool_calls"]
+            .as_array()
+            .unwrap();
+        assert_eq!(replied.len(), 1, "{reply}");
+        assert_eq!(replied[0]["function"], calls[0]["function"], "{reply}");
+        assert_eq!(
+            reply["choices"][0]["message"]["reasoning_content"],
+            streamed_reasoning(&events)
+        );
+    }
+
+    /// Mirror of the non-streamed bare `</think>` case: a call drafted before
+    /// a close the API never saw opened is not returned.
+    #[tokio::test]
+    async fn tool_stream_bare_close_tag_keeps_a_drafted_call_out() {
+        let parts = ["plan ", DRAFT_CALL, "</think>", WEATHER_CALL];
+        let body = post_stream(
+            gated_app_released(&parts).await,
+            tool_stream_body(None, false),
+        )
+        .await;
+        let events = sse_events(&body);
+        let calls = streamed_tool_calls(&events);
+        assert_eq!(calls.len(), 1, "{body}");
+        let calls = calls[0].as_array().unwrap();
+        assert_eq!(calls.len(), 1, "{body}");
+        assert_eq!(calls[0]["function"]["name"], "get_weather", "{body}");
+        assert_eq!(finish_reasons(&events), ["tool_calls"], "{body}");
+    }
+
+    #[tokio::test]
+    async fn stream_length_cut_inside_reasoning_sends_reasoning_only() {
+        let body = post_stream(
+            make_app().await,
+            serde_json::json!({"model":"mock-model","stream":true,"max_tokens":3,
+                   "messages":[{"role":"user","content":"<think> a b c d </think> answer"}]}),
+        )
+        .await;
+        let events = sse_events(&body);
+        assert_eq!(streamed_reasoning(&events), " a b ", "{body}");
+        assert_eq!(streamed_content(&events), "", "{body}");
+        assert_eq!(finish_reasons(&events), ["length"], "{body}");
+    }
+
+    /// The split is per stream: two streams at once keep their own reasoning.
+    #[tokio::test]
+    async fn concurrent_streams_keep_their_own_reasoning() {
+        let app = make_app().await;
+        let req = |text: &str| {
+            serde_json::json!({"model":"mock-model","stream":true,
+                "messages":[{"role":"user","content":text}]})
+        };
+        let (a, b) = tokio::join!(
+            post_stream(app.clone(), req("<think> alpha </think> one")),
+            post_stream(app.clone(), req("<think> beta gamma </think> two"))
+        );
+        let (a, b) = (sse_events(&a), sse_events(&b));
+        assert_eq!(streamed_reasoning(&a), " alpha ");
+        assert_eq!(streamed_content(&a), "one ");
+        assert_eq!(streamed_reasoning(&b), " beta gamma ");
+        assert_eq!(streamed_content(&b), "two ");
+    }
+
+    /// A released gated router (default reasoning format) whose last part
+    /// arrives on the final chunk when `last_on_final`.
+    async fn gated_app_final_text(parts: &[&str], last_on_final: bool) -> Router {
+        let (app, release, _) = start_gated(
+            parts,
+            false,
+            last_on_final,
+            Config {
+                chat_template: ChatTemplateConfig {
+                    template: Some("{% for m in messages %}{{ m.content }}{% endfor %}".into()),
+                    bos_token: None,
+                    eos_token: None,
+                },
+                ..Config::default()
+            },
+        )
+        .await;
+        release.store(true, Ordering::SeqCst);
+        app
+    }
+
+    /// No delta carries both `reasoning_content` and `content`: a client
+    /// that drops a frame's content once it sees reasoning (or keeps one
+    /// open reasoning block until a content-only frame) loses nothing.
+    fn assert_kinds_apart(events: &[Value], body: &str) {
+        for e in events {
+            let delta = &e["choices"][0]["delta"];
+            assert!(
+                delta.get("reasoning_content").is_none() || delta.get("content").is_none(),
+                "reasoning and content in one delta: {body}"
+            );
+        }
+    }
+
+    /// The choice frame whose content holds `text`.
+    fn content_frame_with<'a>(events: &'a [Value], text: &str) -> &'a Value {
+        events
+            .iter()
+            .find(|e| {
+                e["choices"][0]["delta"]["content"]
+                    .as_str()
+                    .is_some_and(|c| c.contains(text))
+            })
+            .unwrap_or_else(|| panic!("no content frame with {text:?}"))
+    }
+
+    #[tokio::test]
+    async fn stream_sends_reasoning_and_answer_of_one_chunk_in_separate_frames() {
+        let cases: [(&[&str], bool, &str, &str, &str); 3] = [
+            (
+                &["<think>pl", "an</think>Hello", " world"],
+                false,
+                "plan",
+                "Hello world",
+                "Hello",
+            ),
+            (&["<think>x</think>Hi"], false, "x", "Hi", "Hi"),
+            (&["<think>x</think>Hi"], true, "x", "Hi", "Hi"),
+        ];
+        for (parts, last_on_final, reasoning, content, marker) in cases {
+            for tools in [false, true] {
+                let payload = if tools {
+                    tool_stream_body(None, true)
+                } else {
+                    plain_stream_body(None, true)
+                };
+                let body =
+                    post_stream(gated_app_final_text(parts, last_on_final).await, payload).await;
+                let events = sse_events(&body);
+                // One token per part, each counted in exactly one frame.
+                assert_eq!(frame_tokens(&events), parts.len() as u64, "{body}");
+                assert_kinds_apart(&events, &body);
+                assert_eq!(streamed_reasoning(&events), reasoning, "{body}");
+                assert_eq!(streamed_content(&events), content, "{body}");
+                let frame = content_frame_with(&events, marker);
+                assert!(
+                    frame["choices"][0]["delta"]
+                        .get("reasoning_content")
+                        .is_none(),
+                    "{body}"
+                );
+                assert_eq!(finish_reasons(&events), ["stop"], "{body}");
+                let choices: Vec<&Value> = events
+                    .iter()
+                    .filter(|e| !e["choices"].as_array().unwrap().is_empty())
+                    .collect();
+                assert_eq!(
+                    choices.last().unwrap()["choices"][0]["finish_reason"],
+                    "stop",
+                    "{body}"
+                );
+            }
+        }
+    }
+
+    /// Reasoning, answer text and a call on one final chunk: the reasoning
+    /// and the text go out in separate frames ahead of the call.
+    #[tokio::test]
+    async fn tool_stream_sends_final_reasoning_and_text_apart_before_the_call() {
+        let last = format!("<think>plan</think>Checking. {WEATHER_CALL}");
+        let parts = [last.as_str()];
+        let body = post_stream(
+            gated_app_final_text(&parts, true).await,
+            tool_stream_body(None, true),
+        )
+        .await;
+        let events = sse_events(&body);
+        assert_eq!(frame_tokens(&events), 1, "{body}");
+        assert_kinds_apart(&events, &body);
+        assert_eq!(streamed_reasoning(&events), "plan", "{body}");
+        assert_eq!(streamed_content(&events), "Checking. ", "{body}");
+        let frame = content_frame_with(&events, "Checking.");
+        assert!(
+            frame["choices"][0]["delta"]
+                .get("reasoning_content")
+                .is_none(),
+            "{body}"
+        );
+        let calls = streamed_tool_calls(&events);
+        assert_eq!(calls.len(), 1, "{body}");
+        assert_eq!(calls[0][0]["function"]["name"], "get_weather", "{body}");
+        assert_eq!(finish_reasons(&events), ["tool_calls"], "{body}");
+    }
+
+    /// A plain stream that ends without a final chunk (cancelled) sends the
+    /// text the split still held, as the tool stream does.
+    #[tokio::test]
+    async fn stream_ending_without_a_final_chunk_sends_the_held_text() {
+        let (app, _release, runner) = start_gated(
+            &["<think>a</thi", "nk>never"],
+            false,
+            false,
+            Config {
+                chat_template: ChatTemplateConfig {
+                    template: Some("{% for m in messages %}{{ m.content }}{% endfor %}".into()),
+                    bos_token: None,
+                    eos_token: None,
+                },
+                ..Config::default()
+            },
+        )
+        .await;
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/v1/chat/completions")
+                    .header("content-type", "application/json")
+                    .body(Body::from(plain_stream_body(None, true).to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let mut stream = resp.into_body().into_data_stream();
+        let first = loop {
+            let frame = tokio::time::timeout(std::time::Duration::from_secs(10), stream.next())
+                .await
+                .expect("first frame while generation is gated")
+                .expect("body still open")
+                .unwrap();
+            if !frame.is_empty() {
+                break String::from_utf8(frame.to_vec()).unwrap();
+            }
+        };
+        let events = sse_events(&first);
+        assert_eq!(streamed_reasoning(&events), "a", "{first}");
+        let task_id = events[0]["id"].as_str().unwrap().to_owned();
+        runner.cancel(&task_id);
+        let mut rest = String::new();
+        while let Some(frame) = stream.next().await {
+            rest.push_str(std::str::from_utf8(&frame.unwrap()).unwrap());
+        }
+        assert!(rest.ends_with("data: [DONE]\n\n"), "{rest}");
+        let all = format!("{first}{rest}");
+        let events = sse_events(&all);
+        assert_eq!(streamed_reasoning(&events), "a</thi", "{all}");
+        assert_eq!(streamed_content(&events), "", "{all}");
+    }
+
+    /// Engine chunks of a Qwen3 `/no_think` reply: an empty reasoning block.
+    const NO_THINK_PARTS: [&str; 5] = ["<think>", "\n\n", "</think>", "\n\n", "Hi"];
+
+    /// A reply's reasoning and content, non-streamed and streamed (plain and
+    /// with tools), with the usage details each carried. Streamed frames must
+    /// carry every part's token.
+    async fn reasoning_three_ways(parts: &[&str]) -> Vec<(Option<String>, String, Value)> {
+        let mut out = Vec::new();
+        let (status, body) = post_chat(
+            gated_app_released(parts).await,
+            serde_json::json!({"model":"mock-model","messages":[{"role":"user","content":"hi"}]}),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        let m = &body["choices"][0]["message"];
+        out.push((
+            m["reasoning_content"].as_str().map(str::to_owned),
+            m["content"].as_str().unwrap().to_owned(),
+            body["usage"]["completion_tokens_details"].clone(),
+        ));
+        for payload in [plain_stream_body(None, true), tool_stream_body(None, true)] {
+            let body = post_stream(gated_app_released(parts).await, payload).await;
+            let events = sse_events(&body);
+            assert_eq!(frame_tokens(&events), parts.len() as u64, "{body}");
+            let has_reasoning = events
+                .iter()
+                .any(|e| e["choices"][0]["delta"].get("reasoning_content").is_some());
+            let usage = events
+                .iter()
+                .find_map(|e| e.get("usage"))
+                .unwrap_or_else(|| panic!("no usage frame: {body}"));
+            out.push((
+                has_reasoning.then(|| streamed_reasoning(&events)),
+                streamed_content(&events),
+                usage["completion_tokens_details"].clone(),
+            ));
+        }
+        out
+    }
+
+    /// Whitespace-only reasoning (a `/no_think` reply) is not reasoning: no
+    /// `reasoning_content` anywhere, but the details stay, since a reasoning
+    /// block was seen.
+    #[tokio::test]
+    async fn whitespace_only_reasoning_is_not_reasoning() {
+        for (reasoning, content, details) in reasoning_three_ways(&NO_THINK_PARTS).await {
+            assert_eq!(reasoning, None);
+            assert_eq!(content, "Hi");
+            assert!(details.is_object(), "{details}");
+        }
+    }
+
+    /// Normal reasoning keeps its bytes verbatim, newlines included.
+    #[tokio::test]
+    async fn reasoning_keeps_its_leading_and_trailing_newlines() {
+        let parts = ["<think>", "\nplan\n", "</think>", "answer"];
+        for (reasoning, content, details) in reasoning_three_ways(&parts).await {
+            assert_eq!(reasoning.as_deref(), Some("\nplan\n"));
+            assert_eq!(content, "answer");
+            assert!(details.is_object(), "{details}");
+        }
+    }
+
+    /// Leading whitespace in reasoning is held, then released with the first
+    /// text, not sent as its own frame.
+    #[tokio::test]
+    async fn leading_reasoning_whitespace_goes_out_with_the_first_text() {
+        let body = post_stream(
+            gated_app_released(&["<think>", "\n", "\n", "plan", "</think>", "a"]).await,
+            plain_stream_body(None, false),
+        )
+        .await;
+        let events = sse_events(&body);
+        let first = events
+            .iter()
+            .find_map(|e| e["choices"][0]["delta"]["reasoning_content"].as_str())
+            .unwrap_or_else(|| panic!("no reasoning: {body}"));
+        assert_eq!(first, "\n\nplan", "{body}");
+        assert_eq!(frame_tokens(&events), 6, "{body}");
     }
 }

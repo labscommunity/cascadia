@@ -495,6 +495,9 @@ async fn run_passes(
             // Never client-settable (see the chat handler): a KV-namespace boundary.
             tenant: String::new(),
             resume_token_ids: None,
+            reasoning_as_text: false,
+            preserve_thinking: None,
+            prompt_pretemplated: None,
             decision: Some(pass.readout.clone()),
         };
         let started = std::time::Instant::now();

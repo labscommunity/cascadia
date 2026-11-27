@@ -69,6 +69,10 @@ pub struct ChatTurn {
     /// Optional participant name (multi-agent / tool messages).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub name: Option<String>,
+    /// Reasoning replayed by the client on an earlier assistant turn, for
+    /// downstream templates that render it (Qwen3, GLM).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reasoning_content: Option<String>,
 }
 
 /// One generation request, end-to-end.
@@ -151,6 +155,27 @@ pub struct GenerationTask {
     /// `decision_unsupported:`-prefixed error.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub decision: Option<crate::DecisionReadout>,
+    /// Return reasoning as text. An engine that receives the model's
+    /// reasoning on a separate channel (llama-server's
+    /// `delta.reasoning_content`) streams it as text framed by the model's
+    /// `<think>` / `</think>` markers instead of dropping it, so the API can
+    /// split it from the answer. Off the wire when false.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub reasoning_as_text: bool,
+    /// The caller's `chat_template_kwargs.preserve_thinking`, for an engine
+    /// that renders the chat template itself (llama-server's
+    /// `chat_template_kwargs`). Templates such as Qwen3.6's keep replayed
+    /// reasoning on earlier turns when it is set. Off the wire when unset.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub preserve_thinking: Option<bool>,
+    /// Whether `prompt` was rendered through the model's chat template for
+    /// this request. An engine that can apply the template itself (ov-genai)
+    /// skips its own apply when `Some(true)` and applies it when
+    /// `Some(false)` (no template, or the legacy text after a render error).
+    /// `None` leaves it to the engine's own setting, as before this field
+    /// existed. Off the wire when unset.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub prompt_pretemplated: Option<bool>,
 }
 
 /// See `resume_token_ids`: `Some([])` on the wire normalizes to `None`.
@@ -228,6 +253,9 @@ impl GenerationTask {
             tenant: String::new(), // LOCAL_NS — see the field doc
             resume_token_ids: None,
             decision: None,
+            reasoning_as_text: false,
+            preserve_thinking: None,
+            prompt_pretemplated: None,
         }
     }
 
@@ -258,6 +286,45 @@ impl GenerationTask {
 mod tests {
     use super::*;
 
+    /// `preserve_thinking` is off the wire when unset and round-trips when
+    /// set.
+    #[test]
+    fn preserve_thinking_is_off_the_wire_when_unset() {
+        let t = GenerationTask::new("t1", "hello");
+        let json = serde_json::to_value(&t).unwrap();
+        assert!(json.get("preserve_thinking").is_none(), "{json}");
+        let back: GenerationTask = serde_json::from_value(json).unwrap();
+        assert_eq!(back.preserve_thinking, None);
+        let mut t = GenerationTask::new("t1", "hello");
+        t.preserve_thinking = Some(true);
+        let json = serde_json::to_value(&t).unwrap();
+        assert_eq!(json["preserve_thinking"], true);
+        let back: GenerationTask = serde_json::from_value(json).unwrap();
+        assert_eq!(back.preserve_thinking, Some(true));
+    }
+
+    /// `prompt_pretemplated` is off the wire when unset (older peers see the
+    /// same bytes and a payload without it decodes to `None`) and
+    /// round-trips when set.
+    #[test]
+    fn prompt_pretemplated_is_off_the_wire_when_unset() {
+        let t = GenerationTask::new("t1", "hello");
+        let json = serde_json::to_value(&t).unwrap();
+        assert!(json.get("prompt_pretemplated").is_none(), "{json}");
+        let back: GenerationTask = serde_json::from_value(json).unwrap();
+        assert_eq!(back.prompt_pretemplated, None);
+        for v in [true, false] {
+            let t = GenerationTask {
+                prompt_pretemplated: Some(v),
+                ..GenerationTask::new("t1", "hello")
+            };
+            let json = serde_json::to_value(&t).unwrap();
+            assert_eq!(json["prompt_pretemplated"], v);
+            let back: GenerationTask = serde_json::from_value(json).unwrap();
+            assert_eq!(back.prompt_pretemplated, Some(v));
+        }
+    }
+
     #[test]
     fn resume_token_ids_defaults_none_and_is_additive() {
         let t = GenerationTask {
@@ -275,6 +342,9 @@ mod tests {
             tenant: String::new(),
             resume_token_ids: None,
             decision: None,
+            reasoning_as_text: false,
+            preserve_thinking: None,
+            prompt_pretemplated: None,
         };
         let json = serde_json::to_string(&t).unwrap();
         let back: GenerationTask = serde_json::from_str(&json).unwrap();
@@ -310,6 +380,26 @@ mod tests {
         });
         let back: GenerationTask = serde_json::from_value(payload).unwrap();
         assert_eq!(back.resume_token_ids, Some(vec![7, 8]));
+    }
+
+    /// `reasoning_as_text` is off the wire when false and defaults to false
+    /// on a payload that lacks it, so older peers see the same bytes.
+    #[test]
+    fn reasoning_as_text_is_off_the_wire_when_false() {
+        let t = GenerationTask::new("t1", "hello");
+        let json = serde_json::to_value(&t).unwrap();
+        assert!(json.get("reasoning_as_text").is_none(), "{json}");
+        let back: GenerationTask = serde_json::from_value(json).unwrap();
+        assert!(!back.reasoning_as_text);
+
+        let t = GenerationTask {
+            reasoning_as_text: true,
+            ..GenerationTask::new("t1", "hello")
+        };
+        let json = serde_json::to_value(&t).unwrap();
+        assert_eq!(json["reasoning_as_text"], true);
+        let back: GenerationTask = serde_json::from_value(json).unwrap();
+        assert!(back.reasoning_as_text);
     }
 
     #[test]

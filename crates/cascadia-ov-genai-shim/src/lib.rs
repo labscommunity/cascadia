@@ -130,6 +130,10 @@ mod sys {
             cfg: *mut cascadia_genconfig_t,
             enabled: i32,
         );
+        pub fn cascadia_genconfig_set_prompt_templated(
+            cfg: *mut cascadia_genconfig_t,
+            enabled: i32,
+        );
         pub fn cascadia_genconfig_set_top_p(cfg: *mut cascadia_genconfig_t, v: f32);
         pub fn cascadia_genconfig_set_top_k(cfg: *mut cascadia_genconfig_t, v: u32);
         pub fn cascadia_genconfig_set_frequency_penalty(cfg: *mut cascadia_genconfig_t, v: f32);
@@ -142,6 +146,7 @@ mod sys {
             cfg: *const cascadia_genconfig_t,
             out_text: *mut *mut c_char,
             out_token_count: *mut u32,
+            out_prompt_tokens: *mut u32,
         ) -> c_int;
 
         pub fn cascadia_free_string(s: *mut c_char);
@@ -181,6 +186,7 @@ mod sys {
         pub fn cascadia_cb_count_tokens(
             handle: *mut cascadia_cb_pipeline_t,
             text: *const c_char,
+            add_special_tokens: i32,
             out_count: *mut u32,
         ) -> c_int;
 
@@ -193,7 +199,14 @@ mod sys {
         pub fn cascadia_tokenizer_count_tokens(
             tok: *mut cascadia_tokenizer_t,
             text: *const c_char,
+            add_special_tokens: i32,
             out_count: *mut u32,
+        ) -> c_int;
+
+        pub fn cascadia_pipeline_apply_chat_template(
+            handle: *mut cascadia_pipeline_t,
+            user: *const c_char,
+            out_text: *mut *mut c_char,
         ) -> c_int;
 
         pub fn cascadia_runtime_compile(
@@ -392,6 +405,7 @@ unsafe fn native_genconfig(cfg: &GenConfig) -> Result<*mut sys::cascadia_genconf
         raw_cfg,
         if cfg.skip_chat_template { 0 } else { 1 },
     );
+    sys::cascadia_genconfig_set_prompt_templated(raw_cfg, i32::from(cfg.prompt_templated));
     // OpenAI-compatible sampling knobs (#14). top_p / penalties take
     // their OV defaults (1.0 / 0.0) when unset, so setting them is a
     // no-op; top_k=0 and seed=None mean "disabled" so only forward
@@ -447,6 +461,11 @@ pub struct GenConfig {
     /// the caller pre-rendered the template (e.g. to honor enable_thinking).
     /// Default false = apply (matches OV's `apply_chat_template = true`).
     pub skip_chat_template: bool,
+    /// The prompt is the model's chat template already rendered, so it
+    /// carries the template's own special tokens (BOS): encode it without
+    /// adding them again. Only meaningful with `skip_chat_template`. Default
+    /// false = the pipeline's own encoding (special tokens added).
+    pub prompt_templated: bool,
     /// OpenAI-compatible sampling knobs (#14). Forwarded to the matching
     /// `ov::genai::GenerationConfig` fields. Defaults (top_p=1.0 via the
     /// builder, penalties=0, top_k=0, seed=None) are no-ops.
@@ -481,6 +500,9 @@ impl PluginConfig {
 pub struct GenResult {
     pub text: String,
     pub generated_tokens: u32,
+    /// Prompt tokens the pipeline fed the model (its perf metrics), when it
+    /// reports them.
+    pub prompt_tokens: Option<u32>,
 }
 
 /// Owned LLMPipeline handle.
@@ -625,12 +647,14 @@ impl LlmPipeline {
             let raw_cfg = native_genconfig(cfg)?;
             let mut text_p: *mut c_char = ptr::null_mut();
             let mut tok_count: u32 = 0;
+            let mut prompt_tokens: u32 = 0;
             let rc = sys::cascadia_pipeline_generate(
                 self.handle,
                 prompt_c.as_ptr(),
                 raw_cfg,
                 &mut text_p,
                 &mut tok_count,
+                &mut prompt_tokens,
             );
             sys::cascadia_genconfig_destroy(raw_cfg);
             if rc != 0 || text_p.is_null() {
@@ -641,20 +665,51 @@ impl LlmPipeline {
             Ok(GenResult {
                 text,
                 generated_tokens: tok_count,
+                prompt_tokens: (prompt_tokens > 0).then_some(prompt_tokens),
             })
+        }
+    }
+
+    /// One user message rendered through the pipeline's own chat template,
+    /// with the generation prompt: the text the pipeline itself would feed
+    /// the model with `apply_chat_template` on.
+    #[cfg(not(feature = "openvino"))]
+    pub fn apply_chat_template(&self, _user: &str) -> Result<String> {
+        Err(Error::Stub)
+    }
+
+    #[cfg(feature = "openvino")]
+    pub fn apply_chat_template(&self, user: &str) -> Result<String> {
+        let user_c = cstr(user)?;
+        unsafe {
+            let mut text_p: *mut c_char = ptr::null_mut();
+            let rc = sys::cascadia_pipeline_apply_chat_template(
+                self.handle,
+                user_c.as_ptr(),
+                &mut text_p,
+            );
+            if rc != 0 || text_p.is_null() {
+                return Err(Error::Native(last_native_error()));
+            }
+            let text = CStr::from_ptr(text_p).to_string_lossy().into_owned();
+            sys::cascadia_free_string(text_p);
+            Ok(text)
         }
     }
 
     /// Best-effort token count via the pipeline's tokenizer. Returns
     /// `None` when the underlying call fails (e.g. tokenizer not available
-    /// in stub builds).
+    /// in stub builds). `add_special_tokens`: count as the tokenizer encodes
+    /// plain text (BOS added); false for text that already carries them (a
+    /// rendered chat template) or for generated text.
     #[cfg(not(feature = "openvino"))]
-    pub fn count_tokens(&self, _text: &str) -> Option<u32> {
+    pub fn count_tokens(&self, _text: &str, _add_special_tokens: bool) -> Option<u32> {
         None
     }
 
+    /// See the stub build's `count_tokens`.
     #[cfg(feature = "openvino")]
-    pub fn count_tokens(&self, text: &str) -> Option<u32> {
+    pub fn count_tokens(&self, text: &str, add_special_tokens: bool) -> Option<u32> {
         let text_c = cstr(text).ok()?;
         unsafe {
             let tok = sys::cascadia_pipeline_get_tokenizer(self.handle);
@@ -664,7 +719,12 @@ impl LlmPipeline {
             // Always destroy the borrowed tokenizer handle, even on
             // count failure — otherwise we leak heap on every call.
             let mut out: u32 = 0;
-            let rc = sys::cascadia_tokenizer_count_tokens(tok, text_c.as_ptr(), &mut out);
+            let rc = sys::cascadia_tokenizer_count_tokens(
+                tok,
+                text_c.as_ptr(),
+                i32::from(add_special_tokens),
+                &mut out,
+            );
             sys::cascadia_tokenizer_destroy(tok);
             if rc != 0 {
                 return None;
@@ -981,17 +1041,24 @@ impl CbPipeline {
     }
 
     #[cfg(not(feature = "openvino"))]
-    pub fn count_tokens(&self, _text: &str) -> Option<u32> {
+    pub fn count_tokens(&self, _text: &str, _add_special_tokens: bool) -> Option<u32> {
         None
     }
 
-    /// Best-effort token count via the pipeline's tokenizer.
+    /// Best-effort token count via the pipeline's tokenizer; see
+    /// [`LlmPipeline::count_tokens`] for `add_special_tokens`.
     #[cfg(feature = "openvino")]
-    pub fn count_tokens(&self, text: &str) -> Option<u32> {
+    pub fn count_tokens(&self, text: &str, add_special_tokens: bool) -> Option<u32> {
         let text_c = cstr(text).ok()?;
         let mut out: u32 = 0;
-        let rc =
-            unsafe { sys::cascadia_cb_count_tokens(self.inner.ptr, text_c.as_ptr(), &mut out) };
+        let rc = unsafe {
+            sys::cascadia_cb_count_tokens(
+                self.inner.ptr,
+                text_c.as_ptr(),
+                i32::from(add_special_tokens),
+                &mut out,
+            )
+        };
         if rc != 0 {
             None
         } else {

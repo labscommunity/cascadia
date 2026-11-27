@@ -8,7 +8,7 @@
 //!
 //! * not templating at all — what upstream does, and what this test caught.
 //!   The engine relies on that flag whenever the API could not pre-render the
-//!   template, and for thinking-on requests; those got raw prompts.
+//!   template (no template file beside the model); those got raw prompts.
 //! * templating and then encoding with `add_special_tokens=true`, which
 //!   prepends a second BOS because the rendered template already carries one.
 //!   The output stays fluent, just quietly worse.
@@ -40,6 +40,7 @@ fn cfg(skip_chat_template: bool) -> GenConfig {
         num_assistant_tokens: 0,
         max_ngram_size: 0,
         skip_chat_template,
+        prompt_templated: false,
         top_p: 1.0,
         top_k: 0,
         frequency_penalty: 0.0,

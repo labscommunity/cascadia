@@ -86,7 +86,10 @@ decoding. `cascadia-api` reads the marker ids off each chunk
 (`MarkerDialect`, ids from `tokenizer_config.json`) and re-inserts the
 textual delimiters every other served template uses — `<think>…</think>`
 around the scratchpad and a Hermes `<tool_call>{"name","arguments"}</tool_call>`
-for tool calls — in the non-streaming and streaming paths. The chat template
+for tool calls — in the non-streaming and streaming paths. With thinking on,
+the re-inserted `<think>…</think>` is then split out of `content` into
+`reasoning_content` like any other thinking model's (`--reasoning-format none`
+leaves it in `content`). The chat template
 turns `reasoning_effort` into a numeric thinking level (`none` = 0 switches
 thinking off, `high` = 0.9 is the default); the API probes at load that the
 template distinguishes the OpenAI words and passes the caller's own word

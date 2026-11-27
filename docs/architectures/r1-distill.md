@@ -28,10 +28,14 @@ cascadia shard \
 
 ## Reasoning output
 
-The R1 distills emit a `<think>...</think>` block before the final
-answer. This is just tokens — Cascadia's OpenAI-compatible API does
-not strip it. If you want only the final answer, post-process by
-splitting on `</think>` and taking the second half:
+The R1 distills emit a reasoning chain ending in `</think>` before the
+final answer. Their chat template opens the `<think>` block in the
+prompt, so the model only writes the closing tag. With thinking on (the
+default) Cascadia's OpenAI-compatible API splits the reply for you: the
+reasoning comes back in `message.reasoning_content` (streamed as
+`delta.reasoning_content`) and only the answer in `content`; the tokens
+spent reasoning are in `usage.completion_tokens_details.reasoning_tokens`.
+See [Reasoning models](../../README.md#reasoning-thinking-models).
 
 ```python
 import openai
@@ -40,9 +44,23 @@ resp = client.chat.completions.create(
     model="r1-distill-qwen-7b",
     messages=[{"role": "user", "content": "What is 17 * 23?"}],
 )
+msg = resp.choices[0].message
+reasoning = getattr(msg, "reasoning_content", None)  # the chain of thought
+answer = msg.content                                 # the final answer only
+```
+
+Splitting on `</think>` yourself is only needed when the server runs with
+`--reasoning-format none`, which keeps the reasoning and the `</think>`
+marker inside `content` as earlier releases did (kept for one release):
+
+```python
 text = resp.choices[0].message.content
 answer = text.split("</think>")[-1].strip() if "</think>" in text else text
 ```
+
+The same holds for a request with thinking off (`"enable_thinking": false`
+and the other switches): the R1 template opens the block regardless, so the
+reply is returned unsplit, reasoning and `</think>` included in `content`.
 
 ## End-to-end test (iGPU + iGPU)
 
@@ -70,7 +88,9 @@ $ curl http://192.168.1.10:8000/v1/chat/completions -H 'Content-Type: applicatio
 ```
 
 (17 × 23 = 391 ✓; the `</think>` marker is the R1 reasoning-chain
-end-of-chain-of-thought.)
+end-of-chain-of-thought. This reply was recorded before the API split
+reasoning out; the same request today returns the text before `</think>`
+in `reasoning_content` and the text after it in `content`.)
 
 **CPU-plugin note (fixed):** an earlier exporter emitted init-less
 `ReadValue` nodes (via `apply_make_stateful_transformation`) that the
